@@ -11,7 +11,7 @@ def prepare_dataset(batch, feature_extractor, tokenizer):
 
 def prep_data(dataset, feature_extractor, tokenizer):
     prepare_dataset_with_args = functools.partial(prepare_dataset, feature_extractor=feature_extractor, tokenizer=tokenizer)
-    dataset = dataset.map(prepare_dataset_with_args, remove_columns=dataset.column_names["train.clean.360"], num_proc=os.cpu_count())
+    dataset = dataset.map(prepare_dataset_with_args, remove_columns=dataset.column_names["train.clean.360"], num_proc=1)
     
     dataset = dataset.with_format("torch")
     return dataset

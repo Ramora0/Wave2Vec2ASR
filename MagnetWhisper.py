@@ -12,9 +12,9 @@ from BoundaryPredictor import BoundaryPredictor
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
-    def load_magnet(self, prior, temp=1, threshold=0.5):
+    def load_magnet(self, lp):
         self.model.__class__ = MagnetWhisperModel
-        self.model.load_magnet(prior, temp, threshold)
+        self.model.load_magnet(lp)
 
     def forward(
         self,
@@ -124,9 +124,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
 
 class MagnetWhisperModel(WhisperModel):
-    def load_magnet(self, prior, temp, threshold):
+    def load_magnet(self, lp):
         self.encoder.__class__ = MagnetWhisperEncoder
-        self.encoder.load_magnet(prior, temp, threshold)
+        self.encoder.load_magnet(lp)
 
     def forward(
         self,
@@ -228,16 +228,14 @@ class MagnetWhisperModel(WhisperModel):
 
 class MagnetWhisperEncoder(WhisperEncoder):
     def load_magnet(self, lp):
-        predictor_dim = self.config.d_model
-
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
         )
 
         for layer_idx, prior_value in lp:
             self.boundary_predictors[layer_idx] = BoundaryPredictor(
-                predictor_dim, # input_dim
-                predictor_dim, # hidden_dim
+                768,
+                768,
                 prior_value,
                 1,
                 0.5
