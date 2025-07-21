@@ -9,42 +9,89 @@ from utils import delete, downsample
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, num_heads=8):
         """
         input_dim: dimensionality of per-token vectors (D)
-        tau: Gumbel-Sigmoid temperature
+        temp: Gumbel-Sigmoid temperature
+        num_heads: number of attention heads
         """
         super().__init__()
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
+        self.scale = self.head_dim ** -0.5
 
-        # Linear projections for computing similarity (initialized as identity)
-        self.q_proj_layer = nn.Linear(
-            input_dim, input_dim, bias=False)
-        self.k_proj_layer = nn.Linear(
-            input_dim, input_dim, bias=False)
+        assert input_dim % num_heads == 0, "input_dim must be divisible by num_heads"
 
-        # Initialize as identity matrices (same as RoutingModule)
-        with torch.no_grad():
-            self.q_proj_layer.weight.copy_(torch.eye(input_dim))
-            self.k_proj_layer.weight.copy_(torch.eye(input_dim))
-        self.q_proj_layer.weight._no_reinit = True
-        self.k_proj_layer.weight._no_reinit = True
+        # Multi-head attention projections
+        self.q_proj = nn.Linear(input_dim, input_dim, bias=False)
+        self.k_proj = nn.Linear(input_dim, input_dim, bias=False)
+        self.v_proj = nn.Linear(input_dim, input_dim, bias=False)
+        self.out_proj = nn.Linear(input_dim, 1, bias=False)
+
+        # Initialize projection layers
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+        # Prevent re-initialization during model loading
+        self.q_proj.weight._no_reinit = True
+        self.k_proj.weight._no_reinit = True
+        self.v_proj.weight._no_reinit = True
+        self.out_proj.weight._no_reinit = True
 
     def set_prior(self, prior):
         self.prior = prior
 
     def forward(self, hidden):
-        cos_sim = torch.einsum(
-            "b l d, b l d -> b l",
-            # Move normalization to before the projection layer
-            self.q_proj_layer(F.normalize(hidden[:, :-1])),
-            self.k_proj_layer(F.normalize(hidden[:, 1:]))
+        batch_size, seq_len, embed_dim = hidden.shape
+
+        # Project to Q, K, V using full sequence
+        Q = self.q_proj(hidden)  # [batch, seq_len, embed_dim]
+        K = self.k_proj(hidden)  # [batch, seq_len, embed_dim]
+        V = self.v_proj(hidden)  # [batch, seq_len, embed_dim]
+
+        # Reshape for multi-head attention
+        Q = Q.view(batch_size, seq_len, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads,
+                   self.head_dim).transpose(1, 2)
+        # Shape: [batch, num_heads, seq_len, head_dim]
+
+        # Calculate attention scores
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        # Shape: [batch, num_heads, seq_len, seq_len]
+
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        # Apply attention to values
+        attended_values = torch.matmul(attention_weights, V)
+        # Shape: [batch, num_heads, seq_len, head_dim]
+
+        # Concatenate heads
+        attended_values = attended_values.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, embed_dim
         )
 
-        probs = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
-        probs = F.pad(probs, (1, 0), "constant", 1.0)
+        # Calculate boundary probabilities as sum of attention weights
+        # Sum attention weights across the key dimension to get boundary score for each position
+        boundary_scores = attention_weights.sum(
+            dim=-1).mean(dim=1)  # Average across heads
+        # Shape: [batch, seq_len]
+
+        # Project to boundary probabilities
+        boundary_logits = self.out_proj(
+            attended_values).squeeze(-1)  # [batch, seq_len]
+
+        # Combine attention weights and projection for final probabilities
+        probs = torch.sigmoid(boundary_logits + boundary_scores)
+        probs = torch.clamp(probs, min=0.0, max=1.0)
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
             temperature=self.temp,
