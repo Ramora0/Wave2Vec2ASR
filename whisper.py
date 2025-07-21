@@ -19,21 +19,21 @@ import aiohttp
 scratch_path = "/fs/scratch/PAS2836/lees_stuff"
 
 print("hi")
-dataset = load_dataset("openslr/librispeech_asr", trust_remote_code=True, storage_options={
-                       'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=60*60*24)}})
+# dataset = load_dataset("openslr/librispeech_asr", trust_remote_code=True, storage_options={
+#                        'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=60*60*24)}})
 
-dataset = dataset.remove_columns(["file", "speaker_id", "chapter_id", "id"])
-dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
+# dataset = dataset.remove_columns(["file", "speaker_id", "chapter_id", "id"])
+# dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
 
-# del dataset["train.clean.360"]
-del dataset["train.clean.100"]
-del dataset["train.other.500"]
-del dataset["test.other"]
-del dataset["validation.other"]
+# # del dataset["train.clean.360"]
+# del dataset["train.clean.100"]
+# del dataset["train.other.500"]
+# del dataset["test.other"]
+# del dataset["validation.other"]
 
-dataset.save_to_disk(f"{scratch_path}/librispeech-trimmed")
+# dataset.save_to_disk(f"{scratch_path}/librispeech-trimmed")
 
-# dataset = load_from_disk("./datasets/librispeech-trimmed")
+dataset = load_from_disk(f"{scratch_path}/librispeech-trimmed")
 
 print(dataset["train.clean.360"][0])
 

@@ -10,7 +10,6 @@ from torch import nn
 import os
 
 from BoundaryPredictor2 import BoundaryPredictor2
-from HNetBoundaryPredictor import HNetBoundaryPredictor
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
@@ -47,16 +46,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         model.model.encoder.boundary_predictors.load_state_dict(
             boundary_state_dict)
 
-        # Update temperature and threshold for boundary predictors using saved values (only for BoundaryPredictor)
-        if saved_predictor_type == "boundary":
-            temp_dict = dict(layer_temps)
-            threshold_dict = dict(layer_thresholds)
-
-            for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-                if isinstance(boundary_predictor, BoundaryPredictor):
-                    boundary_predictor.temp = temp_dict[idx]
-                    boundary_predictor.threshold = threshold_dict[idx]
-
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
@@ -76,23 +65,17 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         layer_priors = []
         layer_temps = []
         layer_thresholds = []
-        predictor_type = "boundary"  # Default type
 
         for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, BoundaryPredictor):
+            if isinstance(boundary_predictor, BoundaryPredictor2):
                 layer_priors.append((idx, boundary_predictor.prior))
                 layer_temps.append((idx, boundary_predictor.temp))
                 layer_thresholds.append((idx, boundary_predictor.threshold))
-                predictor_type = "boundary"
-            elif isinstance(boundary_predictor, HNetBoundaryPredictor):
-                layer_priors.append((idx, 0.0))  # HNet doesn't use prior
-                predictor_type = "hnet"
 
         params = {
             "layer_priors": layer_priors,
             "layer_temps": layer_temps,
             "layer_thresholds": layer_thresholds,
-            "predictor_type": predictor_type,
         }
         torch.save(params, boundary_params_path)
 
@@ -326,20 +309,13 @@ class MagnetWhisperEncoder(WhisperEncoder):
         self.compression_ratio = 0  # Track compression ratios by layer
 
         for layer_idx, prior_value in lp:
-            if predictor_type == "boundary":
-                self.boundary_predictors[layer_idx] = BoundaryPredictor2(
-                    768,
-                    768,
-                    prior_value,
-                    1,
-                    0.5
-                )
-            elif predictor_type == "hnet":
-                self.boundary_predictors[layer_idx] = HNetBoundaryPredictor(
-                    768,  # d_model
-                    device=None,
-                    dtype=None
-                )
+            self.boundary_predictors[layer_idx] = BoundaryPredictor2(
+                768,
+                768,
+                prior_value,
+                1,
+                0.5
+            )
 
     def forward(
         self,
@@ -446,20 +422,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     final_hs_for_layer, current_b_loss = predictor_module(
                         layer_outputs[0])
                     boundary_loss += current_b_loss
-                    layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
-                elif isinstance(predictor_module, HNetBoundaryPredictor):
-                    # HNetBoundaryPredictor returns WhisperBoundaryOutput
-                    boundary_output = predictor_module(layer_outputs[0])
-                    # Track compression ratio for this layer
-                    compression_ratios = predictor_module.get_compression_ratio(
-                        boundary_output.boundary_mask)
-                    # Store mean compression ratio
-                    self.compression_ratio = compression_ratios.mean(
-                    ).item()
-
-                    # Use compressed features as the new hidden states
-                    # HNetBoundaryPredictor now uses the same padding strategy as BoundaryPredictor
-                    final_hs_for_layer = boundary_output.compressed_features
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
                 hidden_states = layer_outputs[0]
