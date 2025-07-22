@@ -35,15 +35,6 @@ processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="E
 dataset = get_dataset(dataset, feature_extractor, tokenizer)
 
 
-def cast_input_features_to_fp16(batch):
-    if "input_features" in batch:
-        if isinstance(batch["input_features"], list):
-            batch["input_features"] = torch.tensor(batch["input_features"])
-        batch["input_features"] = batch["input_features"].to(torch.float16)
-    return batch
-
-
-dataset = dataset.map(cast_input_features_to_fp16)
 dataset = dataset.with_format("torch")
 
 # Load the model
@@ -69,7 +60,7 @@ model.generation_config.task = "transcribe"
 model.generation_config.forced_decoder_ids = None
 
 model.__class__ = MagnetWhisper
-model.load_magnet([(1, .67)], predictor_type="boundary")
+model.load_magnet([(1, .5)], predictor_type="boundary")
 
 # model.__class__ = SlidingWhisper
 # model.load_sliding(window_size=128)
@@ -173,7 +164,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=22,
+    num_train_epochs=6,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,

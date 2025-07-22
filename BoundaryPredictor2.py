@@ -9,7 +9,7 @@ from utils import delete, downsample
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, num_heads=8):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, num_heads=1):
         """
         input_dim: dimensionality of per-token vectors (D)
         temp: Gumbel-Sigmoid temperature
@@ -28,20 +28,14 @@ class BoundaryPredictor2(nn.Module):
         # Multi-head attention projections
         self.q_proj = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj = nn.Linear(input_dim, input_dim, bias=False)
-        self.v_proj = nn.Linear(input_dim, input_dim, bias=False)
-        self.out_proj = nn.Linear(input_dim, 1, bias=False)
 
         # Initialize projection layers
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.xavier_uniform_(self.k_proj.weight)
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight)
 
         # Prevent re-initialization during model loading
         self.q_proj.weight._no_reinit = True
         self.k_proj.weight._no_reinit = True
-        self.v_proj.weight._no_reinit = True
-        self.out_proj.weight._no_reinit = True
 
     def set_prior(self, prior):
         self.prior = prior
@@ -49,48 +43,21 @@ class BoundaryPredictor2(nn.Module):
     def forward(self, hidden):
         batch_size, seq_len, embed_dim = hidden.shape
 
-        # Project to Q, K, V using full sequence
+        # Normalize hidden vectors before projection
+        hidden = F.normalize(hidden, p=2, dim=-1)
+
+        # Project to Q, K using normalized sequence
         Q = self.q_proj(hidden)  # [batch, seq_len, embed_dim]
         K = self.k_proj(hidden)  # [batch, seq_len, embed_dim]
-        V = self.v_proj(hidden)  # [batch, seq_len, embed_dim]
 
-        # Reshape for multi-head attention
-        Q = Q.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads,
-                   self.head_dim).transpose(1, 2)
-        # Shape: [batch, num_heads, seq_len, head_dim]
-
-        # Calculate attention scores
+        # Calculate attention scores (single head)
         attention_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # Shape: [batch, num_heads, seq_len, seq_len]
+        # Shape: [batch, seq_len, seq_len]
 
-        # Apply softmax to get attention weights
-        attention_weights = F.softmax(attention_scores, dim=-1)
-
-        # Apply attention to values
-        attended_values = torch.matmul(attention_weights, V)
-        # Shape: [batch, num_heads, seq_len, head_dim]
-
-        # Concatenate heads
-        attended_values = attended_values.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, embed_dim
-        )
-
-        # Calculate boundary probabilities as sum of attention weights
-        # Sum attention weights across the key dimension to get boundary score for each position
-        boundary_scores = attention_weights.sum(
-            dim=-1).mean(dim=1)  # Average across heads
-        # Shape: [batch, seq_len]
-
-        # Project to boundary probabilities
-        boundary_logits = self.out_proj(
-            attended_values).squeeze(-1)  # [batch, seq_len]
-
-        # Combine attention weights and projection for final probabilities
-        probs = torch.sigmoid(boundary_logits + boundary_scores)
+        # Calculate boundary probabilities directly from attention scores with sigmoid
+        # Sum attention scores across the key dimension
+        boundary_scores = attention_scores.sum(dim=-1)  # [batch, seq_len]
+        probs = torch.sigmoid(boundary_scores)
         probs = torch.clamp(probs, min=0.0, max=1.0)
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
@@ -105,8 +72,8 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled = downsample(hard_boundaries, hidden)  # S x B x D
-        # pooled = delete(hard_boundaries, hidden)  # S x B x D
+        # pooled = downsample(hard_boundaries, hidden)  # S x B x D
+        pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 
