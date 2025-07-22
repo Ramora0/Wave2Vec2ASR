@@ -53,7 +53,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             threshold_dict = dict(layer_thresholds)
 
             for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-                if isinstance(boundary_predictor, BoundaryPredictor):
+                if isinstance(boundary_predictor, BoundaryPredictor2):
                     boundary_predictor.temp = temp_dict[idx]
                     boundary_predictor.threshold = threshold_dict[idx]
 
@@ -79,7 +79,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         predictor_type = "boundary"  # Default type
 
         for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, BoundaryPredictor):
+            if isinstance(boundary_predictor, BoundaryPredictor2):
                 layer_priors.append((idx, boundary_predictor.prior))
                 layer_temps.append((idx, boundary_predictor.temp))
                 layer_thresholds.append((idx, boundary_predictor.threshold))

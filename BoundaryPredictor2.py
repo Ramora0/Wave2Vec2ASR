@@ -58,8 +58,8 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        # pooled = downsample(hard_boundaries, hidden)  # S x B x D
-        pooled = delete(hard_boundaries, hidden)  # S x B x D
+        pooled = downsample(hard_boundaries, hidden)  # S x B x D
+        # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 
