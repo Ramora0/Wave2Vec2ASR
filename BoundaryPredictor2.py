@@ -9,11 +9,12 @@ from utils import delete, downsample
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, num_heads=1):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, num_heads=1, attention_dropout=0.1):
         """
         input_dim: dimensionality of per-token vectors (D)
         temp: Gumbel-Sigmoid temperature
         num_heads: number of attention heads
+        attention_dropout: dropout probability for attention weights
         """
         super().__init__()
         self.temp = temp
@@ -21,7 +22,7 @@ class BoundaryPredictor2(nn.Module):
         self.threshold = threshold
         self.num_heads = num_heads
         self.head_dim = input_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.attention_dropout = nn.Dropout(attention_dropout)
 
         assert input_dim % num_heads == 0, "input_dim must be divisible by num_heads"
 
@@ -47,63 +48,40 @@ class BoundaryPredictor2(nn.Module):
         self.q_proj.weight._no_reinit = True
         self.k_proj.weight._no_reinit = True
 
+        self.sigma = None
+
     def set_prior(self, prior):
         self.prior = prior
 
     def forward(self, hidden):
         batch_size, seq_len, embed_dim = hidden.shape
-        print(
-            f"Input shape: batch={batch_size}, seq_len={seq_len}, embed_dim={embed_dim}")
 
         # Add positional embeddings
         positions = torch.arange(seq_len, device=hidden.device).unsqueeze(
             0).expand(batch_size, -1)
         pos_embeddings = self.pos_embedding(positions)
-        hidden = hidden + pos_embeddings
-        print(f"After adding positional embeddings: {hidden.shape}")
+        hidden_with_pos = hidden + pos_embeddings
 
-        # Normalize hidden vectors before projection
-        hidden = F.normalize(hidden, p=2, dim=-1)
+        Q = self.q_proj(hidden_with_pos)
+        K = self.k_proj(hidden_with_pos)
 
-        # Project to Q, K using normalized sequence
-        Q = self.q_proj(hidden)  # [batch, seq_len, embed_dim]
-        K = self.k_proj(hidden)  # [batch, seq_len, embed_dim]
-        print(f"Q shape: {Q.shape}, K shape: {K.shape}")
+        attention_matrix = torch.matmul(
+            Q, K.transpose(-2, -1))  # [batch, seq_len, seq_len]
 
-        # Calculate attention scores (single head)
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # Shape: [batch, seq_len, seq_len]
-        print(f"Attention scores shape: {attention_scores.shape}")
-        print(
-            f"Attention scores range: [{attention_scores.min():.4f}, {attention_scores.max():.4f}]")
+        attention_matrix = self.attention_dropout(attention_matrix)
 
-        # Mask to only allow attention to the previous token (i-1)
-        # Create a mask that allows only the lower diagonal with offset -1
-        mask = torch.ones(seq_len, seq_len,
-                          device=attention_scores.device, dtype=torch.bool)
-        # Allow attention from position i to position i-1
-        for i in range(1, seq_len):
-            mask[i, i-1] = False
-        print(f"Mask pattern (first 5x5):\n{(~mask[:5, :5]).int()}")
+        batch_size, seq_len, _ = attention_matrix.shape
 
-        # Mask out all other positions (set to 0)
-        attention_scores = attention_scores.masked_fill(mask, 0.0)
-        print(
-            f"Masked attention scores range: [{attention_scores.min():.4f}, {attention_scores.max():.4f}]")
+        diagonal_mask = torch.eye(
+            seq_len, device=attention_matrix.device, dtype=torch.bool)
+        attention_matrix = attention_matrix.masked_fill(diagonal_mask, 0.0)
 
-        # Calculate boundary probabilities - sum as normal (only previous token contributes)
-        boundary_scores = attention_scores.sum(dim=-1)  # [batch, seq_len]
-        print(f"Boundary scores shape: {boundary_scores.shape}")
-        print(f"Boundary scores: {boundary_scores[0, :min(10, seq_len)]}")
+        cos_sim = attention_matrix.sum(dim=-1)[:, :-1]
 
-        # Apply learnable temperature scaling and threshold adjustment to sigmoid
-        print(
-            f"Sigmoid temperature: {self.sigmoid_temperature.item():.4f}, threshold: {self.sigmoid_threshold.item():.4f}")
         probs = torch.sigmoid(
-            (boundary_scores - self.sigmoid_threshold) / self.sigmoid_temperature)
-        probs = torch.clamp(probs, min=0.0, max=1.0)
-        probs[:, 0] = 1.0  # Set the first position to 1
-        print(f"Probabilities: {probs[0, :min(10, seq_len)]}")
+            (cos_sim + self.sigmoid_threshold) / self.sigmoid_temperature)
+        probs = F.pad(probs, (1, 0), "constant", 1.0)
+        # All elements are now treated the same; no forced boundary at the first position
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
             temperature=self.temp,
@@ -117,15 +95,19 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        # pooled = downsample(hard_boundaries, hidden)  # S x B x D
-        pooled = delete(hard_boundaries, hidden)  # S x B x D
+        pooled = downsample(hard_boundaries, hidden)  # S x B x D
+        # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 
         loss = self.calc_loss(hard_boundaries)
         self.last_loss = loss  # Store the calculated loss
 
-        return pooled, loss
+        # Calculate kept ratio (ratio of tokens that are not boundaries)
+        kept_ratio = (1 - hard_boundaries).sum(dim=-1).float() / \
+            hard_boundaries.size(-1)
+
+        return pooled, loss, kept_ratio.mean()
 
     def calc_loss(self, preds):
         binomial = torch.distributions.binomial.Binomial(
@@ -137,3 +119,36 @@ class BoundaryPredictor2(nn.Module):
         ).mean() / preds.size(-1)
 
         return loss_boundaries
+
+    # def update_sigma(self, boundary_rates):
+    #     """
+    #     Update sigma based on current batch of boundary rates
+
+    #     Args:
+    #         boundary_rates: Tensor of boundary rates for current samples
+    #     """
+    #     self.sigma = torch.std(boundary_rates)
+    #     self.beta = self.prior - 3 * self.sigma
+
+    # def calc_loss(self, preds):
+    #     """
+    #     Implements the paper's proposed loss: max(k/N - β, 0)
+    #     where k/N is the boundary rate and β = α - λσ
+
+    #     Args:
+    #         preds: Predictions tensor of shape (..., sequence_length)
+
+    #     Returns:
+    #         loss: Scalar loss value
+    #     """
+    #     # Calculate boundary rate k/N for each sample
+    #     boundary_rates = preds.sum(dim=-1) / preds.size(-1)  # k/N
+
+    #     # Update sigma and beta based on current batch
+    #     self.update_sigma(boundary_rates)
+
+    #     # Apply the modified loss: max(k/N - β, 0)
+    #     loss_per_sample = torch.clamp(boundary_rates - self.beta, min=0.0)
+
+    #     # Return mean loss across batch
+    #     return loss_per_sample.mean()

@@ -162,12 +162,15 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         # Unpack model output
         if len(model_output) == 3:
             outputs, boundary_loss, compression_ratios = model_output
+            # Store compression ratios for logging
+            self._compression_ratios = compression_ratios
         else:
             outputs, boundary_loss = model_output
-            compression_ratios = {}
-
-        # Store compression ratios for logging
-        self._compression_ratios = compression_ratios
+            # If not returned, try to get from encoder
+            if hasattr(self.model.encoder, 'compression_ratios'):
+                self._compression_ratios = self.model.encoder.compression_ratios
+            else:
+                self._compression_ratios = {}
 
         lm_logits = self.proj_out(outputs[0])
 
@@ -306,7 +309,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
             [nn.Identity() for _ in range(12)]
         )
         self.predictor_type = predictor_type
-        self.compression_ratio = 0  # Track compression ratios by layer
 
         for layer_idx, prior_value in lp:
             self.boundary_predictors[layer_idx] = BoundaryPredictor2(
@@ -387,6 +389,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
         boundary_loss = 0
+        self.compression_ratios = {}
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -419,9 +422,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, BoundaryPredictor2):
-                    final_hs_for_layer, current_b_loss = predictor_module(
+                    final_hs_for_layer, current_b_loss, kept_ratio = predictor_module(
                         layer_outputs[0])
                     boundary_loss += current_b_loss
+                    self.compression_ratios[f"layer_{idx}_kept_ratio"] = kept_ratio
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
                 hidden_states = layer_outputs[0]
@@ -438,7 +442,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         return MagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
-            compression_ratios=getattr(self, 'compression_ratio', 0)
+            compression_ratios=self.compression_ratios
         )
 
 

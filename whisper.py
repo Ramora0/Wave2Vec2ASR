@@ -109,26 +109,6 @@ data_collator = DataCollatorSpeechSeq2SeqWithPadding(
 wer_metric = load("wer")
 
 
-class CompressionRatioCallback(TrainerCallback):
-    """Callback to log compression ratios to wandb during training"""
-
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        """Log compression ratios whenever other metrics are logged"""
-        if model is not None and hasattr(model, '_compression_ratios'):
-            compression_ratios = getattr(model, '_compression_ratios', {})
-            if compression_ratios:
-                # Log the compression ratios to wandb
-                compression_logs = {}
-                if isinstance(compression_ratios, dict):
-                    for key, value in compression_ratios.items():
-                        compression_logs[f"compression_ratio/{key}"] = value
-                elif isinstance(compression_ratios, (int, float)):
-                    compression_logs["compression_ratio/average"] = compression_ratios
-
-                if compression_logs:
-                    wandb.log(compression_logs, step=state.global_step)
-
-
 def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
@@ -180,6 +160,25 @@ training_args = Seq2SeqTrainingArguments(
     dataloader_pin_memory=True,
 )
 
+
+# Custom callback to log compression ratio with loss
+class CompressionRatioLogger(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # logs contains the loss and other metrics
+        if logs is None:
+            return
+        model = kwargs.get("model", None)
+        if model is not None and hasattr(model, "_compression_ratios"):
+            compression_ratios = getattr(model, "_compression_ratios", {})
+            if compression_ratios:
+                if isinstance(compression_ratios, dict):
+                    for key, value in compression_ratios.items():
+                        logs[f"compression_ratio_{key}"] = value
+                elif isinstance(compression_ratios, (int, float)):
+                    logs["compression_ratio_average"] = compression_ratios
+        # wandb will pick up these logs automatically if using report_to="wandb"
+
+
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
@@ -188,11 +187,8 @@ trainer = Seq2SeqTrainer(
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     tokenizer=processor.feature_extractor,
+    callbacks=[CompressionRatioLogger],
 )
-
-# Add compression ratio callback
-trainer.add_callback(CompressionRatioCallback())
-
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):
