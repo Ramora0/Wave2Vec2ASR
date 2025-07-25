@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 
 def downsample(boundaries, hidden, pooling="mean"):
@@ -124,3 +125,100 @@ def delete(boundaries, hidden):
     )  # Shape (S, B, D)
 
     return padded_kept_tensor
+
+
+def cross_attention_downsample(boundaries, hidden, cross_attn_query, cross_attn_key, cross_attn_value, cross_attn_scale):
+    """
+    Use cross-attention between boundary and non-boundary vectors for downsampling.
+    Vectorized implementation without per-batch loops.
+
+    Args:
+        boundaries: [batch_size, seq_len] - binary mask indicating boundaries
+        hidden: [batch_size, seq_len, hidden_dim] - hidden states
+        cross_attn_query: Linear layer for computing queries
+        cross_attn_key: Linear layer for computing keys
+        cross_attn_value: Linear layer for computing values
+        cross_attn_scale: Scaling factor for attention scores
+
+    Returns:
+        pooled: [batch_size, seq_len, hidden_dim] - downsampled representations
+    """
+    batch_size, seq_len, hidden_dim = hidden.shape
+    device = hidden.device
+
+    # Create masks for boundary and non-boundary positions
+    boundary_mask = boundaries.bool()  # [batch_size, seq_len]
+    non_boundary_mask = ~boundary_mask  # [batch_size, seq_len]
+
+    # Compute queries, keys, values for all hidden states
+    # [batch_size, seq_len, hidden_dim]
+    all_queries = cross_attn_query(hidden)
+    # [batch_size, seq_len, hidden_dim]
+    all_keys = cross_attn_key(hidden)
+    # [batch_size, seq_len, hidden_dim]
+    all_values = cross_attn_value(hidden)
+
+    # Create attention mask: boundary positions attend to non-boundary positions
+    # [batch_size, seq_len, seq_len] - True where boundary can attend to non-boundary
+    attn_mask = boundary_mask.unsqueeze(-1) & non_boundary_mask.unsqueeze(1)
+
+    # Compute attention scores for all pairs
+    # [batch_size, seq_len, seq_len]
+    attn_scores = torch.bmm(
+        all_queries, all_keys.transpose(-2, -1)) * cross_attn_scale
+
+    # Apply mask: set invalid positions to very negative values
+    attn_scores = attn_scores.masked_fill(~attn_mask, float('-inf'))
+
+    # For positions where no valid attention exists, we'll handle separately
+    # Check if any boundary position has valid non-boundary positions to attend to
+    has_valid_attn = attn_mask.any(dim=-1)  # [batch_size, seq_len]
+
+    # Compute attention weights
+    # [batch_size, seq_len, seq_len]
+    attn_weights = F.softmax(attn_scores, dim=-1)
+    # Set NaN values (from softmax of all -inf) to 0
+    attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+
+    # Apply attention to get pooled representations
+    # [batch_size, seq_len, hidden_dim]
+    pooled_representations = torch.bmm(attn_weights, all_values)
+
+    # For boundary positions: combine with original vectors (residual connection)
+    # For non-boundary positions: keep original
+    boundary_output = hidden + pooled_representations
+    result = torch.where(
+        boundary_mask.unsqueeze(-1) & has_valid_attn.unsqueeze(-1),
+        boundary_output,
+        hidden
+    )
+
+    # Only keep boundary positions in the final output
+    # Create output tensor with only boundary positions
+    pooled_list = []
+    for b in range(batch_size):
+        boundary_indices = torch.where(boundary_mask[b])[0]
+        if len(boundary_indices) > 0:
+            pooled_list.append(result[b][boundary_indices])
+        else:
+            # If no boundaries, return the full sequence
+            pooled_list.append(result[b])
+
+    # Find max length and pad
+    if pooled_list:
+        max_len = max(rep.shape[0] for rep in pooled_list)
+        padded_representations = []
+        for rep in pooled_list:
+            if rep.shape[0] < max_len:
+                padding = torch.zeros(max_len - rep.shape[0], hidden_dim,
+                                      device=device, dtype=rep.dtype)
+                rep = torch.cat([rep, padding], dim=0)
+            padded_representations.append(rep)
+
+        # Stack into a single tensor [batch_size, max_len, hidden_dim]
+        pooled = torch.stack(padded_representations, dim=0)
+    else:
+        # Fallback case
+        pooled = hidden
+
+    return pooled

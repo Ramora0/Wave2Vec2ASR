@@ -9,20 +9,19 @@ from torch.nn import CrossEntropyLoss
 from torch import nn
 import os
 
+from BoundaryPredictor1 import BoundaryPredictor1
 from BoundaryPredictor2 import BoundaryPredictor2
-from HNetBoundaryPredictor import HNetBoundaryPredictor
+from BoundaryPredictor3 import BoundaryPredictor3
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
-    def load_magnet(self, lp, predictor_type="boundary"):
+
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        # Extract predictor_type from kwargs, default to "boundary"
-        predictor_type = kwargs.pop("predictor_type", "boundary")
-
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
 
         # Check if boundary predictor files exist
@@ -31,68 +30,137 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         boundary_states_path = os.path.join(
             pretrained_model_name_or_path, "boundary_predictors.bin")
 
+        # Load from separate files
         params = torch.load(boundary_params_path, map_location="cpu")
         layer_priors = params["layer_priors"]
         layer_temps = params.get("layer_temps", [])
         layer_thresholds = params.get("layer_thresholds", [])
-        saved_predictor_type = params.get("predictor_type", "boundary")
+        layer_types = params.get("layer_types", [])
 
         # Initialize the magnet component
         model.__class__ = cls
-        model.load_magnet(layer_priors, saved_predictor_type)
+
+        # If we have layer_types information, reconstruct boundary_predictors based on saved types
+        if layer_types:
+            # Convert model to MagnetWhisperModel and encoder to MagnetWhisperEncoder
+            model.model.__class__ = MagnetWhisperModel
+            model.model.encoder.__class__ = MagnetWhisperEncoder
+
+            # Create new ModuleList based on saved types
+            model.model.encoder.boundary_predictors = nn.ModuleList(
+                [nn.Identity() for _ in range(12)]
+            )
+            model.model.encoder.compression_ratios = {}
+            # Initialize boundary and position counters in encoder
+            model.model.encoder.total_boundaries = 0
+            model.model.encoder.total_positions = 0
+
+            # Reconstruct each predictor based on saved type information
+            layer_types_dict = dict(layer_types)
+            layer_priors_dict = dict(layer_priors)
+
+            for idx in range(12):
+                predictor_type = layer_types_dict.get(idx, "Identity")
+                if predictor_type == "BoundaryPredictor1" and idx in layer_priors_dict:
+                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor1(
+                        768,
+                        768,
+                        layer_priors_dict[idx],
+                        1,
+                        0.5
+                    )
+                elif predictor_type == "BoundaryPredictor2" and idx in layer_priors_dict:
+                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor2(
+                        768,
+                        768,
+                        layer_priors_dict[idx],
+                        1,
+                        0.5
+                    )
+                elif predictor_type == "BoundaryPredictor3" and idx in layer_priors_dict:
+                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor3(
+                        768,
+                        768,
+                        layer_priors_dict[idx],
+                        1,
+                        0.5
+                    )
+        else:
+            # Fallback to old method for backward compatibility
+            model.load_magnet(layer_priors, "BoundaryPredictor1")
 
         # Load boundary predictor states
         boundary_state_dict = torch.load(
             boundary_states_path, map_location="cpu")
-        model.model.encoder.boundary_predictors.load_state_dict(
-            boundary_state_dict)
 
-        # Update temperature and threshold for boundary predictors using saved values (only for BoundaryPredictor)
-        if saved_predictor_type == "boundary":
-            temp_dict = dict(layer_temps)
-            threshold_dict = dict(layer_thresholds)
+        # Load state dict only for BoundaryPredictor instances, not Identity layers
+        for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                predictor_key = str(idx)
+                if predictor_key in boundary_state_dict:
+                    boundary_predictor.load_state_dict(
+                        boundary_state_dict[predictor_key])
 
-            for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-                if isinstance(boundary_predictor, BoundaryPredictor2):
-                    boundary_predictor.temp = temp_dict[idx]
-                    boundary_predictor.threshold = threshold_dict[idx]
+        # Update temperature and threshold for boundary predictors using saved values
+        temp_dict = dict(layer_temps)
+        threshold_dict = dict(layer_thresholds)
+
+        for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                boundary_predictor.temp = temp_dict[idx]
+                boundary_predictor.threshold = threshold_dict[idx]
 
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
         super().save_pretrained(save_directory, *args, **kwargs)
 
-        # Save boundary predictor states
+        # Save boundary predictor states - only for BoundaryPredictor1 instances
         boundary_states_path = os.path.join(
             save_directory, "boundary_predictors.bin")
-        torch.save(self.model.encoder.boundary_predictors.state_dict(),
-                   boundary_states_path)
+
+        # Create a state dict containing only BoundaryPredictor instances
+        boundary_state_dict = {}
+        for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                boundary_state_dict[str(idx)] = boundary_predictor.state_dict()
+
+        torch.save(boundary_state_dict, boundary_states_path)
 
         # Save boundary predictor parameters
         boundary_params_path = os.path.join(
             save_directory, "boundary_params.pt")
 
-        # Collect parameters from boundary predictors
+        # Collect parameters from boundary predictors and track their types
         layer_priors = []
         layer_temps = []
         layer_thresholds = []
-        predictor_type = "boundary"  # Default type
+        layer_types = []  # Track what type each layer is
 
         for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, BoundaryPredictor2):
+            if isinstance(boundary_predictor, BoundaryPredictor1):
                 layer_priors.append((idx, boundary_predictor.prior))
                 layer_temps.append((idx, boundary_predictor.temp))
                 layer_thresholds.append((idx, boundary_predictor.threshold))
-                predictor_type = "boundary"
-            elif isinstance(boundary_predictor, HNetBoundaryPredictor):
-                layer_priors.append((idx, 0.0))  # HNet doesn't use prior
-                predictor_type = "hnet"
+                layer_types.append((idx, "BoundaryPredictor1"))
+            elif isinstance(boundary_predictor, BoundaryPredictor2):
+                layer_priors.append((idx, boundary_predictor.prior))
+                layer_temps.append((idx, boundary_predictor.temp))
+                layer_thresholds.append((idx, boundary_predictor.threshold))
+                layer_types.append((idx, "BoundaryPredictor2"))
+            elif isinstance(boundary_predictor, BoundaryPredictor3):
+                layer_priors.append((idx, boundary_predictor.prior))
+                layer_temps.append((idx, boundary_predictor.temp))
+                layer_thresholds.append((idx, boundary_predictor.threshold))
+                layer_types.append((idx, "BoundaryPredictor3"))
+            else:
+                layer_types.append((idx, "Identity"))
 
         params = {
             "layer_priors": layer_priors,
             "layer_temps": layer_temps,
             "layer_thresholds": layer_thresholds,
-            "predictor_type": predictor_type,
+            "layer_types": layer_types,
         }
         torch.save(params, boundary_params_path)
 
@@ -213,11 +281,36 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             encoder_attentions=outputs.encoder_attentions,
         )
 
+    def get_and_reset_compression_ratio(self):
+        """
+        Calculate and return the compression ratio, then reset the counters.
+
+        Returns:
+            float: Compression ratio (boundaries / total_positions)
+        """
+        total_boundaries = self.model.encoder.total_boundaries
+        total_positions = self.model.encoder.total_positions
+        # Reset encoder counters after collecting
+        self.model.encoder.total_boundaries = 0
+        self.model.encoder.total_positions = 0
+
+        if total_positions == 0:
+            compression_ratio = 0.0
+        else:
+            compression_ratio = total_boundaries / total_positions
+
+        return compression_ratio
+
 
 class MagnetWhisperModel(WhisperModel):
-    def load_magnet(self, lp, predictor_type="boundary"):
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.encoder.__class__ = MagnetWhisperEncoder
         self.encoder.load_magnet(lp, predictor_type)
+        # Ensure encoder has the tracking counters
+        if not hasattr(self.encoder, 'total_boundaries'):
+            self.encoder.total_boundaries = 0
+        if not hasattr(self.encoder, 'total_positions'):
+            self.encoder.total_positions = 0
 
     def forward(
         self,
@@ -318,15 +411,25 @@ class MagnetWhisperModel(WhisperModel):
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
-    def load_magnet(self, lp, predictor_type="boundary"):
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
         )
-        self.predictor_type = predictor_type
-        self.compression_ratio = 0  # Track compression ratios by layer
+        self.compression_ratios = {}  # Track compression ratios by layer
+        # Initialize boundary and position counters
+        self.total_boundaries = 0
+        self.total_positions = 0
 
         for layer_idx, prior_value in lp:
-            if predictor_type == "boundary":
+            if predictor_type == "BoundaryPredictor1":
+                self.boundary_predictors[layer_idx] = BoundaryPredictor1(
+                    768,
+                    768,
+                    prior_value,
+                    1,
+                    0.5
+                )
+            elif predictor_type == "BoundaryPredictor2":
                 self.boundary_predictors[layer_idx] = BoundaryPredictor2(
                     768,
                     768,
@@ -334,12 +437,17 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     1,
                     0.5
                 )
-            elif predictor_type == "hnet":
-                self.boundary_predictors[layer_idx] = HNetBoundaryPredictor(
-                    768,  # d_model
-                    device=None,
-                    dtype=None
+            elif predictor_type == "BoundaryPredictor3":
+                self.boundary_predictors[layer_idx] = BoundaryPredictor3(
+                    768,
+                    768,
+                    prior_value,
+                    1,
+                    0.5
                 )
+            else:
+                raise ValueError(
+                    f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3")
 
     def forward(
         self,
@@ -442,24 +550,24 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     )
 
                 predictor_module = self.boundary_predictors[idx]
-                if isinstance(predictor_module, BoundaryPredictor2):
-                    final_hs_for_layer, current_b_loss = predictor_module(
-                        layer_outputs[0])
+                if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                    result = predictor_module(layer_outputs[0])
+                    if len(result) == 4:  # New format with compression metrics
+                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions = result
+                        # Update encoder's counters
+                        self.total_boundaries += num_boundaries
+                        self.total_positions += total_positions
+                        # Track per-layer compression ratio
+                        if total_positions > 0:
+                            self.compression_ratios[idx] = num_boundaries / \
+                                total_positions
+                        else:
+                            self.compression_ratios[idx] = 0.0
+                    else:  # Old format, backward compatibility
+                        final_hs_for_layer, current_b_loss = result
+                        # Unknown compression ratio for old format
+                        self.compression_ratios[idx] = 0.0
                     boundary_loss += current_b_loss
-                    layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
-                elif isinstance(predictor_module, HNetBoundaryPredictor):
-                    # HNetBoundaryPredictor returns WhisperBoundaryOutput
-                    boundary_output = predictor_module(layer_outputs[0])
-                    # Track compression ratio for this layer
-                    compression_ratios = predictor_module.get_compression_ratio(
-                        boundary_output.boundary_mask)
-                    # Store mean compression ratio
-                    self.compression_ratio = compression_ratios.mean(
-                    ).item()
-
-                    # Use compressed features as the new hidden states
-                    # HNetBoundaryPredictor now uses the same padding strategy as BoundaryPredictor
-                    final_hs_for_layer = boundary_output.compressed_features
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
                 hidden_states = layer_outputs[0]
@@ -476,7 +584,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         return MagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
-            compression_ratios=getattr(self, 'compression_ratio', 0)
+            compression_ratios=getattr(self, 'compression_ratios', {})
         )
 
 

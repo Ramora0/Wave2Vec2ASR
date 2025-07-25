@@ -75,7 +75,7 @@ model.generation_config.task = "transcribe"
 model.generation_config.forced_decoder_ids = None
 
 model.__class__ = MagnetWhisper
-model.load_magnet([(1, .5)], predictor_type="boundary")
+model.load_magnet([(1, 0.33)], "BoundaryPredictor3")
 
 # model.__class__ = SlidingWhisper
 # model.load_sliding(window_size=128)
@@ -128,20 +128,10 @@ class CompressionRatioCallback(TrainerCallback):
     """Callback to log compression ratios to wandb during training"""
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        """Log compression ratios whenever other metrics are logged"""
-        if model is not None and hasattr(model, '_compression_ratios'):
-            compression_ratios = getattr(model, '_compression_ratios', {})
-            if compression_ratios:
-                # Log the compression ratios to wandb
-                compression_logs = {}
-                if isinstance(compression_ratios, dict):
-                    for key, value in compression_ratios.items():
-                        compression_logs[f"compression_ratio/{key}"] = value
-                elif isinstance(compression_ratios, (int, float)):
-                    compression_logs["compression_ratio/average"] = compression_ratios
-
-                if compression_logs:
-                    wandb.log(compression_logs, step=state.global_step)
+        compression_ratio = model.get_and_reset_compression_ratio()
+        wandb.log({
+            "train/compression_ratio": compression_ratio
+        })
 
 
 def compute_metrics(pred):
@@ -162,7 +152,7 @@ def compute_metrics(pred):
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "base"
+MODEL_NAME = "magnet"
 
 training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
@@ -179,7 +169,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=6,
+    num_train_epochs=5,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
@@ -220,8 +210,9 @@ trainer.add_callback(CompressionRatioCallback())
 trainer.train()
 # trainer.save_model(f"./models/{MODEL_NAME}")
 
-model.save_pretrained(f"./models/{MODEL_NAME}")
-model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")
+# model.save_pretrained(f"./models/{MODEL_NAME}")
+# model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")
+model = model.to("cuda")
 
 
 def map_to_pred(batch):
@@ -275,25 +266,11 @@ def test_inference_speed(dataset_subset, num_samples=100):
         f"Total inference time for {len(samples)} samples: {total_time:.4f} seconds")
     print(f"Samples per second: {len(samples) / total_time:.2f}")
 
-    wandb.log({
-        "evaluation/avg_inference_time": avg_time,
-        "evaluation/total_inference_time": total_time,
-        "evaluation/samples_per_second": len(samples) / total_time
-    })
-
-    # Log compression ratios if available
-    if hasattr(model, '_compression_ratios'):
-        compression_ratios = getattr(model, '_compression_ratios', {})
-        if compression_ratios:
-            compression_logs = {}
-            if isinstance(compression_ratios, dict):
-                for key, value in compression_ratios.items():
-                    compression_logs[f"evaluation/compression_ratio_{key}"] = value
-            elif isinstance(compression_ratios, (int, float)):
-                compression_logs["evaluation/compression_ratio_average"] = compression_ratios
-
-            if compression_logs:
-                wandb.log(compression_logs)
+    # wandb.log({
+    #     "evaluation/avg_inference_time": avg_time,
+    #     "evaluation/total_inference_time": total_time,
+    #     "evaluation/samples_per_second": len(samples) / total_time
+    # })
 
     return avg_time, total_time
 
@@ -312,21 +289,6 @@ wer = client.compute(
 print(
     f"WER: {100 * wer:.2f}%")
 
-wandb.log({
-    "evaluation/wer": 100 * wer
-})
-
-# Log final compression ratios if available
-if hasattr(model, '_compression_ratios'):
-    compression_ratios = getattr(model, '_compression_ratios', {})
-    if compression_ratios:
-        compression_logs = {}
-        if isinstance(compression_ratios, dict):
-            for key, value in compression_ratios.items():
-                compression_logs[f"final/compression_ratio_{key}"] = value
-        elif isinstance(compression_ratios, (int, float)):
-            compression_logs["final/compression_ratio_average"] = compression_ratios
-
-        if compression_logs:
-            wandb.log(compression_logs)
-            print(f"Final compression ratios: {compression_logs}")
+# wandb.log({
+#     "evaluation/wer": 100 * wer
+# })

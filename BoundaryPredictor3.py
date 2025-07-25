@@ -5,11 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from loss import hinge_loss
-from utils import delete, downsample
+from loss import binomial_loss
+from utils import delete, downsample, cross_attention_downsample
 
 
-class BoundaryPredictor2(nn.Module):
+class BoundaryPredictor3(nn.Module):
     def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5):
         """
         input_dim: dimensionality of per-token vectors (D)
@@ -32,6 +32,12 @@ class BoundaryPredictor2(nn.Module):
             self.k_proj_layer.weight.copy_(torch.eye(input_dim))
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
+
+        # Cross-attention components for downsampling
+        self.cross_attn_query = nn.Linear(input_dim, input_dim, bias=False)
+        self.cross_attn_key = nn.Linear(input_dim, input_dim, bias=False)
+        self.cross_attn_value = nn.Linear(input_dim, input_dim, bias=False)
+        self.cross_attn_scale = input_dim ** -0.5
 
     def set_prior(self, prior):
         self.prior = prior
@@ -59,8 +65,12 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled = downsample(hard_boundaries, hidden)  # S x B x D
-        # pooled = delete(hard_boundaries, hidden)  # S x B x D
+        # Cross-attention based downsampling
+        pooled = cross_attention_downsample(
+            hard_boundaries, hidden,
+            self.cross_attn_query, self.cross_attn_key, self.cross_attn_value,
+            self.cross_attn_scale
+        )
 
         pooled = pooled.transpose(0, 1)
 
@@ -76,13 +86,4 @@ class BoundaryPredictor2(nn.Module):
         return pooled, loss, num_boundaries, total_positions
 
     def calc_loss(self, preds):
-        return hinge_loss(preds, self.prior, .025)
-        # binomial = torch.distributions.binomial.Binomial(
-        #     preds.size(-1),
-        #     probs=torch.Tensor([self.prior]).to(preds.device)
-        # )
-        # loss_boundaries = -binomial.log_prob(
-        #     preds.sum(dim=-1)
-        # ).mean() / preds.size(-1)
-
-        # return loss_boundaries
+        return binomial_loss(preds, self.prior)

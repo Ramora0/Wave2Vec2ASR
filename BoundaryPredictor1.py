@@ -5,10 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from loss import hinge_loss
 from utils import downsample
 
 
-class BoundaryPredictor(nn.Module):
+class BoundaryPredictor1(nn.Module):
     def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5):
         """
         input_dim: dimensionality of per-token vectors (D)
@@ -57,15 +58,22 @@ class BoundaryPredictor(nn.Module):
         loss = self.calc_loss(hard_boundaries)
         self.last_loss = loss  # Store the calculated loss
 
-        return pooled, loss
+        # Calculate compression metrics
+        # Total boundaries across all sequences in batch
+        num_boundaries = hard_boundaries.sum().item()
+        # Total positions across all sequences in batch
+        total_positions = hard_boundaries.numel()
+
+        return pooled, loss, num_boundaries, total_positions
 
     def calc_loss(self, preds):
-        binomial = torch.distributions.binomial.Binomial(
-            preds.size(-1),
-            probs=torch.Tensor([self.prior]).to(preds.device)
-        )
-        loss_boundaries = -binomial.log_prob(
-            preds.sum(dim=-1)
-        ).mean() / preds.size(-1)
+        return hinge_loss(preds, self.prior + 0.05, .05)
+        # binomial = torch.distributions.binomial.Binomial(
+        #     preds.size(-1),
+        #     probs=torch.Tensor([self.prior]).to(preds.device)
+        # )
+        # loss_boundaries = -binomial.log_prob(
+        #     preds.sum(dim=-1)
+        # ).mean() / preds.size(-1)
 
-        return loss_boundaries
+        # return loss_boundaries

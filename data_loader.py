@@ -25,7 +25,10 @@ def prepare_dataset(batch, feature_extractor, tokenizer):
     }
 
 
-def get_dataset(dataset, feature_extractor, tokenizer, split_name="train.clean.360", cache_dir="/fs/scratch/lees_stuff"):
+def get_dataset(dataset, feature_extractor, tokenizer,
+                num_proc=1,
+                split_name="train.clean.360",
+                cache_dir="/fs/scratch/lees_stuff"):
     cache_path = Path(cache_dir) / f"{split_name}.arrow"
     if cache_path.exists():
         print("🔁 Loading processed dataset from disk...")
@@ -35,7 +38,7 @@ def get_dataset(dataset, feature_extractor, tokenizer, split_name="train.clean.3
     processed = dataset.map(
         prepare_dataset,
         remove_columns=dataset.column_names[split_name],
-        num_proc=1,
+        num_proc=num_proc,
         batched=True,
         fn_kwargs={
             "feature_extractor": feature_extractor,
