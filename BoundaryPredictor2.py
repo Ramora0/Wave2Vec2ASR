@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from loss import hinge_loss
+from loss import binomial_loss, hinge_loss
 from utils import delete, downsample
 
 
@@ -76,7 +76,7 @@ class BoundaryPredictor2(nn.Module):
         return pooled, loss, num_boundaries, total_positions
 
     def calc_loss(self, preds):
-        return hinge_loss(preds, self.prior, .025)
+        return binomial_loss(preds, self.prior)
         # binomial = torch.distributions.binomial.Binomial(
         #     preds.size(-1),
         #     probs=torch.Tensor([self.prior]).to(preds.device)

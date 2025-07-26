@@ -39,5 +39,5 @@ tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="E
 processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="English", task="transcribe",
                                              token="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")
 
-dataset = get_dataset(dataset, feature_extractor, tokenizer,
-                      split_name="train", num_proc=4)
+dataset = get_dataset(dataset, feature_extractor,
+                      tokenizer, cache_dir="librispeech-full")
