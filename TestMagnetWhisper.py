@@ -14,10 +14,10 @@ from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
 
 
-class MagnetWhisper(WhisperForConditionalGeneration):
+class TestMagnetWhisper(WhisperForConditionalGeneration):
 
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
-        self.model.__class__ = MagnetWhisperModel
+        self.model.__class__ = TestMagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
 
     @classmethod
@@ -54,10 +54,10 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             # Convert model to MagnetWhisperModel and encoder to MagnetWhisperEncoder
             print(
                 f"Converting model.model class from {model.model.__class__.__name__} to MagnetWhisperModel")
-            model.model.__class__ = MagnetWhisperModel
+            model.model.__class__ = TestMagnetWhisperModel
             print(
                 f"Converting encoder class from {model.model.encoder.__class__.__name__} to MagnetWhisperEncoder")
-            model.model.encoder.__class__ = MagnetWhisperEncoder
+            model.model.encoder.__class__ = TestMagnetWhisperEncoder
 
             # Create new ModuleList based on saved types
             print("Creating boundary_predictors ModuleList with 12 Identity layers")
@@ -68,6 +68,8 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             # Initialize boundary and position counters in encoder
             model.model.encoder.total_boundaries = 0
             model.model.encoder.total_positions = 0
+            # Initialize boundary positions storage
+            model.model.encoder.last_boundary_positions = {}
 
             # Reconstruct each predictor based on saved type information
             layer_types_dict = dict(layer_types)
@@ -359,16 +361,31 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
         return compression_ratio
 
+    def get_boundary_positions(self):
+        """
+        Get the boundary positions from the last forward pass.
 
-class MagnetWhisperModel(WhisperModel):
+        Returns:
+            dict: Dictionary mapping layer indices to lists of boundary positions
+        """
+        return self.model.encoder.get_boundary_positions()
+
+    def clear_boundary_positions(self):
+        """Clear stored boundary positions"""
+        self.model.encoder.clear_boundary_positions()
+
+
+class TestMagnetWhisperModel(WhisperModel):
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
-        self.encoder.__class__ = MagnetWhisperEncoder
+        self.encoder.__class__ = TestMagnetWhisperEncoder
         self.encoder.load_magnet(lp, predictor_type)
-        # Ensure encoder has the tracking counters
+        # Ensure encoder has the tracking counters and boundary positions storage
         if not hasattr(self.encoder, 'total_boundaries'):
             self.encoder.total_boundaries = 0
         if not hasattr(self.encoder, 'total_positions'):
             self.encoder.total_positions = 0
+        if not hasattr(self.encoder, 'last_boundary_positions'):
+            self.encoder.last_boundary_positions = {}
 
     def forward(
         self,
@@ -468,7 +485,7 @@ class MagnetWhisperModel(WhisperModel):
         ), encoder_outputs.boundary_loss, getattr(encoder_outputs, 'compression_ratios', {})
 
 
-class MagnetWhisperEncoder(WhisperEncoder):
+class TestMagnetWhisperEncoder(WhisperEncoder):
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
@@ -477,6 +494,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # Initialize boundary and position counters
         self.total_boundaries = 0
         self.total_positions = 0
+        # Store boundary positions for analysis
+        self.last_boundary_positions = {}
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":
@@ -506,6 +525,27 @@ class MagnetWhisperEncoder(WhisperEncoder):
             else:
                 raise ValueError(
                     f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3")
+
+    def get_boundary_positions(self):
+        """Return the last recorded boundary positions"""
+        return self.last_boundary_positions.copy()
+
+    def clear_boundary_positions(self):
+        """Clear stored boundary positions"""
+        self.last_boundary_positions = {}
+
+    def _extract_boundary_positions(self, hard_boundaries):
+        """Helper function to extract boundary positions from tensor"""
+        boundary_positions = []
+        for batch_idx in range(hard_boundaries.shape[0]):
+            positions = torch.nonzero(
+                hard_boundaries[batch_idx], as_tuple=False).squeeze(-1).cpu().tolist()
+            if isinstance(positions, int):
+                positions = [positions]
+            elif len(positions) == 0:
+                positions = []
+            boundary_positions.append(positions)
+        return boundary_positions
 
     def forward(
         self,
@@ -609,22 +649,26 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-                    result = predictor_module(layer_outputs[0])
-                    if len(result) == 4:  # New format with compression metrics
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions = result
-                        # Update encoder's counters
-                        self.total_boundaries += num_boundaries
-                        self.total_positions += total_positions
-                        # Track per-layer compression ratio
-                        if total_positions > 0:
-                            self.compression_ratios[idx] = num_boundaries / \
-                                total_positions
-                        else:
-                            self.compression_ratios[idx] = 0.0
-                    else:  # Old format, backward compatibility
-                        final_hs_for_layer, current_b_loss = result
-                        # Unknown compression ratio for old format
+                    # Call the predictor with return_boundary_positions=True
+                    result = predictor_module(
+                        layer_outputs[0], return_boundary_positions=True)
+
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, hard_boundaries = result
+                    # Convert tensor to position lists and store
+                    boundary_positions = self._extract_boundary_positions(
+                        hard_boundaries)
+                    self.last_boundary_positions[idx] = boundary_positions
+
+                    # Update encoder's counters
+                    self.total_boundaries += num_boundaries
+                    self.total_positions += total_positions
+                    # Track per-layer compression ratio
+                    if total_positions > 0:
+                        self.compression_ratios[idx] = num_boundaries / \
+                            total_positions
+                    else:
                         self.compression_ratios[idx] = 0.0
+
                     boundary_loss += current_b_loss
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
@@ -639,7 +683,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         if not return_dict:
             return (tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None), 0)
-        return MagnetModelOutput(
+        return TestMagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
             compression_ratios=getattr(self, 'compression_ratios', {})
@@ -647,6 +691,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
 
 @dataclass
-class MagnetModelOutput(BaseModelOutput):
+class TestMagnetModelOutput(BaseModelOutput):
     boundary_loss: Optional[torch.FloatTensor] = None
     compression_ratios: Optional[Dict] = None

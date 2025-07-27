@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from loss import binomial_loss, hinge_loss
-from utils import delete, downsample
+from utils import delete, downsample, weighted_downsample
 
 
 class BoundaryPredictor2(nn.Module):
@@ -36,7 +36,7 @@ class BoundaryPredictor2(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden):
+    def forward(self, hidden, return_boundary_positions=False):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
             # Move normalization to before the projection layer
@@ -44,8 +44,12 @@ class BoundaryPredictor2(nn.Module):
             self.k_proj_layer(F.normalize(hidden[:, 1:]))
         )
 
+        # Append -1 to cos_sim to match the length of hidden
+        cos_sim = F.pad(cos_sim, (1, 0), "constant", -1.0)
+
         probs = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
-        probs = F.pad(probs, (1, 0), "constant", 1.0)
+        # probs = torch.sigmoid(cos_sim)
+        # probs = F.pad(probs, (1, 0), "constant", 1.0)
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
             temperature=self.temp,
@@ -59,7 +63,8 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled = downsample(hard_boundaries, hidden)  # S x B x D
+        pooled = weighted_downsample(hard_boundaries, cos_sim, hidden)
+        # pooled = downsample(hard_boundaries, hidden)  # S x B x D
         # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
@@ -73,7 +78,10 @@ class BoundaryPredictor2(nn.Module):
         # Total positions across all sequences in batch
         total_positions = hard_boundaries.numel()
 
-        return pooled, loss, num_boundaries, total_positions
+        if return_boundary_positions:
+            return pooled, loss, num_boundaries, total_positions, hard_boundaries
+        else:
+            return pooled, loss, num_boundaries, total_positions
 
     def calc_loss(self, preds):
         return binomial_loss(preds, self.prior)

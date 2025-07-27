@@ -33,9 +33,9 @@ print("hi")
 
 # dataset.save_to_disk(f"{scratch_path}/librispeech-trimmed")
 
-dataset = load_from_disk(f"{scratch_path}/librispeech-full")
+dataset = load_from_disk(f"{scratch_path}/librispeech-processed")
 
-print(dataset["train.clean.360"][0])
+print(dataset["train"][0])
 
 
 feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small",
@@ -46,10 +46,6 @@ tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="E
 
 processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="English", task="transcribe",
                                              token="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")
-
-dataset = get_dataset(dataset, feature_extractor,
-                      tokenizer, split_name="train.clean.360")
-
 
 dataset = dataset.with_format("torch")
 
@@ -63,12 +59,6 @@ model = WhisperForConditionalGeneration.from_pretrained(
 )
 
 model.to("cuda")
-
-# use_flash_attention_2=True)
-# attn_implementation="flash_attention_2")
-
-# model = WhisperForConditionalGeneration.from_pretrained("data/models/whisper/base")
-
 
 model.generation_config.language = "english"
 model.generation_config.task = "transcribe"
@@ -170,7 +160,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=6,
+    num_train_epochs=3,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
@@ -189,7 +179,7 @@ training_args = Seq2SeqTrainingArguments(
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=dataset["train.clean.360"],
+    train_dataset=dataset["train"],
     eval_dataset=dataset["validation.clean"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,
@@ -211,8 +201,8 @@ trainer.add_callback(CompressionRatioCallback())
 trainer.train()
 # trainer.save_model(f"./models/{MODEL_NAME}")
 
-# model.save_pretrained(f"./models/{MODEL_NAME}")
-# model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")
+model.save_pretrained(f"./models/{MODEL_NAME}")
+model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")
 model = model.to("cuda")
 
 

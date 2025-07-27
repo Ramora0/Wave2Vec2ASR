@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-def downsample(boundaries, hidden, pooling="mean"):
+def downsample(boundaries, hidden):
     """
     Downsamples hidden states based on boundaries using vectorized torch operations.
     A new segment starts at index 0 and at every index t+1 where boundaries[b, t] == 1.
@@ -38,46 +38,132 @@ def downsample(boundaries, hidden, pooling="mean"):
     max_segments = num_segments_per_batch.max(
     ).item() if batch_size > 0 and seq_len > 0 else 0
 
-    if pooling == "mean":
-        # 3. Sum hidden states per segment using scatter_add_.
-        # Target tensor for sums: (B, max_segments, D)
-        summed_hidden = torch.zeros(
-            batch_size, max_segments, model_dim, device=device, dtype=dtype)
-        # Index for scatter_add_: needs to match shape of source (hidden) along scatter dim (1)
-        # Index shape: (B, L) -> expand to (B, L, D)
-        index = segment_ids.unsqueeze(-1).expand_as(hidden)  # Shape: (B, L, D)
-        summed_hidden.scatter_add_(dim=1, index=index, src=hidden)
+    # 3. Sum hidden states per segment using scatter_add_.
+    # Target tensor for sums: (B, max_segments, D)
+    summed_hidden = torch.zeros(
+        batch_size, max_segments, model_dim, device=device, dtype=dtype)
+    # Index for scatter_add_: needs to match shape of source (hidden) along scatter dim (1)
+    # Index shape: (B, L) -> expand to (B, L, D)
+    index = segment_ids.unsqueeze(-1).expand_as(hidden)  # Shape: (B, L, D)
+    summed_hidden.scatter_add_(dim=1, index=index, src=hidden)
 
-        # 4. Count segment lengths using scatter_add_.
-        # Target tensor for counts: (B, max_segments)
-        segment_lengths = torch.zeros(
-            batch_size, max_segments, device=device, dtype=torch.int64)
-        # Index for scatter_add_: (B, L)
-        # Source for scatter_add_: ones(B, L)
-        segment_lengths.scatter_add_(
-            dim=1, index=segment_ids, src=torch.ones_like(segment_ids))
+    # 4. Count segment lengths using scatter_add_.
+    # Target tensor for counts: (B, max_segments)
+    segment_lengths = torch.zeros(
+        batch_size, max_segments, device=device, dtype=torch.int64)
+    # Index for scatter_add_: (B, L)
+    # Source for scatter_add_: ones(B, L)
+    segment_lengths.scatter_add_(
+        dim=1, index=segment_ids, src=torch.ones_like(segment_ids))
 
-        # 5. Calculate the mean.
-        # Avoid division by zero for potentially empty segments (scatter_add initializes with 0).
-        # Clamp segment_lengths to minimum 1 before dividing.
-        # Shape: (B, max_segments, 1)
-        segment_lengths_clamped = segment_lengths.unsqueeze(-1).clamp(min=1)
-        # Shape: (B, max_segments, D)
-        pooled_batch = summed_hidden / segment_lengths_clamped
-    elif pooling == "max":
-        index = segment_ids.unsqueeze(-1).expand_as(hidden)  # Shape: (B, L, D)
-
-        pooled_batch = torch.scatter_reduce(
-            input=torch.full((batch_size, max_segments, model_dim), torch.finfo(
-                dtype).min, device=device, dtype=dtype),  # Initialize with min value
-            dim=1,
-            index=index,
-            src=hidden,  # Use src argument for the source tensor
-            reduce="amax",
-            include_self=False  # Exclude initial min values from reduction
-        )
+    # 5. Calculate the mean.
+    # Avoid division by zero for potentially empty segments (scatter_add initializes with 0).
+    # Clamp segment_lengths to minimum 1 before dividing.
+    # Shape: (B, max_segments, 1)
+    segment_lengths_clamped = segment_lengths.unsqueeze(-1).clamp(min=1)
+    # Shape: (B, max_segments, D)
+    pooled_batch = summed_hidden / segment_lengths_clamped
 
     # 6. Transpose to match the expected output shape (S, B, D).
+    pooled_tensor = pooled_batch.transpose(0, 1)  # Shape: (max_segments, B, D)
+
+    return pooled_tensor
+
+
+def weighted_downsample(boundaries, probs, hidden):
+    """
+    Downsamples hidden states based on boundaries using weighted sums based on probability values.
+    A new segment starts at index 0 and at every index t+1 where boundaries[b, t] == 1.
+
+    Args:
+        boundaries (torch.Tensor): Tensor of shape (B, L), dtype=float or long.
+                                   1 indicates the *end* of a segment at index t.
+        probs (torch.Tensor): Tensor of shape (B, L), dtype=float.
+                              Probability values used for weighting the hidden states.
+        hidden (torch.Tensor): Tensor of shape (B, L, D) containing hidden states.
+
+    Returns:
+        torch.Tensor: Weighted pooled hidden states of shape (S, B, D), where S is the
+                      maximum number of segments in the batch. Padded with zeros.
+    """
+    batch_size, seq_len, model_dim = hidden.shape
+    device = hidden.device
+    dtype = hidden.dtype
+
+    # Ensure boundaries is long type for indexing and cumsum
+    boundaries = boundaries.long()
+
+    # 1. Calculate segment IDs for each time step t in each batch item b.
+    # segment_ids[b, t] = ID of the segment that hidden[b, t] belongs to.
+    # A new segment starts at t=0 and at t+1 if boundaries[b, t] == 1.
+    # We use cumsum on boundaries shifted right by one, prepended with 0.
+    segment_ids = torch.cat([
+        torch.zeros_like(boundaries[:, :1]),  # Segment 0 starts at index 0
+        # Boundary at t-1 means new segment starts at t
+        boundaries[:, :-1]
+    ], dim=1).cumsum(dim=1)  # Shape: (B, L)
+
+    # 2. Determine the number of segments for each batch item and the maximum.
+    num_segments_per_batch = segment_ids[:, -1] + 1  # Max segment ID + 1
+    max_segments = num_segments_per_batch.max(
+    ).item() if batch_size > 0 and seq_len > 0 else 0
+
+    # 3. Apply vectorized softmax within each segment
+    # Create a unique segment identifier across the entire batch
+    # Shape: (B, L) -> (B*L,)
+    batch_indices = torch.arange(
+        batch_size, device=device).unsqueeze(1).expand(-1, seq_len)
+    global_segment_ids = batch_indices * \
+        max_segments + segment_ids  # Shape: (B, L)
+
+    # Flatten for scatter operations
+    flat_probs = probs.view(-1)  # Shape: (B*L,)
+    flat_segment_ids = global_segment_ids.view(-1)  # Shape: (B*L,)
+
+    # Apply softmax within each segment using scatter operations
+    # First, find the maximum value within each segment for numerical stability
+    max_vals = torch.full((batch_size * max_segments,),
+                          float('-inf'), device=device, dtype=flat_probs.dtype)
+    max_vals.scatter_reduce_(
+        0, flat_segment_ids, flat_probs, reduce='amax', include_self=False)
+    segment_maxes = max_vals[flat_segment_ids]  # Shape: (B*L,)
+
+    # Subtract max for numerical stability and compute exp
+    stable_probs = torch.exp(flat_probs - segment_maxes)  # Shape: (B*L,)
+
+    # Sum exp values within each segment
+    exp_sums = torch.zeros(batch_size * max_segments,
+                           device=device, dtype=stable_probs.dtype)
+    exp_sums.scatter_add_(0, flat_segment_ids, stable_probs)
+    segment_sums = exp_sums[flat_segment_ids]  # Shape: (B*L,)
+
+    # Compute normalized probabilities (softmax)
+    normalized_flat = stable_probs / \
+        segment_sums.clamp(min=1e-8)  # Shape: (B*L,)
+    normalized_probs = normalized_flat.view(
+        batch_size, seq_len)  # Shape: (B, L)
+
+    # 4. Weight the hidden states by normalized probabilities before summing
+    # Shape: (B, L, D)
+    weighted_hidden = hidden * normalized_probs.unsqueeze(-1)
+
+    # 5. Sum weighted hidden states per segment using scatter_add_.
+    # Target tensor for weighted sums: (B, max_segments, D)
+    weighted_summed_hidden = torch.zeros(
+        batch_size, max_segments, model_dim, device=device, dtype=dtype)
+    # Index for scatter_add_: needs to match shape of source (weighted_hidden) along scatter dim (1)
+    # Index shape: (B, L) -> expand to (B, L, D)
+    # Shape: (B, L, D)
+    index = segment_ids.unsqueeze(-1).expand_as(weighted_hidden)
+    weighted_summed_hidden.scatter_add_(
+        dim=1, index=index, src=weighted_hidden)
+
+    # 6. Since probabilities are now normalized within each segment (sum to 1),
+    # the weighted sum IS the weighted average - no need to divide by weight sums
+    # Shape: (B, max_segments, D)
+    pooled_batch = weighted_summed_hidden
+
+    # 7. Transpose to match the expected output shape (S, B, D).
     pooled_tensor = pooled_batch.transpose(0, 1)  # Shape: (max_segments, B, D)
 
     return pooled_tensor

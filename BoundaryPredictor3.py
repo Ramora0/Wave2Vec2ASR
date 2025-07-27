@@ -42,7 +42,7 @@ class BoundaryPredictor3(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden):
+    def forward(self, hidden, return_boundary_positions=False):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
             # Move normalization to before the projection layer
@@ -83,7 +83,10 @@ class BoundaryPredictor3(nn.Module):
         # Total positions across all sequences in batch
         total_positions = hard_boundaries.numel()
 
-        return pooled, loss, num_boundaries, total_positions
+        if return_boundary_positions:
+            return pooled, loss, num_boundaries, total_positions, hard_boundaries
+        else:
+            return pooled, loss, num_boundaries, total_positions
 
     def calc_loss(self, preds):
         return binomial_loss(preds, self.prior)
