@@ -6,12 +6,26 @@ def binomial_loss(num_boundaries, total_positions, prior, device):
         total_positions,
         probs=torch.Tensor([prior]).to(device)
     )
-    loss_boundaries = -binomial.log_prob(num_boundaries).mean() / total_positions
+    loss_boundaries = - \
+        binomial.log_prob(num_boundaries).mean() / total_positions
+    # loss_boundaries = -binomial.log_prob(num_boundaries).mean()
 
     return loss_boundaries
 
 
-def hinge_loss(preds, prior_mean, prior_std, s_bound=3.0):
+# def binomial_loss(preds, prior):
+#     binomial = torch.distributions.binomial.Binomial(
+#         preds.size(-1),
+#         probs=torch.Tensor([prior]).to(preds.device)
+#     )
+#     loss_boundaries = -binomial.log_prob(
+#         preds.sum(dim=-1)
+#     ).mean() / preds.size(-1)
+
+#     return loss_boundaries
+
+
+def hinge_loss(est_prior, prior_mean, prior_std, s_bound=3.0):
     """
     Compute hinge loss for boundary predictions centered at prior_mean.
 
@@ -26,16 +40,16 @@ def hinge_loss(preds, prior_mean, prior_std, s_bound=3.0):
     Returns:
         torch.Tensor: Scalar loss value
     """
-    sum_preds = preds.sum(dim=-1)
-    total_count = torch.full((preds.size(0),), preds.size(-1),
-                             dtype=torch.float, device=preds.device)
+    # sum_preds = preds.sum(dim=-1)
+    # total_count = torch.full((preds.size(0),), preds.size(-1),
+    #                          dtype=torch.float, device=preds.device)
 
-    # Estimate actual boundary probability for each sequence
-    est_prior = sum_preds / total_count
+    # # Estimate actual boundary probability for each sequence
+    # est_prior = sum_preds / total_count
 
     # Convert prior values to tensors on the same device
-    prior_mean_tensor = torch.tensor(prior_mean, device=preds.device)
-    prior_std_tensor = torch.tensor(prior_std, device=preds.device)
+    prior_mean_tensor = torch.tensor(prior_mean, device=est_prior.device)
+    prior_std_tensor = torch.tensor(prior_std, device=est_prior.device)
 
     # Define bounds centered at prior_mean
     upper_bound = prior_mean_tensor + s_bound * prior_std_tensor
