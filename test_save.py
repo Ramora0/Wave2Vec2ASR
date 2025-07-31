@@ -21,6 +21,7 @@ print("Loading MagnetWhisper model from saved path...")
 # Load the model directly from the saved path
 loaded_model = TestMagnetWhisper.from_pretrained(test_model_path)
 loaded_model = loaded_model.to("cuda")
+loaded_model.config._attn_implementation = "eager"
 
 print("Running inference on 5 train samples...")
 
@@ -37,7 +38,9 @@ def run_inference_test(model, dataset_subset, num_samples=5):
             break
         input_features = torch.tensor(
             sample["input_features"]).unsqueeze(0).to("cuda")
-        samples.append(input_features)
+        attention_mask = torch.tensor(
+            sample["attention_mask"]).unsqueeze(0).to("cuda")
+        samples.append((input_features, attention_mask))
 
     print(f"Testing inference on {len(samples)} samples from train split...")
 
@@ -47,20 +50,19 @@ def run_inference_test(model, dataset_subset, num_samples=5):
     boundary_data = []
 
     with torch.no_grad():
-        for i, input_features in enumerate(samples):
+        for i, (input_features, attention_mask) in enumerate(samples):
             print(f"\nProcessing sample {i+1}...")
-            print(f"Input shape: {input_features.shape}")
 
             # Clear any previous boundary positions
             model.clear_boundary_positions()
 
             start_time = time.time()
-            predicted_ids = model.generate(input_features)[0]
+            predicted_ids = model.generate(
+                input_features, attention_mask=attention_mask)[0]
             end_time = time.time()
 
             # Get boundary positions from the model
             sample_boundaries = model.get_boundary_positions()
-            print(f"Sample {i+1} boundary positions: {sample_boundaries}")
 
             times.append(end_time - start_time)
 
@@ -89,22 +91,14 @@ def run_inference_test(model, dataset_subset, num_samples=5):
             boundary_data.append(boundary_data_with_stats)
 
             # Print boundary information for this sample
-            print(f"Sample {i+1} boundary analysis:")
-            for layer_idx in sorted(sample_boundaries.keys()):
-                boundary_info = boundary_data_with_stats[layer_idx]
-                print(
-                    f"  Layer {layer_idx}: {boundary_info['num_boundaries']} boundaries")
-                print(
-                    f"    Compression ratio: {boundary_info['compression_ratio']:.4f}")
-                print(f"    Boundary positions: {boundary_info['positions']}")
-
-            # Print per-batch boundary positions (in case of multiple batches)
-            for layer_idx in sorted(sample_boundaries.keys()):
-                positions = sample_boundaries[layer_idx]
-                for batch_idx, batch_positions in enumerate(positions):
-                    if batch_positions:  # Only print if there are boundaries
-                        print(
-                            f"  Layer {layer_idx}, Batch {batch_idx}: boundaries at positions {batch_positions}")
+            # print(f"Sample {i+1} boundary analysis:")
+            # for layer_idx in sorted(sample_boundaries.keys()):
+            #     boundary_info = boundary_data_with_stats[layer_idx]
+            #     print(
+            #         f"  Layer {layer_idx}: {boundary_info['num_boundaries']} boundaries")
+            #     print(
+            #         f"    Compression ratio: {boundary_info['compression_ratio']:.4f}")
+            #     print(f"    Boundary positions: {boundary_info['positions']}")
 
     avg_time = sum(times) / len(times)
     total_time = sum(times)
@@ -119,7 +113,7 @@ def run_inference_test(model, dataset_subset, num_samples=5):
     print(f"\nSample predictions:")
     for i in range(min(5, len(predictions))):
         print(f"Sample {i+1}:")
-        print(f"  Input shape:  {samples[i].shape}")
+        print(f"  Input shape:  {samples[i][0].shape}")
         print(f"  Reference:  {references[i]}")
         print(f"  Prediction: {predictions[i]}")
         print()

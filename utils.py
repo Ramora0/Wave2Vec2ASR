@@ -7,6 +7,10 @@ def downsample(boundaries, hidden):
     Downsamples hidden states based on boundaries using vectorized torch operations.
     A new segment starts at index 0 and at every index t+1 where boundaries[b, t] == 1.
 
+    This revised version handles trailing segments of zeros by ensuring they are not
+    included in the output. The number of output segments for each batch item is
+    equal to the number of 1s in its corresponding boundaries row.
+
     Args:
         boundaries (torch.Tensor): Tensor of shape (B, L), dtype=float or long.
                                    1 indicates the *end* of a segment at index t.
@@ -14,60 +18,140 @@ def downsample(boundaries, hidden):
 
     Returns:
         torch.Tensor: Pooled hidden states of shape (S, B, D), where S is the
-                      maximum number of segments in the batch. Padded with zeros.
+                      maximum number of segments (sum of 1s) in the batch.
     """
     batch_size, seq_len, model_dim = hidden.shape
     device = hidden.device
     dtype = hidden.dtype
 
-    # Ensure boundaries is long type for indexing and cumsum
+    # Handle empty sequence edge case
+    if seq_len == 0:
+        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
+
     boundaries = boundaries.long()
 
     # 1. Calculate segment IDs for each time step t in each batch item b.
-    # segment_ids[b, t] = ID of the segment that hidden[b, t] belongs to.
     # A new segment starts at t=0 and at t+1 if boundaries[b, t] == 1.
-    # We use cumsum on boundaries shifted right by one, prepended with 0.
     segment_ids = torch.cat([
         torch.zeros_like(boundaries[:, :1]),  # Segment 0 starts at index 0
-        # Boundary at t-1 means new segment starts at t
         boundaries[:, :-1]
     ], dim=1).cumsum(dim=1)  # Shape: (B, L)
 
-    # 2. Determine the number of segments for each batch item and the maximum.
-    num_segments_per_batch = segment_ids[:, -1] + 1  # Max segment ID + 1
-    max_segments = num_segments_per_batch.max(
-    ).item() if batch_size > 0 and seq_len > 0 else 0
+    # 2. Determine the actual number of segments for each batch item.
+    # This is the sum of 1s in each boundaries row.
+    num_segments_per_batch = boundaries.sum(dim=1)  # Shape: (B,)
+    max_segments = num_segments_per_batch.max().item() if batch_size > 0 else 0
 
-    # 3. Sum hidden states per segment using scatter_add_.
-    # Target tensor for sums: (B, max_segments, D)
+    # Handle case where there are no segments at all (e.g., all-zero boundaries)
+    if max_segments == 0:
+        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
+
+    # Cast to int for tensor creation
+    max_segments = int(max_segments)
+
+    # 3. Create a mask to nullify contributions from trailing time steps.
+    # A time step t is valid if its segment ID is less than the total number of
+    # actual segments for that batch item.
+    # Shape: (B, L)
+    valid_mask = (segment_ids < num_segments_per_batch.unsqueeze(1))
+
+    # 4. Sum hidden states per segment, using the mask to ignore trailing states.
+    # Zero out the hidden states for invalid time steps before summing.
+    src_hidden = hidden * valid_mask.unsqueeze(-1)
+
+    # Target tensor for sums, sized to the actual max number of segments.
     summed_hidden = torch.zeros(
         batch_size, max_segments, model_dim, device=device, dtype=dtype)
-    # Index for scatter_add_: needs to match shape of source (hidden) along scatter dim (1)
-    # Index shape: (B, L) -> expand to (B, L, D)
-    index = segment_ids.unsqueeze(-1).expand_as(hidden)  # Shape: (B, L, D)
-    summed_hidden.scatter_add_(dim=1, index=index, src=hidden)
 
-    # 4. Count segment lengths using scatter_add_.
-    # Target tensor for counts: (B, max_segments)
+    # Clamp segment_ids to avoid out-of-bounds errors in scatter_add_.
+    # Contributions from invalid parts are 0 anyway due to the mask.
+    index_scatter = segment_ids.clamp(max=max_segments - 1)
+    summed_hidden.scatter_add_(
+        dim=1, index=index_scatter.unsqueeze(-1).expand_as(src_hidden), src=src_hidden)
+
+    # 5. Count segment lengths, using the mask to ignore trailing states.
+    src_lengths = torch.ones_like(segment_ids) * valid_mask
     segment_lengths = torch.zeros(
         batch_size, max_segments, device=device, dtype=torch.int64)
-    # Index for scatter_add_: (B, L)
-    # Source for scatter_add_: ones(B, L)
-    segment_lengths.scatter_add_(
-        dim=1, index=segment_ids, src=torch.ones_like(segment_ids))
+    segment_lengths.scatter_add_(dim=1, index=index_scatter, src=src_lengths)
 
-    # 5. Calculate the mean.
-    # Avoid division by zero for potentially empty segments (scatter_add initializes with 0).
-    # Clamp segment_lengths to minimum 1 before dividing.
-    # Shape: (B, max_segments, 1)
+    # 6. Calculate the mean.
+    # Avoid division by zero for any segment that might have a length of 0.
     segment_lengths_clamped = segment_lengths.unsqueeze(-1).clamp(min=1)
-    # Shape: (B, max_segments, D)
-    pooled_batch = summed_hidden / segment_lengths_clamped
+    pooled_batch = summed_hidden / segment_lengths_clamped  # Shape: (B, S, D)
 
-    # 6. Transpose to match the expected output shape (S, B, D).
-    pooled_tensor = pooled_batch.transpose(0, 1)  # Shape: (max_segments, B, D)
+    # 7. Transpose to match the expected output shape (S, B, D).
+    return pooled_batch.transpose(0, 1)
 
-    return pooled_tensor
+# def downsample(boundaries, hidden):
+#     """
+#     Downsamples hidden states based on boundaries using vectorized torch operations.
+#     A new segment starts at index 0 and at every index t+1 where boundaries[b, t] == 1.
+
+#     Args:
+#         boundaries (torch.Tensor): Tensor of shape (B, L), dtype=float or long.
+#                                    1 indicates the *end* of a segment at index t.
+#         hidden (torch.Tensor): Tensor of shape (B, L, D) containing hidden states.
+
+#     Returns:
+#         torch.Tensor: Pooled hidden states of shape (S, B, D), where S is the
+#                       maximum number of segments in the batch. Padded with zeros.
+#     """
+#     batch_size, seq_len, model_dim = hidden.shape
+#     device = hidden.device
+#     dtype = hidden.dtype
+
+#     # Ensure boundaries is long type for indexing and cumsum
+#     boundaries = boundaries.long()
+
+#     # 1. Calculate segment IDs for each time step t in each batch item b.
+#     # segment_ids[b, t] = ID of the segment that hidden[b, t] belongs to.
+#     # A new segment starts at t=0 and at t+1 if boundaries[b, t] == 1.
+#     # We use cumsum on boundaries shifted right by one, prepended with 0.
+#     segment_ids = torch.cat([
+#         torch.zeros_like(boundaries[:, :1]),  # Segment 0 starts at index 0
+#         # Boundary at t-1 means new segment starts at t
+#         boundaries[:, :-1]
+#     ], dim=1).cumsum(dim=1)  # Shape: (B, L)
+
+#     # 2. Determine the number of segments for each batch item and the maximum.
+#     num_segments_per_batch = segment_ids[:, -1] + 1  # Max segment ID + 1
+#     max_segments = num_segments_per_batch.max(
+#     ).item() if batch_size > 0 and seq_len > 0 else 0
+
+#     # 3. Sum hidden states per segment using scatter_add_.
+#     # Target tensor for sums: (B, max_segments, D)
+#     summed_hidden = torch.zeros(
+#         batch_size, max_segments, model_dim, device=device, dtype=dtype)
+#     # Index for scatter_add_: needs to match shape of source (hidden) along scatter dim (1)
+#     # Index shape: (B, L) -> expand to (B, L, D)
+#     index = segment_ids.unsqueeze(-1).expand_as(hidden)  # Shape: (B, L, D)
+#     summed_hidden.scatter_add_(dim=1, index=index, src=hidden)
+
+#     # 4. Count segment lengths using scatter_add_.
+#     # Target tensor for counts: (B, max_segments)
+#     segment_lengths = torch.zeros(
+#         batch_size, max_segments, device=device, dtype=torch.int64)
+#     # Index for scatter_add_: (B, L)
+#     # Source for scatter_add_: ones(B, L)
+#     segment_lengths.scatter_add_(
+#         dim=1, index=segment_ids, src=torch.ones_like(segment_ids))
+
+#     # 5. Calculate the mean.
+#     # Avoid division by zero for potentially empty segments (scatter_add initializes with 0).
+#     # Clamp segment_lengths to minimum 1 before dividing.
+#     # Shape: (B, max_segments, 1)
+#     segment_lengths_clamped = segment_lengths.unsqueeze(-1).clamp(min=1)
+#     # Shape: (B, max_segments, D)
+#     pooled_batch = summed_hidden / segment_lengths_clamped
+
+#     # 6. Transpose to match the expected output shape (S, B, D).
+#     pooled_tensor = pooled_batch.transpose(0, 1)  # Shape: (max_segments, B, D)
+
+#     # 7. Remove the last vector (assuming trailing zeros)
+#     pooled_tensor = pooled_tensor[:-1]  # Shape: (max_segments-1, B, D)
+
+#     return pooled_tensor
 
 
 def weighted_downsample(boundaries, probs, hidden):
@@ -308,3 +392,70 @@ def cross_attention_downsample(boundaries, hidden, cross_attn_query, cross_attn_
         pooled = hidden
 
     return pooled
+
+
+def pool_attention(attention_vector):
+    """
+    Max pools an attention vector from size (1, 3000) to (1, 1500).
+
+    Args:
+        attention_vector (torch.Tensor): Tensor of shape (1, 3000)
+
+    Returns:
+        torch.Tensor: Max pooled tensor of shape (1, 1500)
+    """
+    # Max pool with kernel size 2 and stride 2 to halve the sequence length
+    pooled = F.max_pool1d(
+        attention_vector.float().unsqueeze(1), kernel_size=2, stride=2).squeeze(1)
+    return pooled
+
+
+def convert_attention_mask(attention_mask):
+    """
+    Convert a binary attention mask (batch_size, seq_length) with 0/1 values
+    to a proper 2D attention mask with -inf for masked positions and 0 for valid ones.
+
+    Ensures bidirectional masking: padded positions (0s) don't attend to anything
+    and nothing attends to padded positions.
+
+    Args:
+        attention_mask (torch.Tensor): Binary mask of shape (batch_size, seq_length)
+                                     where 0 indicates masked/padded positions and 1 indicates valid positions
+
+    Returns:
+        torch.Tensor: Attention mask of shape (batch_size, 1, seq_length, seq_length)
+                     with -inf for any interaction involving masked positions and 0 for valid interactions
+    """
+    if attention_mask is None:
+        return None
+
+    batch_size, seq_length = attention_mask.shape
+    device = attention_mask.device
+
+    # Create 2D attention mask for self-attention
+    # Shape: (batch_size, seq_length, seq_length)
+    # We need bidirectional masking: mask[i,j] should be -inf if either position i or j is padded
+
+    # Expand attention mask to create query and key masks
+    query_mask = attention_mask.unsqueeze(2)  # (batch_size, seq_length, 1)
+    key_mask = attention_mask.unsqueeze(1)    # (batch_size, 1, seq_length)
+
+    # Create 2D mask: valid only if both query and key positions are valid
+    # Shape: (batch_size, seq_length, seq_length)
+    valid_interactions = query_mask * key_mask  # Element-wise multiplication
+
+    # Convert to float and replace 0s with -inf, 1s with 0
+    attention_mask_2d = valid_interactions.float()
+    attention_mask_2d = torch.where(
+        attention_mask_2d == 0,
+        torch.tensor(float('-inf'), device=device,
+                     dtype=attention_mask_2d.dtype),
+        torch.tensor(0.0, device=device, dtype=attention_mask_2d.dtype)
+    )
+
+    # Add head dimension: (batch_size, 1, seq_length, seq_length)
+    attention_mask_2d = attention_mask_2d.unsqueeze(1)
+
+    # print(attention_mask_2d)
+
+    return attention_mask_2d

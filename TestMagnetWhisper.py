@@ -12,6 +12,7 @@ import os
 from BoundaryPredictor1 import BoundaryPredictor1
 from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
+from utils import pool_attention, convert_attention_mask
 
 
 class TestMagnetWhisper(WhisperForConditionalGeneration):
@@ -438,6 +439,7 @@ class TestMagnetWhisperModel(WhisperModel):
 
             encoder_outputs = self.encoder(
                 input_features,
+                attention_mask=attention_mask,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
@@ -453,10 +455,15 @@ class TestMagnetWhisperModel(WhisperModel):
                     encoder_outputs) > 2 else None,
             )
 
+        # Extract final attention mask from encoder outputs
+        encoder_attention_mask = None
+        if hasattr(encoder_outputs, 'final_attention_mask') and encoder_outputs.final_attention_mask is not None:
+            encoder_attention_mask = encoder_outputs.final_attention_mask
+
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
-            attention_mask=decoder_attention_mask,
+            attention_mask=encoder_attention_mask,
             encoder_hidden_states=encoder_outputs[0],
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
@@ -607,6 +614,10 @@ class TestMagnetWhisperEncoder(WhisperEncoder):
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
 
+        # Apply pool_attention to attention mask at the beginning
+        if attention_mask is not None:
+            attention_mask = pool_attention(attention_mask)
+
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
@@ -630,18 +641,19 @@ class TestMagnetWhisperEncoder(WhisperEncoder):
             if to_drop:
                 layer_outputs = (None, None)
             else:
+                proper_attention_mask = convert_attention_mask(attention_mask)
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
                         encoder_layer.__call__,
                         hidden_states,
-                        None,
+                        proper_attention_mask,
                         (head_mask[idx] if head_mask is not None else None),
                         output_attentions,
                     )
                 else:
                     layer_outputs = encoder_layer(
                         hidden_states,
-                        None,
+                        proper_attention_mask,
                         layer_head_mask=(
                             head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
@@ -651,10 +663,11 @@ class TestMagnetWhisperEncoder(WhisperEncoder):
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
                     # Call the predictor with return_boundary_positions=True
                     result = predictor_module(
-                        layer_outputs[0], return_boundary_positions=True)
+                        layer_outputs[0], attention_mask=attention_mask, return_boundary_positions=True)
 
-                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, hard_boundaries = result
+                    final_hs_for_layer, attention_mask, current_b_loss, num_boundaries, total_positions, hard_boundaries = result
                     # Convert tensor to position lists and store
+                    print(hard_boundaries)
                     boundary_positions = self._extract_boundary_positions(
                         hard_boundaries)
                     self.last_boundary_positions[idx] = boundary_positions
@@ -682,11 +695,12 @@ class TestMagnetWhisperEncoder(WhisperEncoder):
             encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return (tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None), 0)
+            return (tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None), 0, attention_mask)
         return TestMagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
-            compression_ratios=getattr(self, 'compression_ratios', {})
+            compression_ratios=getattr(self, 'compression_ratios', {}),
+            final_attention_mask=attention_mask
         )
 
 
@@ -694,3 +708,4 @@ class TestMagnetWhisperEncoder(WhisperEncoder):
 class TestMagnetModelOutput(BaseModelOutput):
     boundary_loss: Optional[torch.FloatTensor] = None
     compression_ratios: Optional[Dict] = None
+    final_attention_mask: Optional[torch.LongTensor] = None

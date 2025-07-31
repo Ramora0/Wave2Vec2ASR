@@ -1,14 +1,12 @@
 import torch
 
 
-def binomial_loss(preds, prior):
+def binomial_loss(num_boundaries, total_positions, prior, device):
     binomial = torch.distributions.binomial.Binomial(
-        preds.size(-1),
-        probs=torch.Tensor([prior]).to(preds.device)
+        total_positions,
+        probs=torch.Tensor([prior]).to(device)
     )
-    loss_boundaries = -binomial.log_prob(
-        preds.sum(dim=-1)
-    ).mean() / preds.size(-1)
+    loss_boundaries = -binomial.log_prob(num_boundaries).mean() / total_positions
 
     return loss_boundaries
 

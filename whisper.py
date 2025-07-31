@@ -10,9 +10,8 @@ import torch
 from MagnetWhisper import MagnetWhisper
 from transformers import WhisperForConditionalGeneration
 from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor
-from datasets import load_dataset, Audio, load_from_disk
+from datasets import load_from_disk
 
-from data_loader import get_dataset
 import wandb
 import aiohttp
 
@@ -85,6 +84,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         batch = self.processor.feature_extractor.pad(
             input_features, return_tensors="pt")
 
+        # Stack attention masks directly since they should already be uniform size
+        attention_masks = torch.stack(
+            [feature["attention_mask"].clone().detach()
+             for feature in features]
+        )
+        batch["attention_mask"] = attention_masks
+
         # get the tokenized label sequences
         label_features = [{"input_ids": feature["labels"]}
                           for feature in features]
@@ -116,12 +122,14 @@ wer_metric = load("wer")
 
 
 class CompressionRatioCallback(TrainerCallback):
-    """Callback to log compression ratios to wandb during training"""
+    """Callback to log compression ratios and boundary loss to wandb during training"""
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         compression_ratio = model.get_and_reset_compression_ratio()
+        boundary_loss = model.get_and_reset_boundary_loss()
         wandb.log({
-            "train/compression_ratio": compression_ratio
+            "train/compression_ratio": compression_ratio,
+            "train/boundary_loss": boundary_loss
         })
 
 
@@ -143,7 +151,7 @@ def compute_metrics(pred):
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "magnet"
+MODEL_NAME = "magnet-masked"
 
 training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice

@@ -37,7 +37,7 @@ tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="E
                                              token="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")
 
 dataset = get_dataset(dataset, feature_extractor,
-                      tokenizer, cache_dir="librispeech-processed")
+                      tokenizer, cache_dir="librispeech-processed", num_proc=2)
 
 print("Keys in processed train dataset:", dataset["train"].features.keys())
 print("Sample attention_mask:",

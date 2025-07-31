@@ -12,6 +12,7 @@ import os
 from BoundaryPredictor1 import BoundaryPredictor1
 from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
+from utils import pool_attention, convert_attention_mask
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
@@ -242,6 +243,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
+        # print(f"Attention mask {attention_mask}")
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the language modeling loss. Indices should either be in `[0, ..., config.vocab_size]`
@@ -359,16 +361,30 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
         return compression_ratio
 
+    def get_and_reset_boundary_loss(self):
+        """
+        Return the accumulated boundary loss, then reset the counter.
+
+        Returns:
+            float: Accumulated boundary loss
+        """
+        total_boundary_loss = self.model.encoder.total_boundary_loss
+        # Reset encoder counter after collecting
+        self.model.encoder.total_boundary_loss = 0.0
+        return total_boundary_loss
+
 
 class MagnetWhisperModel(WhisperModel):
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.encoder.__class__ = MagnetWhisperEncoder
         self.encoder.load_magnet(lp, predictor_type)
         # Ensure encoder has the tracking counters
-        if not hasattr(self.encoder, 'total_boundaries'):
-            self.encoder.total_boundaries = 0
-        if not hasattr(self.encoder, 'total_positions'):
-            self.encoder.total_positions = 0
+        # if not hasattr(self.encoder, 'total_boundaries'):
+        #     self.encoder.total_boundaries = 0
+        # if not hasattr(self.encoder, 'total_positions'):
+        #     self.encoder.total_positions = 0
+        # if not hasattr(self.encoder, 'total_boundary_loss'):
+        #     self.encoder.total_boundary_loss = 0.0
 
     def forward(
         self,
@@ -421,6 +437,7 @@ class MagnetWhisperModel(WhisperModel):
 
             encoder_outputs = self.encoder(
                 input_features,
+                attention_mask=attention_mask,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
@@ -436,10 +453,15 @@ class MagnetWhisperModel(WhisperModel):
                     encoder_outputs) > 2 else None,
             )
 
+        # Extract final attention mask from encoder outputs
+        encoder_attention_mask = None
+        if hasattr(encoder_outputs, 'final_attention_mask') and encoder_outputs.final_attention_mask is not None:
+            encoder_attention_mask = encoder_outputs.final_attention_mask
+
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
-            attention_mask=decoder_attention_mask,
+            attention_mask=encoder_attention_mask,
             encoder_hidden_states=encoder_outputs[0],
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
@@ -477,6 +499,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # Initialize boundary and position counters
         self.total_boundaries = 0
         self.total_positions = 0
+        self.total_boundary_loss = 0.0
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":
@@ -567,6 +590,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
 
+        # Apply pool_attention to attention mask at the beginning
+        if attention_mask is not None:
+            attention_mask = pool_attention(attention_mask)
+
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
@@ -590,18 +617,19 @@ class MagnetWhisperEncoder(WhisperEncoder):
             if to_drop:
                 layer_outputs = (None, None)
             else:
+                proper_attention_mask = convert_attention_mask(attention_mask)
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
                         encoder_layer.__call__,
                         hidden_states,
-                        None,
+                        proper_attention_mask,
                         (head_mask[idx] if head_mask is not None else None),
                         output_attentions,
                     )
                 else:
                     layer_outputs = encoder_layer(
                         hidden_states,
-                        None,
+                        proper_attention_mask,
                         layer_head_mask=(
                             head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
@@ -609,23 +637,20 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-                    result = predictor_module(layer_outputs[0])
-                    if len(result) == 4:  # New format with compression metrics
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions = result
-                        # Update encoder's counters
-                        self.total_boundaries += num_boundaries
-                        self.total_positions += total_positions
-                        # Track per-layer compression ratio
-                        if total_positions > 0:
-                            self.compression_ratios[idx] = num_boundaries / \
-                                total_positions
-                        else:
-                            self.compression_ratios[idx] = 0.0
-                    else:  # Old format, backward compatibility
-                        final_hs_for_layer, current_b_loss = result
-                        # Unknown compression ratio for old format
-                        self.compression_ratios[idx] = 0.0
+                    result = predictor_module(
+                        layer_outputs[0], attention_mask=attention_mask)
+
+                    final_hs_for_layer, attention_mask, current_b_loss, num_boundaries, total_positions = result
+
+                    # Update encoder's counters
+                    self.total_boundaries += num_boundaries
+                    self.total_positions += total_positions
+                    # Track per-layer compression ratio
+                    self.compression_ratios[idx] = num_boundaries / \
+                        total_positions
+
                     boundary_loss += current_b_loss
+                    self.total_boundary_loss += current_b_loss.item()
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
                 hidden_states = layer_outputs[0]
@@ -638,11 +663,12 @@ class MagnetWhisperEncoder(WhisperEncoder):
             encoder_states = encoder_states + (hidden_states,)
 
         if not return_dict:
-            return (tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None), 0)
+            return (tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None), 0, attention_mask)
         return MagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
-            compression_ratios=getattr(self, 'compression_ratios', {})
+            compression_ratios=getattr(self, 'compression_ratios', {}),
+            final_attention_mask=attention_mask
         )
 
 
@@ -650,3 +676,4 @@ class MagnetWhisperEncoder(WhisperEncoder):
 class MagnetModelOutput(BaseModelOutput):
     boundary_loss: Optional[torch.FloatTensor] = None
     compression_ratios: Optional[Dict] = None
+    final_attention_mask: Optional[torch.LongTensor] = None

@@ -36,7 +36,7 @@ class BoundaryPredictor2(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden, return_boundary_positions=False):
+    def forward(self, hidden, attention_mask=None, return_boundary_positions=False):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
             # Move normalization to before the projection layer
@@ -63,28 +63,59 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled = weighted_downsample(hard_boundaries, cos_sim, hidden)
-        # pooled = downsample(hard_boundaries, hidden)  # S x B x D
+        # Manually disable hard boundaries at masked positions after sampling
+        if attention_mask is not None:
+            masked_positions = (attention_mask == 0).float()
+            hard_boundaries = hard_boundaries * (1 - masked_positions)
+
+        # pooled = weighted_downsample(hard_boundaries, cos_sim, hidden)
+        pooled = downsample(hard_boundaries, hidden)  # S x B x D
         # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 
-        loss = self.calc_loss(hard_boundaries)
-        self.last_loss = loss  # Store the calculated loss
+        pooled_attention_mask = attention_mask
+        # Update attention mask to match the pooled output size
+        if pooled_attention_mask is not None:
+            # Keep attention mask values only where hard_boundaries == 1
+            pooled_attention_mask = [pooled_attention_mask[b][hard_boundaries[b] == 1]
+                                     for b in range(pooled_attention_mask.shape[0])]
+            # Pad with zeros so all batch items have the same length
+            pooled_attention_mask = torch.nn.utils.rnn.pad_sequence(
+                pooled_attention_mask, batch_first=True, padding_value=0)
 
-        # Calculate compression metrics
-        # Total boundaries across all sequences in batch
+        # Calculate compression metrics - subtract masked positions
         num_boundaries = hard_boundaries.sum().item()
-        # Total positions across all sequences in batch
         total_positions = hard_boundaries.numel()
 
-        if return_boundary_positions:
-            return pooled, loss, num_boundaries, total_positions, hard_boundaries
-        else:
-            return pooled, loss, num_boundaries, total_positions
+        if attention_mask is not None:
+            masked_count = (attention_mask == 0).sum().item()
+            total_positions -= masked_count
 
-    def calc_loss(self, preds):
-        return binomial_loss(preds, self.prior)
+        # Calculate loss using adjusted metrics
+        loss = self.calc_loss(torch.tensor(num_boundaries, dtype=torch.float, device=hard_boundaries.device),
+                              torch.tensor(total_positions, dtype=torch.float, device=hard_boundaries.device))
+        self.last_loss = loss  # Store the calculated loss
+
+        if return_boundary_positions:
+            # Exclude hard_boundaries at or past the first 0 in pooled_mask for each batch
+            filtered_hard_boundaries = []
+            for b in range(hard_boundaries.shape[0]):
+                mask_row = attention_mask[b]
+                hb_row = hard_boundaries[b]
+                # Find the first zero in attention_mask
+                zero_indices = (mask_row == 0).nonzero(as_tuple=True)[0]
+                cutoff = zero_indices[0].item()
+                filtered_hard_boundaries.append(hb_row[:cutoff])
+
+            filtered_hard_boundaries = torch.stack(filtered_hard_boundaries)
+
+            return pooled, pooled_attention_mask, loss, num_boundaries, total_positions, filtered_hard_boundaries
+        else:
+            return pooled, pooled_attention_mask, loss, num_boundaries, total_positions
+
+    def calc_loss(self, num_boundaries, total_positions):
+        return binomial_loss(num_boundaries, total_positions, self.prior, self.q_proj_layer.weight.device)
         # binomial = torch.distributions.binomial.Binomial(
         #     preds.size(-1),
         #     probs=torch.Tensor([self.prior]).to(preds.device)
