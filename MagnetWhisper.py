@@ -650,7 +650,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                         total_positions
 
                     boundary_loss += current_b_loss
-                    self.total_boundary_loss += current_b_loss.item()
+                    self.total_boundary_loss += current_b_loss.detach().item()
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
 
                 hidden_states = layer_outputs[0]
