@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from loss import hinge_loss
+from loss import binomial_loss, hinge_loss
 from utils import delete, downsample
 
 
@@ -36,7 +36,7 @@ class BoundaryPredictor2(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden):
+    def forward(self, hidden, attention_mask=None):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
             # Move normalization to before the projection layer
@@ -59,30 +59,50 @@ class BoundaryPredictor2(nn.Module):
             hard_boundaries - soft_boundaries.detach() + soft_boundaries
         )
 
+        # Apply attention mask to hard boundaries to ensure masked positions are not boundaries
+        if attention_mask is not None:
+            hard_boundaries = hard_boundaries * attention_mask
+
         pooled = downsample(hard_boundaries, hidden)  # S x B x D
         # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 
-        loss = self.calc_loss(hard_boundaries)
+        shortened_attention_mask = None
+
+        if attention_mask is not None:
+            keep_mask = hard_boundaries == 1
+            batch_size = attention_mask.shape[0]
+            shortened_masks = []
+
+            for b in range(batch_size):
+                keep_indices = keep_mask[b].nonzero(as_tuple=True)[0]
+
+                # Extract the relevant positions from 1D attention mask
+                original_mask = attention_mask[b]
+                shortened_mask = original_mask[keep_indices]
+                shortened_masks.append(shortened_mask)
+
+            # Automatically pad to max length and stack
+            shortened_attention_mask = torch.nn.utils.rnn.pad_sequence(
+                shortened_masks, batch_first=True, padding_value=0.0)
+
+        num_boundaries_tensor = hard_boundaries.sum()
+        if attention_mask is not None:
+            total_positions_tensor = attention_mask.sum()
+        else:
+            total_positions_tensor = torch.tensor(
+                hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
+
+        loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
         self.last_loss = loss  # Store the calculated loss
 
-        # Calculate compression metrics
-        # Total boundaries across all sequences in batch
-        num_boundaries = hard_boundaries.sum().item()
-        # Total positions across all sequences in batch
-        total_positions = hard_boundaries.numel()
+        # Convert to scalars for metrics (after loss calculation)
+        num_boundaries = num_boundaries_tensor.item()
+        total_positions = total_positions_tensor.item()
 
-        return pooled, loss, num_boundaries, total_positions
+        return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
 
-    def calc_loss(self, preds):
-        return hinge_loss(preds, self.prior, .025)
-        # binomial = torch.distributions.binomial.Binomial(
-        #     preds.size(-1),
-        #     probs=torch.Tensor([self.prior]).to(preds.device)
-        # )
-        # loss_boundaries = -binomial.log_prob(
-        #     preds.sum(dim=-1)
-        # ).mean() / preds.size(-1)
-
-        # return loss_boundaries
+    def calc_loss(self, num_boundaries, total_positions):
+        return binomial_loss(num_boundaries, total_positions, self.prior)
+        # return hinge_loss(num_boundaries, total_positions, self.prior, .025)

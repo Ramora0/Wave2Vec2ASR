@@ -12,6 +12,8 @@ import os
 from BoundaryPredictor1 import BoundaryPredictor1
 from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
+from MagnetWhisperDecoder import MagnetWhisperDecoder
+from utils import max_pool_attention_mask
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
@@ -225,6 +227,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
 
+        # print(
+        #     f"[MagnetWhisper] attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
+
         model_output = self.model(
             input_features,
             attention_mask=attention_mask,
@@ -306,11 +311,8 @@ class MagnetWhisperModel(WhisperModel):
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.encoder.__class__ = MagnetWhisperEncoder
         self.encoder.load_magnet(lp, predictor_type)
-        # Ensure encoder has the tracking counters
-        if not hasattr(self.encoder, 'total_boundaries'):
-            self.encoder.total_boundaries = 0
-        if not hasattr(self.encoder, 'total_positions'):
-            self.encoder.total_positions = 0
+
+        self.decoder.__class__ = MagnetWhisperDecoder
 
     def forward(
         self,
@@ -357,12 +359,16 @@ class MagnetWhisperModel(WhisperModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # print(
+        #     f"[MagnetWhisperModel] attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
+
         if encoder_outputs is None:
             input_features = self._mask_input_features(
                 input_features, attention_mask=attention_mask)
 
             encoder_outputs = self.encoder(
                 input_features,
+                attention_mask=attention_mask,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
@@ -379,9 +385,17 @@ class MagnetWhisperModel(WhisperModel):
             )
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+        # Create cross-attention mask from encoder attention mask
+        cross_attention_mask = None
+        if hasattr(encoder_outputs, 'encoder_attention_mask') and encoder_outputs.encoder_attention_mask is not None:
+            cross_attention_mask = self.encoder._create_cross_attention_mask(
+                encoder_outputs.encoder_attention_mask, decoder_input_ids
+            )
+
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
+            encoder_attention_mask=cross_attention_mask,
             encoder_hidden_states=encoder_outputs[0],
             head_mask=decoder_head_mask,
             cross_attn_head_mask=cross_attn_head_mask,
@@ -411,6 +425,76 @@ class MagnetWhisperModel(WhisperModel):
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
+    # Dont actually use -inf for masking
+    def _convert_attention_mask_to_2d(self, attention_mask):
+        """
+        Convert a 1D attention mask to a 4D attention mask where only positions
+        with value 1 can attend to other positions with value 1.
+
+        Args:
+            attention_mask: 1D tensor of shape (batch_size, seq_length) with 1s and 0s
+
+        Returns:
+            4D attention mask of shape (batch_size, 1, seq_length, seq_length) where
+            mask[i, 0, j, k] = 0 if both position j and k should attend to each other, -1e9 otherwise
+        """
+        if attention_mask is None:
+            return None
+
+        batch_size, seq_length = attention_mask.shape
+
+        # Create 2D mask: only positions with 1 can attend to other positions with 1
+        # Shape: (batch_size, seq_length, seq_length)
+        attention_mask_2d = attention_mask.unsqueeze(
+            1) * attention_mask.unsqueeze(2)
+
+        # Convert to attention mask format: 0 for allowed, -1e9 for blocked
+        # Where original mask had 1s, we want 0 (allowed attention)
+        # Where original mask had 0s, we want -1e9 (blocked attention)
+        attention_mask_2d = (1 - attention_mask_2d) * -1e9
+
+        # Add head dimension: (batch_size, 1, seq_length, seq_length)
+        attention_mask_4d = attention_mask_2d.unsqueeze(1)
+
+        return attention_mask_4d
+
+    def _create_cross_attention_mask(self, encoder_attention_mask, decoder_input_ids):
+        """
+        Create a 2D cross-attention mask that allows decoder tokens to attend to 
+        non-padded encoder tokens while masking out padded encoder positions.
+
+        Args:
+            encoder_attention_mask: 1D tensor of shape (batch_size, encoder_seq_length) 
+                                  with 1s for valid tokens and 0s for padding
+            decoder_input_ids: tensor of shape (batch_size, decoder_seq_length)
+
+        Returns:
+            4D cross-attention mask of shape (batch_size, 1, decoder_seq_length, encoder_seq_length)
+            where mask[i, 0, j, k] = 0 if decoder position j can attend to encoder position k, 
+            -1e9 if encoder position k is padded and should be masked out
+        """
+        if encoder_attention_mask is None:
+            return None
+
+        batch_size, encoder_seq_length = encoder_attention_mask.shape
+        decoder_seq_length = decoder_input_ids.shape[1] if decoder_input_ids is not None else 1
+
+        # Expand encoder mask to cover all decoder positions
+        # Shape: (batch_size, decoder_seq_length, encoder_seq_length)
+        cross_attention_mask = encoder_attention_mask.unsqueeze(1).expand(
+            batch_size, decoder_seq_length, encoder_seq_length
+        )
+
+        # Convert to attention mask format: 0 for allowed attention, -1e9 for blocked
+        # Where encoder_attention_mask has 1s (valid), we want 0 (allowed attention)
+        # Where encoder_attention_mask has 0s (padding), we want -1e9 (blocked attention)
+        cross_attention_mask = (1 - cross_attention_mask) * -1e9
+
+        # Add head dimension: (batch_size, 1, decoder_seq_length, encoder_seq_length)
+        cross_attention_mask_4d = cross_attention_mask.unsqueeze(1)
+
+        return cross_attention_mask_4d
+
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
@@ -501,6 +585,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
+        if attention_mask is not None:
+            attention_mask = max_pool_attention_mask(attention_mask)
+
         embed_pos = self.embed_positions.weight
 
         # print("Embed pos", embed_pos.shape)
@@ -519,6 +606,16 @@ class MagnetWhisperEncoder(WhisperEncoder):
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
         boundary_loss = 0
+
+        # Convert 1D attention mask to 4D if provided
+        # print(
+        #     f"[MagnetWhisperEncoder] Input attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
+        attention_mask_4d = self._convert_attention_mask_to_2d(attention_mask)
+        # print(
+        #     f"[MagnetWhisperEncoder] Converted attention_mask_4d shape: {attention_mask_4d.shape if attention_mask_4d is not None else None}")
+        # Keep track of the 1D attention mask for boundary predictors
+        attention_mask_1d = attention_mask
+
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -536,14 +633,14 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     layer_outputs = self._gradient_checkpointing_func(
                         encoder_layer.__call__,
                         hidden_states,
-                        None,
+                        attention_mask_4d,  # Use pre-computed 4D attention mask
                         (head_mask[idx] if head_mask is not None else None),
                         output_attentions,
                     )
                 else:
                     layer_outputs = encoder_layer(
                         hidden_states,
-                        None,
+                        attention_mask_4d,  # Use pre-computed 4D attention mask
                         layer_head_mask=(
                             head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
@@ -551,21 +648,22 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-                    result = predictor_module(layer_outputs[0])
-                    if len(result) == 4:  # New format with compression metrics
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions = result
-                        # Update encoder's counters
-                        self.total_boundaries += num_boundaries
-                        self.total_positions += total_positions
-                        # Track per-layer compression ratio
-                        if total_positions > 0:
-                            self.compression_ratios[idx] = num_boundaries / \
-                                total_positions
-                        else:
-                            self.compression_ratios[idx] = 0.0
-                    else:  # Old format, backward compatibility
-                        final_hs_for_layer, current_b_loss = result
-                        # Unknown compression ratio for old format
+                    result = predictor_module(
+                        layer_outputs[0], attention_mask_1d)
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d = result
+                    # Update the 1D attention mask for subsequent boundary predictors
+                    attention_mask_1d = shortened_attention_mask_1d
+                    # Convert the shortened 1D mask to 4D for subsequent encoder layers
+                    attention_mask_4d = self._convert_attention_mask_to_2d(
+                        shortened_attention_mask_1d)
+                    # Update encoder's counters
+                    self.total_boundaries += num_boundaries
+                    self.total_positions += total_positions
+                    # Track per-layer compression ratio
+                    if total_positions > 0:
+                        self.compression_ratios[idx] = num_boundaries / \
+                            total_positions
+                    else:
                         self.compression_ratios[idx] = 0.0
                     boundary_loss += current_b_loss
                     layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
@@ -584,7 +682,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         return MagnetModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states,
             attentions=all_attentions, boundary_loss=boundary_loss,
-            compression_ratios=getattr(self, 'compression_ratios', {})
+            compression_ratios=getattr(self, 'compression_ratios', {}),
+            encoder_attention_mask=attention_mask_1d
         )
 
 
@@ -592,3 +691,4 @@ class MagnetWhisperEncoder(WhisperEncoder):
 class MagnetModelOutput(BaseModelOutput):
     boundary_loss: Optional[torch.FloatTensor] = None
     compression_ratios: Optional[Dict] = None
+    encoder_attention_mask: Optional[torch.LongTensor] = None

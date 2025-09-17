@@ -19,24 +19,8 @@ import aiohttp
 scratch_path = "/fs/scratch/PAS2836/lees_stuff"
 
 print("hi")
-# dataset = load_dataset("openslr/librispeech_asr", trust_remote_code=True, storage_options={
-#                        'client_kwargs': {'timeout': aiohttp.ClientTimeout(total=60*60*24)}})
 
-# dataset = dataset.remove_columns(["file", "speaker_id", "chapter_id", "id"])
-# dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
-
-# # del dataset["train.clean.360"]
-# del dataset["train.clean.100"]
-# del dataset["train.other.500"]
-# del dataset["test.other"]
-# del dataset["validation.other"]
-
-# dataset.save_to_disk(f"{scratch_path}/librispeech-trimmed")
-
-dataset = load_from_disk(f"{scratch_path}/librispeech-trimmed")
-
-print(dataset["train.clean.360"][0])
-
+dataset = load_from_disk(f"{scratch_path}/librispeech-processed")
 
 feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small",
                                                             token="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")
@@ -46,9 +30,6 @@ tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="E
 
 processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="English", task="transcribe",
                                              token="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")
-
-dataset = get_dataset(dataset, feature_extractor, tokenizer)
-
 
 dataset = dataset.with_format("torch")
 
@@ -75,7 +56,7 @@ model.generation_config.task = "transcribe"
 model.generation_config.forced_decoder_ids = None
 
 model.__class__ = MagnetWhisper
-model.load_magnet([(1, 0.33)], "BoundaryPredictor3")
+model.load_magnet([(1, 0.25)], "BoundaryPredictor2")
 
 # model.__class__ = SlidingWhisper
 # model.load_sliding(window_size=128)
@@ -87,12 +68,25 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # print(f"[DataCollator] Processing batch with {len(features)} features")
+
         # split inputs and labels since they have to be of different lengths and need different padding methods
         # first treat the audio inputs by simply returning torch tensors
         input_features = [{"input_features": feature["input_features"]}
                           for feature in features]
         batch = self.processor.feature_extractor.pad(
             input_features, return_tensors="pt")
+
+        # Process attention masks - check shapes before stacking
+        attention_mask_shapes = [
+            feature["attention_mask"].shape for feature in features]
+
+        attention_masks = torch.stack(
+            [feature["attention_mask"] for feature in features])
+
+        batch["attention_mask"] = attention_masks
+        # print(
+        #     f"[DataCollator] Final attention mask shape: {attention_masks.shape}")
 
         # get the tokenized label sequences
         label_features = [{"input_ids": feature["labels"]}
@@ -169,7 +163,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=5,
+    num_train_epochs=3,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
@@ -188,7 +182,7 @@ training_args = Seq2SeqTrainingArguments(
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=dataset["train.clean.360"],
+    train_dataset=dataset["train"],
     eval_dataset=dataset["validation.clean"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,

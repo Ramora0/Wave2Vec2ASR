@@ -1,0 +1,67 @@
+[MagnetWhisper] attention_mask shape: torch.Size([16, 3000])
+[MagnetWhisper] encoder_attention_mask shape: torch.Size([16, 1500])
+[MagnetWhisperModel] attention_mask shape: torch.Size([16, 3000])
+[MagnetWhisperModel] encoder_attention_mask shape: torch.Size([16, 1500])
+[MagnetWhisperEncoder] Input attention_mask shape: torch.Size([16, 1500])
+[MagnetWhisperEncoder] Converted attention_mask_4d shape: torch.Size([16, 1, 1500, 1500])
+Attention mask shape: torch.Size([16, 413])
+Pooled shape: torch.Size([16, 413, 768])
+[DataCollator] Processing batch with 16 features
+[DataCollator] Input features shape after padding: torch.Size([16, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([16, 1500])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[MagnetWhisperEncoder] Input attention_mask shape: torch.Size([128, 3000])
+[MagnetWhisperEncoder] Converted attention_mask_4d shape: torch.Size([128, 1, 3000, 3000])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
+[DataCollator] Processing batch with 128 features
+[DataCollator] Input features shape after padding: torch.Size([128, 80, 3000])
+[DataCollator] Final attention mask shape: torch.Size([128, 1500])
