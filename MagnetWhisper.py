@@ -77,7 +77,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                         768,
                         layer_priors_dict[idx],
                         1,
-                        0.5
+                        0
                     )
                 elif predictor_type == "BoundaryPredictor3" and idx in layer_priors_dict:
                     model.model.encoder.boundary_predictors[idx] = BoundaryPredictor3(
@@ -519,7 +519,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     768,
                     prior_value,
                     1,
-                    0.5
+                    0
                 )
             elif predictor_type == "BoundaryPredictor3":
                 self.boundary_predictors[layer_idx] = BoundaryPredictor3(

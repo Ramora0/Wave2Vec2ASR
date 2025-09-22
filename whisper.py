@@ -42,6 +42,12 @@ model = WhisperForConditionalGeneration.from_pretrained(
     # attn_implementation="flash_attention_2"
 )
 
+# Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2 with
+# masking-aware priors on every encoder layer.
+model.__class__ = MagnetWhisper
+boundary_priors = [(1, 1.0)]
+model.load_magnet(boundary_priors, "BoundaryPredictor2")
+
 model.to("cuda")
 
 # use_flash_attention_2=True)
@@ -55,8 +61,8 @@ model.generation_config.task = "transcribe"
 
 model.generation_config.forced_decoder_ids = None
 
-model.__class__ = MagnetWhisper
-model.load_magnet([(1, 0.25)], "BoundaryPredictor2")
+# model.__class__ = MagnetWhisper
+# model.load_magnet([(1, 0.25)], "BoundaryPredictor2")
 
 # model.__class__ = SlidingWhisper
 # model.load_sliding(window_size=128)
@@ -118,16 +124,6 @@ data_collator = DataCollatorSpeechSeq2SeqWithPadding(
 wer_metric = load("wer")
 
 
-class CompressionRatioCallback(TrainerCallback):
-    """Callback to log compression ratios to wandb during training"""
-
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        compression_ratio = model.get_and_reset_compression_ratio()
-        wandb.log({
-            "train/compression_ratio": compression_ratio
-        })
-
-
 def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
@@ -163,7 +159,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=3,
+    num_train_epochs=1,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
@@ -188,6 +184,17 @@ trainer = Seq2SeqTrainer(
     compute_metrics=compute_metrics,
     tokenizer=processor.feature_extractor,
 )
+
+
+class CompressionRatioCallback(TrainerCallback):
+    """Callback to log compression ratios to wandb during training"""
+
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        compression_ratio = model.get_and_reset_compression_ratio()
+        wandb.log({
+            "train/compression_ratio": compression_ratio
+        })
+
 
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())

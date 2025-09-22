@@ -63,6 +63,16 @@ class BoundaryPredictor2(nn.Module):
         if attention_mask is not None:
             hard_boundaries = hard_boundaries * attention_mask
 
+            # Ensure we always close out the final real segment by forcing a boundary
+            # at the first padded position (if any). This keeps every non-padded
+            # frame while preventing padded timesteps from leaking through.
+            pad_mask = attention_mask == 0
+            if pad_mask.any():
+                first_pad_mask = pad_mask & (pad_mask.long().cumsum(dim=1) == 1)
+                hard_boundaries = torch.maximum(
+                    hard_boundaries, first_pad_mask.float()
+                )
+
         pooled = downsample(hard_boundaries, hidden)  # S x B x D
         # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
