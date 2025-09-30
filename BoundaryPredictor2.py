@@ -68,9 +68,14 @@ class BoundaryPredictor2(nn.Module):
             # frame while preventing padded timesteps from leaking through.
             pad_mask = attention_mask == 0
             if pad_mask.any():
-                first_pad_mask = pad_mask & (pad_mask.long().cumsum(dim=1) == 1)
+                first_pad_mask = pad_mask & (
+                    pad_mask.long().cumsum(dim=1) == 1)
+                # Shift the boundary one position to the left (to the last real token)
+                last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
+                # Clear the last column to avoid wrapping
+                last_real_mask[:, -1] = False
                 hard_boundaries = torch.maximum(
-                    hard_boundaries, first_pad_mask.float()
+                    hard_boundaries, last_real_mask.float()
                 )
 
         pooled = downsample(hard_boundaries, hidden)  # S x B x D
@@ -104,6 +109,26 @@ class BoundaryPredictor2(nn.Module):
             total_positions_tensor = torch.tensor(
                 hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
 
+        # if attention_mask is not None:
+        #     # Sanity check per batch item.
+        #     expected_per_item = attention_mask.long().sum(dim=1)
+        #     actual_per_item = hard_boundaries.long().sum(dim=1)
+        #     mismatched = expected_per_item != actual_per_item
+        #     if mismatched.any():
+        #         bad_indices = mismatched.nonzero(as_tuple=True)[0].tolist()
+        #         for idx in bad_indices:
+        #             torch.set_printoptions(profile="full")
+        #             try:
+        #                 print(f"[BoundaryPredictor2] Batch index {idx} attention_mask:",
+        #                       attention_mask[idx].detach().cpu())
+        #                 print(f"[BoundaryPredictor2] Batch index {idx} hard_boundaries:",
+        #                       hard_boundaries[idx].detach().cpu())
+        #                 print(f"[BoundaryPredictor2] Expected {expected_per_item[idx].item()} boundaries,"
+        #                       f" got {actual_per_item[idx].item()}.")
+        #             finally:
+        #                 torch.set_printoptions(profile="default")
+        #         raise ValueError("Boundary count mismatch detected.")
+
         loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
         self.last_loss = loss  # Store the calculated loss
 
@@ -115,4 +140,4 @@ class BoundaryPredictor2(nn.Module):
 
     def calc_loss(self, num_boundaries, total_positions):
         return binomial_loss(num_boundaries, total_positions, self.prior)
-        # return hinge_loss(num_boundaries, total_positions, self.prior, .025)
+        # return hinge_loss(num_boundaries, total_positions, self.prior, .03)
