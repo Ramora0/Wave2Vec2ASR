@@ -186,8 +186,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        apply_encoder_attention_mask: bool = True,
-        apply_decoder_attention_mask: bool = False,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -250,8 +248,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            apply_encoder_attention_mask=apply_encoder_attention_mask,
-            apply_decoder_attention_mask=apply_decoder_attention_mask,
         )
 
         # Unpack model output
@@ -337,8 +333,6 @@ class MagnetWhisperModel(WhisperModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        apply_encoder_attention_mask: bool = True,
-        apply_decoder_attention_mask: bool = False,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqModelOutput]:
         r"""
         Returns:
@@ -369,7 +363,7 @@ class MagnetWhisperModel(WhisperModel):
         # print(
         #     f"[MagnetWhisperModel] attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
 
-        encoder_attention_mask = attention_mask if apply_encoder_attention_mask else None
+        encoder_attention_mask = attention_mask
 
         if encoder_outputs is None:
             input_features = self._mask_input_features(
@@ -382,7 +376,6 @@ class MagnetWhisperModel(WhisperModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                apply_attention_mask=apply_encoder_attention_mask,
             )
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
@@ -398,17 +391,14 @@ class MagnetWhisperModel(WhisperModel):
         # Create cross-attention mask from encoder attention mask
         cross_attention_mask = None
         if (
-            apply_decoder_attention_mask
-            and hasattr(encoder_outputs, 'encoder_attention_mask')
+            hasattr(encoder_outputs, 'encoder_attention_mask')
             and encoder_outputs.encoder_attention_mask is not None
         ):
             cross_attention_mask = self.encoder._create_cross_attention_mask(
                 encoder_outputs.encoder_attention_mask, decoder_input_ids
             )
 
-        decoder_self_attention_mask = (
-            decoder_attention_mask if apply_decoder_attention_mask else None
-        )
+        decoder_self_attention_mask = decoder_attention_mask
 
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -425,7 +415,6 @@ class MagnetWhisperModel(WhisperModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            apply_attention_mask=apply_decoder_attention_mask,
         )
 
         if not return_dict:
@@ -560,7 +549,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        apply_attention_mask: bool = True,
     ):
         r"""
         Args:
@@ -571,11 +559,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 `input_features`, the [`AutoFeatureExtractor`] should be used for extracting the mel features, padding
                 and conversion into a tensor of type `torch.FloatTensor`. See [`~WhisperFeatureExtractor.__call__`]
             attention_mask (`torch.Tensor`, *optional*):
-                Optional padding mask over the input features. When `apply_attention_mask` is `True` the mask is pooled
-                down to match the convolutional stride and propagated through the encoder stack.
-            apply_attention_mask (`bool`, *optional*, defaults to `True`):
-                If `True`, padding attention masks are pooled and applied inside the encoder. If `False`, the encoder
-                skips any masking logic and processes all positions.
+                Optional padding mask over the input features. The mask is pooled down to match the convolutional
+                stride and propagated through the encoder stack.
             head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
                 Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
 
@@ -608,9 +593,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
-        if not apply_attention_mask:
-            attention_mask = None
-        elif attention_mask is not None:
+        if attention_mask is not None:
             attention_mask = max_pool_attention_mask(attention_mask)
 
         embed_pos = self.embed_positions.weight

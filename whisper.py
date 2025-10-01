@@ -46,7 +46,7 @@ model = WhisperForConditionalGeneration.from_pretrained(
 # masking-aware priors on every encoder layer.
 model.__class__ = MagnetWhisper
 boundary_priors = [(3, 0.25)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 model.to("cuda")
 
@@ -159,7 +159,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=4,
+    num_train_epochs=3,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,

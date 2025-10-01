@@ -98,9 +98,97 @@ class BoundaryPredictor2(nn.Module):
                 shortened_mask = original_mask[keep_indices]
                 shortened_masks.append(shortened_mask)
 
+            boundary_counts = hard_boundaries.sum(dim=1)
+
+            max_len = max((mask.size(0)
+                          for mask in shortened_masks), default=0)
+            expected_max_len = int(
+                boundary_counts.max().item()) if batch_size > 0 else 0
+            if max_len != expected_max_len:
+                print(
+                    "[BoundaryPredictor2] Max boundary count mismatch:",
+                    f"expected_max_len={expected_max_len}",
+                    f"observed_max_len={max_len}",
+                    "boundary_counts=", boundary_counts.detach().cpu()
+                )
+                raise ValueError(
+                    "shortened_attention_mask length mismatch detected.")
+
             # Automatically pad to max length and stack
-            shortened_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                shortened_masks, batch_first=True, padding_value=0.0)
+            if max_len == 0:
+                shortened_attention_mask = attention_mask.new_zeros(
+                    (batch_size, 0))
+            else:
+                shortened_attention_mask = torch.nn.utils.rnn.pad_sequence(
+                    shortened_masks, batch_first=True, padding_value=0.0)
+
+                unique_vals = torch.unique(shortened_attention_mask)
+                if not torch.all((unique_vals == 0.0) | (unique_vals == 1.0)):
+                    print(
+                        "[BoundaryPredictor2] Non-binary shortened_attention_mask values detected:",
+                        unique_vals.detach().cpu()
+                    )
+                    raise ValueError(
+                        "shortened_attention_mask must be binary (0s and 1s)."
+                    )
+
+                if shortened_attention_mask.size(1) > 1:
+                    if not torch.all(
+                        shortened_attention_mask[:, :-
+                                                 1] >= shortened_attention_mask[:, 1:]
+                    ):
+                        print(
+                            "[BoundaryPredictor2] Non-monotonic shortened_attention_mask rows:",
+                            shortened_attention_mask.detach().cpu()
+                        )
+                        raise ValueError(
+                            "shortened_attention_mask rows must be left-monotonic (ones then zeros)."
+                        )
+
+            expected_mask = (
+                torch.arange(max_len, device=shortened_attention_mask.device)
+                .unsqueeze(0) < boundary_counts.unsqueeze(1)
+            ).float()
+            if not torch.equal(shortened_attention_mask, expected_mask):
+                print(
+                    "[BoundaryPredictor2] shortened_attention_mask does not match expected pattern.",
+                    "expected_mask=", expected_mask.detach().cpu(),
+                    "actual_mask=", shortened_attention_mask.detach().cpu(),
+                    "boundary_counts=", boundary_counts.detach().cpu()
+                )
+                raise ValueError(
+                    "shortened_attention_mask structure mismatch detected."
+                )
+
+            kept_counts = shortened_attention_mask.sum(dim=1)
+            if not torch.all(kept_counts.long() == boundary_counts.long()):
+                print(
+                    "[BoundaryPredictor2] Kept count mismatch: kept_counts=", kept_counts.detach(
+                    ).cpu(),
+                    "boundary_counts=", boundary_counts.detach().cpu()
+                )
+                raise ValueError(
+                    "shortened_attention_mask count mismatch detected."
+                )
+
+            if pooled.shape[0] != shortened_attention_mask.shape[0]:
+                print(
+                    "[BoundaryPredictor2] pooled batch dim:", pooled.shape[0],
+                    "shortened_attention_mask batch dim:", shortened_attention_mask.shape[0]
+                )
+                raise ValueError(
+                    "Pooled hidden state batch dimension does not match shortened attention mask."
+                )
+
+            if pooled.shape[1] != shortened_attention_mask.shape[1]:
+                print(
+                    "[BoundaryPredictor2] pooled sequence length:", pooled.shape[1],
+                    "shortened_attention_mask sequence length:", shortened_attention_mask.shape[
+                        1]
+                )
+                raise ValueError(
+                    "Pooled hidden state sequence length does not match shortened attention mask."
+                )
 
         num_boundaries_tensor = hard_boundaries.sum()
         if attention_mask is not None:
@@ -108,26 +196,6 @@ class BoundaryPredictor2(nn.Module):
         else:
             total_positions_tensor = torch.tensor(
                 hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
-
-        # if attention_mask is not None:
-        #     # Sanity check per batch item.
-        #     expected_per_item = attention_mask.long().sum(dim=1)
-        #     actual_per_item = hard_boundaries.long().sum(dim=1)
-        #     mismatched = expected_per_item != actual_per_item
-        #     if mismatched.any():
-        #         bad_indices = mismatched.nonzero(as_tuple=True)[0].tolist()
-        #         for idx in bad_indices:
-        #             torch.set_printoptions(profile="full")
-        #             try:
-        #                 print(f"[BoundaryPredictor2] Batch index {idx} attention_mask:",
-        #                       attention_mask[idx].detach().cpu())
-        #                 print(f"[BoundaryPredictor2] Batch index {idx} hard_boundaries:",
-        #                       hard_boundaries[idx].detach().cpu())
-        #                 print(f"[BoundaryPredictor2] Expected {expected_per_item[idx].item()} boundaries,"
-        #                       f" got {actual_per_item[idx].item()}.")
-        #             finally:
-        #                 torch.set_printoptions(profile="default")
-        #         raise ValueError("Boundary count mismatch detected.")
 
         loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
         self.last_loss = loss  # Store the calculated loss
@@ -139,5 +207,5 @@ class BoundaryPredictor2(nn.Module):
         return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
 
     def calc_loss(self, num_boundaries, total_positions):
-        return binomial_loss(num_boundaries, total_positions, self.prior)
+        return binomial_loss(num_boundaries, total_positions, self.prior) / (64 ** 2)
         # return hinge_loss(num_boundaries, total_positions, self.prior, .03)

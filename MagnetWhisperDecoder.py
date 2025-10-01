@@ -96,7 +96,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        apply_attention_mask: bool = True,
         cache_position=None,
     ):
         r"""
@@ -163,8 +162,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
                 cache in the correct position and to infer the complete sequence length.
-            apply_attention_mask (`bool`, *optional*, defaults to `True`):
-                Controls whether padding masks are applied during self- and cross-attention computations.
         """
         # print(super()._update_causal_mask)
 
@@ -174,10 +171,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if not apply_attention_mask:
-            attention_mask = None
-            encoder_attention_mask = None
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
