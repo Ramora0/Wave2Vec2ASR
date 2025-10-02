@@ -18,9 +18,14 @@ from utils import max_pool_attention_mask
 
 class MagnetWhisper(WhisperForConditionalGeneration):
 
+    def _reset_boundary_loss_tracker(self):
+        self._boundary_loss_total = 0.0
+        self._boundary_loss_steps = 0
+
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
+        self._reset_boundary_loss_tracker()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -113,6 +118,8 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 boundary_predictor.temp = temp_dict[idx]
                 boundary_predictor.threshold = threshold_dict[idx]
 
+        model._reset_boundary_loss_tracker()
+
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
@@ -186,6 +193,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        target_boundary_counts: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -248,6 +256,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            target_boundary_counts=target_boundary_counts,
         )
 
         # Unpack model output
@@ -270,6 +279,12 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             loss = loss_fct(
                 lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
             loss += boundary_loss
+
+        if boundary_loss is not None:
+            if not hasattr(self, "_boundary_loss_total"):
+                self._reset_boundary_loss_tracker()
+            self._boundary_loss_total += boundary_loss.detach().float().item()
+            self._boundary_loss_steps += 1
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -307,6 +322,15 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
         return compression_ratio
 
+    def get_and_reset_boundary_loss(self):
+        """Return the mean boundary loss since the last reset and clear the accumulator."""
+        steps = getattr(self, "_boundary_loss_steps", 0)
+        if steps == 0:
+            return None
+        average_loss = self._boundary_loss_total / steps
+        self._reset_boundary_loss_tracker()
+        return average_loss
+
 
 class MagnetWhisperModel(WhisperModel):
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
@@ -333,6 +357,7 @@ class MagnetWhisperModel(WhisperModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        target_boundary_counts: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqModelOutput]:
         r"""
         Returns:
@@ -376,6 +401,7 @@ class MagnetWhisperModel(WhisperModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                target_boundary_counts=target_boundary_counts,
             )
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
@@ -549,6 +575,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        target_boundary_counts=None,
     ):
         r"""
         Args:
@@ -656,8 +683,13 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-                    result = predictor_module(
-                        layer_outputs[0], attention_mask_1d)
+                    if isinstance(predictor_module, BoundaryPredictor1):
+                        result = predictor_module(
+                            layer_outputs[0], attention_mask_1d,
+                            target_boundary_counts=target_boundary_counts)
+                    else:
+                        result = predictor_module(
+                            layer_outputs[0], attention_mask_1d)
                     final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d = result
                     # Update the 1D attention mask for subsequent boundary predictors
                     attention_mask_1d = shortened_attention_mask_1d

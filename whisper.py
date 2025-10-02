@@ -112,6 +112,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         batch["labels"] = labels
 
+        if features and "target_boundary_count" in features[0]:
+            batch["target_boundary_counts"] = torch.tensor(
+                [feature["target_boundary_count"] for feature in features], dtype=torch.float32
+            )
+
         return batch
 
 
@@ -191,9 +196,16 @@ class CompressionRatioCallback(TrainerCallback):
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         compression_ratio = model.get_and_reset_compression_ratio()
-        wandb.log({
+        boundary_loss = model.get_and_reset_boundary_loss()
+
+        log_payload = {
             "train/compression_ratio": compression_ratio
-        })
+        }
+
+        if boundary_loss is not None:
+            log_payload["train/boundary_loss"] = boundary_loss
+
+        wandb.log(log_payload)
 
 
 # Add compression ratio callback

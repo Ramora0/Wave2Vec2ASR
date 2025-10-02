@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from loss import binomial_loss, hinge_loss
+from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
 from utils import downsample
 
 
@@ -31,7 +31,7 @@ class BoundaryPredictor1(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden, attention_mask=None):
+    def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         # print("Hidden", hidden.shape)
         bs, seq_len, model_dim = hidden.shape
         logits = self.boundary_mlp(
@@ -91,10 +91,17 @@ class BoundaryPredictor1(nn.Module):
             total_positions_tensor = torch.tensor(
                 hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
 
-        loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
+        # loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
+        if target_boundary_counts is not None:
+            loss = self.calc_loss_target_counts(
+                hard_boundaries, attention_mask, target_boundary_counts)
+        else:
+            loss = self.calc_loss(num_boundaries_tensor,
+                                  total_positions_tensor)
+            raise NotImplementedError("Unimplemented loss calculation")
+        # loss = self.calc_example_loss(hard_boundaries, attention_mask)
         self.last_loss = loss  # Store the calculated loss
 
-        # Calculate compression metrics
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()
 
@@ -103,12 +110,41 @@ class BoundaryPredictor1(nn.Module):
     def calc_loss(self, num_boundaries, total_positions):
         return binomial_loss(num_boundaries, total_positions, self.prior)
         # return hinge_loss(preds, self.prior + 0.05, .05) / (64 ** 2)
-        # binomial = torch.distributions.binomial.Binomial(
-        #     preds.size(-1),
-        #     probs=torch.Tensor([self.prior]).to(preds.device)
-        # )
-        # loss_boundaries = -binomial.log_prob(
-        #     preds.sum(dim=-1)
-        # ).mean() / preds.size(-1)
 
-        # return loss_boundaries
+    def calc_loss_target_counts(self, hard_boundaries, attention_mask, target_boundary_counts):
+        # Encourage boundary counts to match target segment counts via binomial loss.
+        device = hard_boundaries.device
+        per_item_boundaries = hard_boundaries.sum(dim=1)
+
+        if attention_mask is not None:
+            per_item_totals = attention_mask.sum(dim=1)
+        else:
+            per_item_totals = torch.full(
+                (hard_boundaries.size(0),), hard_boundaries.size(1),
+                device=device, dtype=torch.float32
+            )
+
+        per_item_totals = per_item_totals.to(dtype=torch.float32)
+        target_boundary_counts = target_boundary_counts.to(
+            device=device, dtype=torch.float32)
+
+        loss_values = binomial_loss_from_target_counts(
+            per_item_boundaries.to(dtype=torch.float32),
+            per_item_totals,
+            target_boundary_counts,
+        )
+        return loss_values.mean() / (64 ** 2)
+
+    def calc_example_loss(self, hard_boundaries, attention_mask=None):
+        per_item_boundaries = hard_boundaries.sum(dim=1)
+        if attention_mask is not None:
+            per_item_totals = attention_mask.sum(dim=1)
+        else:
+            per_item_totals = torch.full_like(
+                per_item_boundaries, hard_boundaries.size(1), dtype=torch.float)
+
+        # Compute loss per example and normalize by batch size
+        per_example_loss = binomial_loss(
+            per_item_boundaries, per_item_totals, self.prior
+        )
+        return per_example_loss.mean()

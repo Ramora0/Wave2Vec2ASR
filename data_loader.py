@@ -17,14 +17,22 @@ def prepare_dataset(batch, feature_extractor: WhisperFeatureExtractor, tokenizer
     attention_mask = features.attention_mask
 
     # Tokenize all texts in the batch
-    labels = tokenizer([txt.lower() for txt in batch["text"]],
+    normalized_texts = [txt.lower() for txt in batch["text"]]
+    labels = tokenizer(normalized_texts,
                        padding="longest", truncation=True).input_ids
+
+    # Track target boundary counts (characters excluding whitespace) so
+    # downstream components can encourage matching predicted segments.
+    boundary_counts = [
+        sum(1 for char in text if not char.isspace()) for text in batch["text"]
+    ]
 
     # Return a new batch dictionary
     batch_dict = {
         "input_features": input_features,
         "labels": labels,
         "attention_mask": attention_mask,
+        "target_boundary_count": boundary_counts,
     }
     return batch_dict
 
