@@ -642,6 +642,12 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         boundary_loss = 0
 
+        target_matrix: Optional[torch.Tensor] = None
+        if target_boundary_counts is not None:
+            target_matrix = target_boundary_counts.to(hidden_states.device)
+
+        target_pointer = 0
+
         # Convert 1D attention mask to 4D if provided
         # print(
         #     f"[MagnetWhisperEncoder] Input attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
@@ -683,13 +689,21 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
                 predictor_module = self.boundary_predictors[idx]
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                    predictor_input = layer_outputs[0]
+                    target_for_predictor = None
                     if isinstance(predictor_module, BoundaryPredictor1):
+                        if target_matrix is not None and target_pointer < target_matrix.size(0):
+                            target_for_predictor = target_matrix[target_pointer]
+                            target_pointer += 1
+
                         result = predictor_module(
-                            layer_outputs[0], attention_mask_1d,
-                            target_boundary_counts=target_boundary_counts)
+                            predictor_input,
+                            attention_mask_1d,
+                            target_boundary_counts=target_for_predictor,
+                        )
                     else:
                         result = predictor_module(
-                            layer_outputs[0], attention_mask_1d)
+                            predictor_input, attention_mask_1d)
                     final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d = result
                     # Update the 1D attention mask for subsequent boundary predictors
                     attention_mask_1d = shortened_attention_mask_1d

@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
 from utils import downsample
+# from utils import weighted_downsample  # Optional weighted pooling prototype
 
 
 class BoundaryPredictor1(nn.Module):
@@ -61,8 +62,10 @@ class BoundaryPredictor1(nn.Module):
                     hard_boundaries, last_real_mask.float()
                 )
 
+        # Weighted version retained for future experimentation.
+        # pooled = weighted_downsample(
+        #     hard_boundaries, hidden, segment_weights)  # S x B x D
         pooled = downsample(hard_boundaries, hidden)  # S x B x D
-        # pooled = delete(hard_boundaries, hidden)  # S x B x D
 
         pooled = pooled.transpose(0, 1)
 

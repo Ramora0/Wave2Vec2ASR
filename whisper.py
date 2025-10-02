@@ -15,7 +15,8 @@ from datasets import load_dataset, Audio, load_from_disk
 from data_loader import get_dataset
 import wandb
 import aiohttp
-# from g2p_en import G2p
+
+from g2p_en import G2p
 from syllapy import count as syllable_count
 
 scratch_path = "/fs/scratch/PAS2836/lees_stuff"
@@ -30,30 +31,23 @@ print("hi")
 # been regenerated yet.
 # ============================================================================
 
-# G2P_CONVERTER = G2p()
-
-# Previous phoneme-based boundary counter kept for reference while disabled.
-# def get_boundary_count(text: str) -> float:
-#     normalized = text.strip().lower()
-#     phoneme_sequence = G2P_CONVERTER(normalized)
-#     phoneme_tokens = [token for token in phoneme_sequence if token.strip()]
-#     return float(len(phoneme_tokens))
-
-# Previous character-based boundary counter kept for reference while disabled.
-# def get_boundary_count(text: str) -> float:
-#     cleaned = text.strip()
-#     letter_count = sum(1 for char in cleaned if char.isalpha())
-#     return float(letter_count)
-
-# Previous syllable-based boundary counter kept for reference while disabled.
-# def get_boundary_count(text: str) -> float:
-#     cleaned = text.strip().lower()
-#     return float(syllable_count(cleaned))
+G2P_CONVERTER = G2p()
 
 
-def get_boundary_count(text: str) -> float:
-    tokens = [tok for tok in text.strip().split() if tok]
-    return float(len(tokens))
+def count_phonemes(text: str) -> float:
+    normalized = text.strip().lower()
+    if not normalized:
+        return 0.0
+    phoneme_sequence = G2P_CONVERTER(normalized)
+    phoneme_tokens = [token for token in phoneme_sequence if token.strip() and token != " "]
+    return float(len(phoneme_tokens))
+
+
+def count_syllables(text: str) -> float:
+    normalized = text.strip().lower()
+    if not normalized:
+        return 0.0
+    return float(syllable_count(normalized))
 
 
 # ============================================================================
@@ -86,7 +80,7 @@ model = WhisperForConditionalGeneration.from_pretrained(
 # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2 with
 # masking-aware priors on every encoder layer.
 model.__class__ = MagnetWhisper
-boundary_priors = [(3, 0.25)]
+boundary_priors = [(1, 0.25), (3, 0.25)]
 model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 model.to("cuda")
@@ -158,32 +152,44 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             input_id_batches = labels_batch["input_ids"]
             attention_batches = labels_batch["attention_mask"]
 
-            counts: List[float] = []
-            for idx, feature in enumerate(features):
-                value = feature.get("target_boundary_count")
+            phoneme_counts: List[float] = []
+            syllable_counts: List[float] = []
 
-                if value is not None:
-                    if isinstance(value, torch.Tensor):
-                        value = value.item()
-                    counts.append(float(value))
+            for idx, feature in enumerate(features):
+                if "phoneme_count" in feature and "syllable_count" in feature:
+                    phoneme_value = feature["phoneme_count"]
+                    syllable_value = feature["syllable_count"]
+                    if isinstance(phoneme_value, torch.Tensor):
+                        phoneme_value = phoneme_value.item()
+                    if isinstance(syllable_value, torch.Tensor):
+                        syllable_value = syllable_value.item()
+                    phoneme_counts.append(float(phoneme_value))
+                    syllable_counts.append(float(syllable_value))
                     continue
 
-                input_ids = input_id_batches[idx]
-                attn_mask = attention_batches[idx]
-                valid_ids = input_ids[attn_mask == 1]
-                tokens = valid_ids.tolist()
-                if tokens and tokens[0] == self.decoder_start_token_id:
-                    tokens = tokens[1:]
-                if pad_id is not None:
-                    tokens = [tok for tok in tokens if tok != pad_id]
-                text = self.processor.tokenizer.decode(
-                    tokens, skip_special_tokens=True
-                )
+                text = feature.get("text")
+                if text is None:
+                    input_ids = input_id_batches[idx]
+                    attn_mask = attention_batches[idx]
+                    valid_ids = input_ids[attn_mask == 1]
+                    tokens = valid_ids.tolist()
+                    if tokens and tokens[0] == self.decoder_start_token_id:
+                        tokens = tokens[1:]
+                    if pad_id is not None:
+                        tokens = [tok for tok in tokens if tok != pad_id]
+                    text = self.processor.tokenizer.decode(
+                        tokens, skip_special_tokens=True
+                    )
+                elif isinstance(text, (list, tuple)):
+                    text = " ".join(map(str, text))
 
-                counts.append(get_boundary_count(text))
+                phoneme_counts.append(count_phonemes(text))
+                syllable_counts.append(count_syllables(text))
 
-            batch["target_boundary_counts"] = torch.tensor(
-                counts, dtype=torch.float32
+            phoneme_tensor = torch.tensor(phoneme_counts, dtype=torch.float32)
+            syllable_tensor = torch.tensor(syllable_counts, dtype=torch.float32)
+            batch["target_boundary_counts"] = torch.stack(
+                [phoneme_tensor, syllable_tensor], dim=0
             )
 
         return batch
@@ -248,6 +254,7 @@ training_args = Seq2SeqTrainingArguments(
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
     remove_unused_columns=False,
+    max_grad_norm=2.0,
 )
 
 trainer = Seq2SeqTrainer(

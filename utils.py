@@ -108,6 +108,129 @@ def downsample(boundaries, hidden):
     return pooled_batch.transpose(0, 1)
 
 
+def weighted_downsample(boundaries, hidden, weights, eps=1e-6):
+    """Downsample hidden states using per-segment softmax weighting.
+
+    Each segment is determined by ``boundaries`` in the same way as ``downsample``.
+    Within a segment the provided ``weights`` are normalised with a softmax and
+    used to take a weighted sum of the hidden states.
+
+    Args:
+        boundaries (torch.Tensor): Boundary tensor of shape (B, L) with ones
+            marking the end of a segment at position *t*.
+        hidden (torch.Tensor): Hidden state tensor of shape (B, L, D).
+        weights (torch.Tensor): Logit weights for each timestep of shape (B, L)
+            or (B, L, 1). Higher logits give more influence within a segment.
+        eps (float): Numerical stability constant for divisions.
+
+    Returns:
+        torch.Tensor: Weighted segment summaries of shape (S, B, D) where
+            ``S`` is the maximum number of segments in the batch.
+    """
+    batch_size, seq_len, model_dim = hidden.shape
+    device = hidden.device
+    dtype = hidden.dtype
+
+    if seq_len == 0:
+        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
+
+    boundaries = boundaries.long()
+
+    if weights is None:
+        raise ValueError("weights must be provided for weighted_downsample")
+
+    if weights.dim() == 3 and weights.size(-1) == 1:
+        weights = weights.squeeze(-1)
+
+    if weights.shape != boundaries.shape:
+        raise ValueError(
+            f"weights must have shape {boundaries.shape}, but got {weights.shape}")
+
+    weights = weights.to(device=device, dtype=dtype)
+
+    # Segment IDs: segment 0 starts at index 0, new segment after each boundary.
+    segment_ids = torch.cat([
+        torch.zeros_like(boundaries[:, :1]),
+        boundaries[:, :-1]
+    ], dim=1).cumsum(dim=1)
+
+    num_segments_per_batch = boundaries.sum(dim=1)
+    max_segments = num_segments_per_batch.max().item() if batch_size > 0 else 0
+
+    if max_segments == 0:
+        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
+
+    max_segments = int(max_segments)
+
+    valid_mask = segment_ids < num_segments_per_batch.unsqueeze(1)
+
+    index_scatter = segment_ids.clamp(max=max_segments - 1)
+
+    # Count valid elements per segment for masking and fallbacks.
+    src_lengths = torch.ones_like(segment_ids) * valid_mask
+    segment_lengths = torch.zeros(
+        batch_size, max_segments, device=device, dtype=torch.int64)
+    segment_lengths.scatter_add_(dim=1, index=index_scatter, src=src_lengths)
+
+    finfo = torch.finfo(weights.dtype)
+    masked_weights = torch.where(
+        valid_mask, weights, torch.full_like(weights, finfo.min))
+
+    segment_max = torch.full(
+        (batch_size, max_segments), finfo.min, device=device, dtype=weights.dtype)
+
+    if hasattr(segment_max, "scatter_reduce_"):
+        segment_max.scatter_reduce_(
+            dim=1,
+            index=index_scatter,
+            src=masked_weights,
+            reduce="amax",
+            include_self=True,
+        )
+    else:
+        for b in range(batch_size):
+            total_segments = int(num_segments_per_batch[b].item())
+            for seg_idx in range(total_segments):
+                seg_mask = (segment_ids[b] == seg_idx) & valid_mask[b]
+                if seg_mask.any():
+                    segment_max[b, seg_idx] = masked_weights[b][seg_mask].max()
+                else:
+                    segment_max[b, seg_idx] = 0.0
+
+    # Replace max for empty segments so gather does not introduce -inf.
+    segment_max = torch.where(
+        segment_lengths > 0,
+        segment_max,
+        torch.zeros_like(segment_max)
+    )
+
+    gathered_segment_max = segment_max.gather(1, index_scatter)
+    stable_logits = masked_weights - gathered_segment_max
+    exp_weights = torch.exp(stable_logits)
+    exp_weights = exp_weights * valid_mask
+
+    segment_weight_sum = torch.zeros(
+        batch_size, max_segments, device=device, dtype=weights.dtype)
+    segment_weight_sum.scatter_add_(dim=1, index=index_scatter, src=exp_weights)
+
+    safe_eps = max(eps, float(finfo.tiny))
+    segment_weight_sum = torch.clamp(segment_weight_sum, min=safe_eps)
+
+    weighted_hidden = hidden * exp_weights.unsqueeze(-1)
+
+    summed_hidden = torch.zeros(
+        batch_size, max_segments, model_dim, device=device, dtype=dtype)
+    summed_hidden.scatter_add_(
+        dim=1,
+        index=index_scatter.unsqueeze(-1).expand_as(hidden),
+        src=weighted_hidden
+    )
+
+    pooled_batch = summed_hidden / segment_weight_sum.unsqueeze(-1)
+
+    return pooled_batch.transpose(0, 1)
+
+
 # def downsample(boundaries, hidden, pooling="mean"):
 #     """
 #     Downsamples hidden states based on boundaries using vectorized torch operations.
