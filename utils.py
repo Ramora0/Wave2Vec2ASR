@@ -1,5 +1,47 @@
+from typing import Any, Dict, Iterable
+
 import torch
 import torch.nn.functional as F
+
+
+def _normalize_text(text: str) -> str:
+    return text.strip().lower()
+
+
+def tokenize_batch_texts(texts: Iterable[str], tokenizer) -> Any:
+    normalized = [_normalize_text(text) for text in texts]
+    return tokenizer(normalized, padding="longest", truncation=True)
+
+
+def recover_text_from_feature(
+    feature: Dict[str, Any],
+    labels_row: torch.Tensor,
+    attention_row: torch.Tensor,
+    tokenizer,
+    decoder_start_token_id: int,
+) -> str:
+    text = feature.get("text") if isinstance(feature, dict) else None
+
+    if isinstance(text, (list, tuple)):
+        text = " ".join(map(str, text))
+    elif text is not None:
+        text = str(text)
+
+    if text is not None and text.strip():
+        return text.strip()
+
+    mask = attention_row == 1
+    valid_ids = labels_row[mask].tolist()
+
+    if valid_ids and valid_ids[0] == decoder_start_token_id:
+        valid_ids = valid_ids[1:]
+
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is not None:
+        valid_ids = [tok for tok in valid_ids if tok != pad_id]
+
+    decoded = tokenizer.decode(valid_ids, skip_special_tokens=True)
+    return decoded.strip()
 
 
 def max_pool_attention_mask(attention_mask, stride=2):

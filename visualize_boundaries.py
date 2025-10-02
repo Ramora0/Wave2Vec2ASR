@@ -4,30 +4,28 @@
 from pathlib import Path
 from typing import Optional, Tuple
 
-import matplotlib.pyplot as plt
+import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.nn.utils.rnn  # noqa: F401  # ensure pad_sequence is available
 import torchaudio
 
 from MagnetWhisper import MagnetWhisper
-from BoundaryPredictor2 import BoundaryPredictor2
+from BoundaryPredictor1 import BoundaryPredictor1
 from utils import downsample
-from transformers import WhisperFeatureExtractor
+from transformers import WhisperProcessor
 
 
-def _rewrite_boundary_forward(predictor: BoundaryPredictor2) -> None:
+def _rewrite_boundary_forward(predictor: BoundaryPredictor1) -> None:
     """Patch predictor.forward so it retains the last hard boundary mask."""
 
-    def _forward(self, hidden, attention_mask: Optional[torch.Tensor] = None):
-        cos_sim = torch.einsum(
-            "b l d, b l d -> b l",
-            self.q_proj_layer(F.normalize(hidden[:, :-1])),
-            self.k_proj_layer(F.normalize(hidden[:, 1:]))
-        )
-
-        probs = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
-        probs = F.pad(probs, (1, 0), "constant", 1.0)
+    def _forward(
+        self,
+        hidden,
+        attention_mask: Optional[torch.Tensor] = None,
+        target_boundary_counts: Optional[torch.Tensor] = None,
+    ):
+        logits = self.boundary_mlp(hidden).squeeze(-1)
+        probs = torch.sigmoid(logits)
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
             temperature=self.temp,
@@ -46,7 +44,8 @@ def _rewrite_boundary_forward(predictor: BoundaryPredictor2) -> None:
 
             pad_mask = attention_mask == 0
             if pad_mask.any():
-                first_pad_mask = pad_mask & (pad_mask.long().cumsum(dim=1) == 1)
+                first_pad_mask = pad_mask & (
+                    pad_mask.long().cumsum(dim=1) == 1)
                 last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
                 last_real_mask[:, -1] = False
                 hard_boundaries = torch.maximum(
@@ -78,22 +77,50 @@ def _rewrite_boundary_forward(predictor: BoundaryPredictor2) -> None:
             total_positions_tensor = torch.tensor(
                 hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
 
-        loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
+        if target_boundary_counts is not None:
+            loss = self.calc_loss_target_counts(
+                hard_boundaries,
+                attention_mask,
+                target_boundary_counts,
+            )
+        else:
+            loss = num_boundaries_tensor.new_tensor(0.0)
+
         self.last_loss = loss
 
         self.last_hard_boundaries = hard_boundaries.detach().cpu()
-        self.last_attention_mask = attention_mask.detach().cpu() if attention_mask is not None else None
+        self.last_attention_mask = attention_mask.detach(
+        ).cpu() if attention_mask is not None else None
 
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()
 
         return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
 
-    predictor.forward = _forward.__get__(predictor, BoundaryPredictor2)
+    predictor.forward = _forward.__get__(predictor, BoundaryPredictor1)
 
 
 def _load_audio(path: Path, target_sr: int) -> Tuple[torch.Tensor, int]:
-    waveform, sample_rate = torchaudio.load(str(path))
+    try:
+        waveform, sample_rate = torchaudio.load(str(path))
+    except RuntimeError:
+        print("No torchaudio :(")
+        try:
+            import librosa
+
+            array, sample_rate = librosa.load(str(path), sr=None, mono=False)
+            if array.ndim == 1:
+                waveform = torch.from_numpy(array).unsqueeze(0)
+            else:
+                waveform = torch.from_numpy(array)
+        except Exception as librosa_exc:
+            raise RuntimeError(
+                f"Unable to load audio file {path}. Ensure ffmpeg support is available."
+            ) from librosa_exc
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform)
+
+    waveform = waveform.to(torch.float32)
     if waveform.dim() == 2 and waveform.size(0) > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
@@ -106,8 +133,8 @@ def _load_audio(path: Path, target_sr: int) -> Tuple[torch.Tensor, int]:
 
 
 def _compute_boundary_times(boundary_mask: torch.Tensor,
-                             attention_mask: Optional[torch.Tensor],
-                             audio_duration: float) -> torch.Tensor:
+                            attention_mask: Optional[torch.Tensor],
+                            audio_duration: float) -> torch.Tensor:
     if boundary_mask.dim() != 1:
         raise ValueError("Expected boundary mask for a single example.")
 
@@ -127,7 +154,8 @@ def _compute_boundary_times(boundary_mask: torch.Tensor,
 
     frame_duration = audio_duration / num_valid
 
-    boundary_indices = torch.nonzero((boundary_mask > 0.5) & valid_mask, as_tuple=True)[0]
+    boundary_indices = torch.nonzero(
+        (boundary_mask > 0.5) & valid_mask, as_tuple=True)[0]
     if boundary_indices.numel() == 0:
         return torch.empty(0)
 
@@ -136,37 +164,44 @@ def _compute_boundary_times(boundary_mask: torch.Tensor,
 
 
 def visualize_boundaries() -> None:
-    audio_path = Path("/path/to/audio.wav")
-    model_path = "/path/to/magnet/checkpoint"
+    audio_path = Path("./data/validation-1.mp3")
+    model_path = Path("./models/magnet-phonemes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    output_path: Optional[Path] = None
-    feature_extractor_name: Optional[str] = None
+    output_path: Optional[Path] = audio_path.with_name(
+        audio_path.stem + "_boundaries.txt")
 
-    feature_extractor_ref = feature_extractor_name or model_path
-    feature_extractor = WhisperFeatureExtractor.from_pretrained(feature_extractor_ref)
+    processor = WhisperProcessor.from_pretrained(
+        "openai/whisper-small",
+        token="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",
+        language="English",
+        task="transcribe",
+    )
 
-    waveform, sample_rate = _load_audio(audio_path, feature_extractor.sampling_rate)
+    waveform, sample_rate = _load_audio(
+        audio_path, processor.feature_extractor.sampling_rate)
     audio_duration = waveform.numel() / sample_rate
 
-    inputs = feature_extractor(
+    inputs = processor.feature_extractor(
         waveform.numpy(), sampling_rate=sample_rate, return_attention_mask=True
     )
 
-    input_features = torch.tensor(inputs["input_features"], dtype=torch.float32)
-    attention_mask = torch.tensor(inputs["attention_mask"], dtype=torch.float32)
+    input_features = torch.tensor(
+        inputs["input_features"], dtype=torch.float32)
+    attention_mask = torch.tensor(
+        inputs["attention_mask"], dtype=torch.float32)
 
-    model = MagnetWhisper.from_pretrained(model_path)
+    model = MagnetWhisper.from_pretrained(str(model_path))
     model.eval()
     model.to(device)
 
-    predictor: Optional[BoundaryPredictor2] = None
+    predictor: Optional[BoundaryPredictor1] = None
     for module in model.model.encoder.boundary_predictors:
-        if isinstance(module, BoundaryPredictor2):
+        if isinstance(module, BoundaryPredictor1):
             predictor = module
             break
 
     if predictor is None:
-        raise RuntimeError("No BoundaryPredictor2 found in the loaded model.")
+        raise RuntimeError("No BoundaryPredictor found in the loaded model.")
 
     _rewrite_boundary_forward(predictor)
 
@@ -177,35 +212,39 @@ def visualize_boundaries() -> None:
             return_dict=True,
         )
 
+    with torch.no_grad():
+        generated_ids = model.generate(
+            inputs=input_features.to(device),
+            attention_mask=attention_mask.to(device),
+        )[0]
+
+    prediction_text = processor.decode(
+        generated_ids.cpu(), skip_special_tokens=True
+    ).strip()
+
     boundary_mask = predictor.last_hard_boundaries.squeeze(0)
-    attention_mask_recorded = predictor.last_attention_mask.squeeze(0) if predictor.last_attention_mask is not None else None
+    attention_mask_recorded = predictor.last_attention_mask.squeeze(
+        0) if predictor.last_attention_mask is not None else None
 
-    boundary_times = _compute_boundary_times(boundary_mask, attention_mask_recorded, audio_duration)
+    boundary_times = _compute_boundary_times(
+        boundary_mask, attention_mask_recorded, audio_duration)
 
-    time_axis = torch.linspace(0, audio_duration, steps=waveform.numel())
+    boundary_times_list = boundary_times.tolist()
+    label_lines = [
+        f"{timestamp:.6f}\t{timestamp:.6f}\tboundary_{idx}"
+        for idx, timestamp in enumerate(boundary_times_list, start=1)
+    ]
 
-    plt.figure(figsize=(14, 4))
-    plt.plot(time_axis.numpy(), waveform.numpy(), label="Waveform")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(label_lines))
 
-    for t in boundary_times:
-        plt.axvline(t.item(), color="red", linestyle="--", alpha=0.6)
-
-    plt.title("Boundary Predictions")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Amplitude")
-    plt.tight_layout()
-
-    if output_path is None:
-        output_path = audio_path.with_name(audio_path.stem + "_boundaries.png")
-    plt.savefig(output_path)
-    plt.close()
-
-    readable_times = ", ".join(f"{t.item():.2f}s" for t in boundary_times)
-    print(f"Saved boundary visualization to {output_path}")
-    if readable_times:
-        print(f"Boundary times: {readable_times}")
+    if label_lines:
+        print(f"Wrote {len(label_lines)} labels to {output_path}")
     else:
-        print("No boundaries detected.")
+        print("No boundaries detected; label file left empty.")
+
+    print("\nModel transcription:")
+    print(prediction_text if prediction_text else "(empty)")
 
 
 def main() -> None:
