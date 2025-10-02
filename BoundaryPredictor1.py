@@ -32,8 +32,6 @@ class BoundaryPredictor1(nn.Module):
         self.prior = prior
 
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
-        # print("Hidden", hidden.shape)
-        bs, seq_len, model_dim = hidden.shape
         logits = self.boundary_mlp(
             hidden).squeeze(-1)
         probs = torch.sigmoid(logits)
@@ -133,7 +131,7 @@ class BoundaryPredictor1(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return loss_values.mean() / (64 ** 2)
+        return loss_values.mean()
 
     def calc_example_loss(self, hard_boundaries, attention_mask=None):
         per_item_boundaries = hard_boundaries.sum(dim=1)

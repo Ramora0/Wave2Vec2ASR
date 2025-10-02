@@ -15,10 +15,51 @@ from datasets import load_dataset, Audio, load_from_disk
 from data_loader import get_dataset
 import wandb
 import aiohttp
+# from g2p_en import G2p
+from syllapy import count as syllable_count
 
 scratch_path = "/fs/scratch/PAS2836/lees_stuff"
 
 print("hi")
+
+
+# ============================================================================
+# Phoneme Utilities (separate from core training logic)
+# Inspired by the phoneme preprocessing example provided; this helper is reused
+# at training time only for boundary-count fallbacks when the dataset has not
+# been regenerated yet.
+# ============================================================================
+
+# G2P_CONVERTER = G2p()
+
+# Previous phoneme-based boundary counter kept for reference while disabled.
+# def get_boundary_count(text: str) -> float:
+#     normalized = text.strip().lower()
+#     phoneme_sequence = G2P_CONVERTER(normalized)
+#     phoneme_tokens = [token for token in phoneme_sequence if token.strip()]
+#     return float(len(phoneme_tokens))
+
+# Previous character-based boundary counter kept for reference while disabled.
+# def get_boundary_count(text: str) -> float:
+#     cleaned = text.strip()
+#     letter_count = sum(1 for char in cleaned if char.isalpha())
+#     return float(letter_count)
+
+# Previous syllable-based boundary counter kept for reference while disabled.
+# def get_boundary_count(text: str) -> float:
+#     cleaned = text.strip().lower()
+#     return float(syllable_count(cleaned))
+
+
+def get_boundary_count(text: str) -> float:
+    tokens = [tok for tok in text.strip().split() if tok]
+    return float(len(tokens))
+
+
+# ============================================================================
+# End Phoneme Utilities
+# ============================================================================
+
 
 dataset = load_from_disk(f"{scratch_path}/librispeech-processed")
 
@@ -112,9 +153,37 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         batch["labels"] = labels
 
-        if features and "target_boundary_count" in features[0]:
+        if features:
+            pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+            input_id_batches = labels_batch["input_ids"]
+            attention_batches = labels_batch["attention_mask"]
+
+            counts: List[float] = []
+            for idx, feature in enumerate(features):
+                value = feature.get("target_boundary_count")
+
+                if value is not None:
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    counts.append(float(value))
+                    continue
+
+                input_ids = input_id_batches[idx]
+                attn_mask = attention_batches[idx]
+                valid_ids = input_ids[attn_mask == 1]
+                tokens = valid_ids.tolist()
+                if tokens and tokens[0] == self.decoder_start_token_id:
+                    tokens = tokens[1:]
+                if pad_id is not None:
+                    tokens = [tok for tok in tokens if tok != pad_id]
+                text = self.processor.tokenizer.decode(
+                    tokens, skip_special_tokens=True
+                )
+
+                counts.append(get_boundary_count(text))
+
             batch["target_boundary_counts"] = torch.tensor(
-                [feature["target_boundary_count"] for feature in features], dtype=torch.float32
+                counts, dtype=torch.float32
             )
 
         return batch
@@ -178,6 +247,7 @@ training_args = Seq2SeqTrainingArguments(
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
+    remove_unused_columns=False,
 )
 
 trainer = Seq2SeqTrainer(
