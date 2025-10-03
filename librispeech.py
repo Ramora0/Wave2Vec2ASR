@@ -19,13 +19,18 @@ HF_AUTH_TOKEN = "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"
 G2P_CONVERTER = G2p()
 
 
-def count_phonemes(text: str) -> float:
+def count_syllables(text: str) -> float:
     normalized = text.strip().lower()
     if not normalized:
         return 0.0
+
     phoneme_sequence = G2P_CONVERTER(normalized)
-    phoneme_tokens = [token for token in phoneme_sequence if token.strip() and token != " "]
-    return float(len(phoneme_tokens))
+    syllable_tokens = [
+        token
+        for token in phoneme_sequence
+        if token.strip() and any(char.isdigit() for char in token)
+    ]
+    return float(len(syllable_tokens))
 
 
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -51,7 +56,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         batch["labels"] = labels
 
         if features:
-            phoneme_counts: List[float] = []
+            syllable_counts: List[float] = []
 
             for idx, feature in enumerate(features):
                 text = recover_text_from_feature(
@@ -61,10 +66,10 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                     self.processor.tokenizer,
                     self.decoder_start_token_id,
                 )
-                phoneme_counts.append(count_phonemes(text))
+                syllable_counts.append(count_syllables(text))
 
-            phoneme_tensor = torch.tensor(phoneme_counts, dtype=torch.float32)
-            batch["target_boundary_counts"] = phoneme_tensor.unsqueeze(0)
+            syllable_tensor = torch.tensor(syllable_counts, dtype=torch.float32)
+            batch["target_boundary_counts"] = syllable_tensor.unsqueeze(0)
 
         return batch
 

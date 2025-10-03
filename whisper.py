@@ -25,11 +25,35 @@ model = WhisperForConditionalGeneration.from_pretrained(
     # attn_implementation="flash_attention_2"
 )
 
-# Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2 with
-# masking-aware priors on every encoder layer.
+# Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
-boundary_priors = [(1, 0.25)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+SYLLABLE_BOUNDARY_LAYER = 1
+SYLLABLE_BOUNDARY_PRIOR = 0.25
+BOUNDARY_TEMP_START = 2.5
+BOUNDARY_TEMP_END = 1.1
+BOUNDARY_TARGET_MIX_START = 0.0
+BOUNDARY_TARGET_MIX_END = 1.0
+boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
+model.load_magnet(boundary_priors, "BoundaryPredictor2")
+
+
+def _set_boundary_temperature(magnet_model, temperature):
+    predictors = getattr(magnet_model.model.encoder, "boundary_predictors", [])
+    for predictor in predictors:
+        if hasattr(predictor, "temp"):
+            predictor.temp = temperature
+    magnet_model.boundary_temperature = temperature
+
+
+def _set_boundary_target_mix(magnet_model, mix):
+    if hasattr(magnet_model, "set_boundary_target_mix"):
+        magnet_model.set_boundary_target_mix(mix)
+    else:
+        magnet_model.boundary_target_mix = mix
+
+
+_set_boundary_temperature(model, BOUNDARY_TEMP_START)
+_set_boundary_target_mix(model, BOUNDARY_TARGET_MIX_START)
 
 model.to("cuda")
 
@@ -65,7 +89,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=1,
+    num_train_epochs=3,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
@@ -108,11 +132,54 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_loss is not None:
             log_payload["train/boundary_loss"] = boundary_loss
 
+        boundary_temp = getattr(model, "boundary_temperature", None)
+        if boundary_temp is not None:
+            log_payload["train/boundary_temperature"] = boundary_temp
+
+        boundary_target_mix = getattr(model, "boundary_target_mix", None)
+        if boundary_target_mix is not None:
+            log_payload["train/boundary_target_mix"] = boundary_target_mix
+
         wandb.log(log_payload)
 
 
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())
+
+
+class BoundaryScheduler(TrainerCallback):
+    def __init__(self, start_temp, end_temp, start_mix, end_mix):
+        self.start_temp = start_temp
+        self.end_temp = end_temp
+        self.start_mix = start_mix
+        self.end_mix = end_mix
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
+
+        progress = min(1.0, state.global_step / total_steps)
+        current_temp = self.start_temp + \
+            (self.end_temp - self.start_temp) * progress
+        current_mix = self.start_mix + \
+            (self.end_mix - self.start_mix) * progress
+
+        _set_boundary_temperature(model, current_temp)
+        _set_boundary_target_mix(model, current_mix)
+
+
+trainer.add_callback(
+    BoundaryScheduler(
+        start_temp=BOUNDARY_TEMP_START,
+        end_temp=BOUNDARY_TEMP_END,
+        start_mix=BOUNDARY_TARGET_MIX_START,
+        end_mix=BOUNDARY_TARGET_MIX_END,
+    )
+)
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):

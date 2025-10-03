@@ -22,9 +22,17 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         self._boundary_loss_total = 0.0
         self._boundary_loss_steps = 0
 
+    def set_boundary_target_mix(self, mix: float):
+        mix = float(mix)
+        mix = max(0.0, min(1.0, mix))
+        self.boundary_target_mix = mix
+        if hasattr(self.model, "encoder"):
+            setattr(self.model.encoder, "boundary_target_mix", mix)
+
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
+        self.set_boundary_target_mix(1.0)
         self._reset_boundary_loss_tracker()
 
     @classmethod
@@ -537,6 +545,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # Initialize boundary and position counters
         self.total_boundaries = 0
         self.total_positions = 0
+        self.boundary_target_mix = 1.0
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":
@@ -691,10 +700,23 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
                     predictor_input = layer_outputs[0]
                     target_for_predictor = None
-                    if isinstance(predictor_module, BoundaryPredictor1):
+                    if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2)):
                         if target_matrix is not None and target_pointer < target_matrix.size(0):
                             target_for_predictor = target_matrix[target_pointer]
                             target_pointer += 1
+
+                        if target_for_predictor is not None:
+                            if attention_mask_1d is not None:
+                                per_item_totals = attention_mask_1d.sum(dim=1).to(target_for_predictor.dtype)
+                            else:
+                                per_item_totals = predictor_input.new_full(
+                                    (predictor_input.size(0),),
+                                    predictor_input.size(1),
+                                ).to(target_for_predictor.dtype)
+
+                            mix = getattr(self, "boundary_target_mix", 1.0)
+                            target_for_predictor = mix * target_for_predictor + (1.0 - mix) * per_item_totals
+                            target_for_predictor = torch.minimum(target_for_predictor, per_item_totals)
 
                         result = predictor_module(
                             predictor_input,
