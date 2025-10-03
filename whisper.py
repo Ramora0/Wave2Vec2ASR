@@ -1,5 +1,6 @@
 from transformers import TrainerCallback
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers.trainer import Trainer
 import os
 # from SlidingWhisper import SlidingWhisper
 from evaluate import load
@@ -29,10 +30,10 @@ model = WhisperForConditionalGeneration.from_pretrained(
 model.__class__ = MagnetWhisper
 SYLLABLE_BOUNDARY_LAYER = 1
 SYLLABLE_BOUNDARY_PRIOR = 0.25
-BOUNDARY_TEMP_START = 2.5
-BOUNDARY_TEMP_END = 1.1
-BOUNDARY_TARGET_MIX_START = 0.0
-BOUNDARY_TARGET_MIX_END = 1.0
+BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
+# Max compression, i.e., syllable target throughout training
+BOUNDARY_TARGET_PROGRESS = 1.0
+FREEZE_NON_BOUNDARY_STEPS = 250
 boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
 model.load_magnet(boundary_priors, "BoundaryPredictor2")
 
@@ -45,15 +46,15 @@ def _set_boundary_temperature(magnet_model, temperature):
     magnet_model.boundary_temperature = temperature
 
 
-def _set_boundary_target_mix(magnet_model, mix):
-    if hasattr(magnet_model, "set_boundary_target_mix"):
-        magnet_model.set_boundary_target_mix(mix)
+def _set_boundary_target_progress(magnet_model, progress):
+    if hasattr(magnet_model, "set_boundary_target_progress"):
+        magnet_model.set_boundary_target_progress(progress)
     else:
-        magnet_model.boundary_target_mix = mix
+        magnet_model.boundary_target_progress = progress
 
 
-_set_boundary_temperature(model, BOUNDARY_TEMP_START)
-_set_boundary_target_mix(model, BOUNDARY_TARGET_MIX_START)
+_set_boundary_temperature(model, BOUNDARY_TEMP)
+_set_boundary_target_progress(model, BOUNDARY_TARGET_PROGRESS)
 
 model.to("cuda")
 
@@ -99,7 +100,7 @@ training_args = Seq2SeqTrainingArguments(
     logging_steps=50,
     report_to="wandb",
     greater_is_better=False,
-    weight_decay=.005,
+    weight_decay=1e-4,
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
@@ -107,7 +108,42 @@ training_args = Seq2SeqTrainingArguments(
     max_grad_norm=2.0,
 )
 
-trainer = Seq2SeqTrainer(
+
+class MagnetSeq2SeqTrainer(Seq2SeqTrainer):
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return
+
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+            self.args)
+
+        boundary_params = []
+        other_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "boundary_predictors" in name:
+                boundary_params.append(param)
+            else:
+                other_params.append(param)
+
+        base_lr = self.args.learning_rate
+
+        param_groups = []
+        if other_params:
+            param_groups.append({"params": other_params, "lr": base_lr * 2.0})
+        if boundary_params:
+            param_groups.append(
+                {"params": boundary_params, "lr": base_lr / 2.0})
+
+        if not param_groups:
+            param_groups = [{"params": self.model.parameters()}]
+
+        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+
+
+trainer = MagnetSeq2SeqTrainer(
     args=training_args,
     model=model,
     train_dataset=dataset["train"],
@@ -136,9 +172,10 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_temp is not None:
             log_payload["train/boundary_temperature"] = boundary_temp
 
-        boundary_target_mix = getattr(model, "boundary_target_mix", None)
-        if boundary_target_mix is not None:
-            log_payload["train/boundary_target_mix"] = boundary_target_mix
+        boundary_target_progress = getattr(
+            model, "boundary_target_progress", None)
+        if boundary_target_progress is not None:
+            log_payload["train/boundary_target_progress"] = boundary_target_progress
 
         wandb.log(log_payload)
 
@@ -147,39 +184,79 @@ class CompressionRatioCallback(TrainerCallback):
 trainer.add_callback(CompressionRatioCallback())
 
 
-class BoundaryScheduler(TrainerCallback):
-    def __init__(self, start_temp, end_temp, start_mix, end_mix):
-        self.start_temp = start_temp
-        self.end_temp = end_temp
-        self.start_mix = start_mix
-        self.end_mix = end_mix
+class FreezeNonBoundaryCallback(TrainerCallback):
+    def __init__(self, freeze_steps: int):
+        self.freeze_steps = freeze_steps
+        self._frozen = False
+        self._unfrozen = False
+
+    @staticmethod
+    def _is_boundary_parameter(name: str) -> bool:
+        return "boundary_predictors" in name
+
+    def _freeze(self, model):
+        for name, param in model.named_parameters():
+            param.requires_grad = self._is_boundary_parameter(name)
+        self._frozen = True
+
+    def _unfreeze(self, model):
+        for _, param in model.named_parameters():
+            param.requires_grad = True
+        self._unfrozen = True
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if model is None or self.freeze_steps <= 0 or self._frozen:
+            return
+        self._freeze(model)
 
     def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is None:
+        if model is None or not self._frozen or self._unfrozen:
             return
+        if state.global_step >= self.freeze_steps:
+            self._unfreeze(model)
 
-        total_steps = state.max_steps if state and state.max_steps else None
-        if not total_steps or total_steps <= 0:
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        if model is None or not self._frozen or self._unfrozen:
             return
-
-        progress = min(1.0, state.global_step / total_steps)
-        current_temp = self.start_temp + \
-            (self.end_temp - self.start_temp) * progress
-        current_mix = self.start_mix + \
-            (self.end_mix - self.start_mix) * progress
-
-        _set_boundary_temperature(model, current_temp)
-        _set_boundary_target_mix(model, current_mix)
+        self._unfreeze(model)
 
 
-trainer.add_callback(
-    BoundaryScheduler(
-        start_temp=BOUNDARY_TEMP_START,
-        end_temp=BOUNDARY_TEMP_END,
-        start_mix=BOUNDARY_TARGET_MIX_START,
-        end_mix=BOUNDARY_TARGET_MIX_END,
-    )
-)
+# trainer.add_callback(FreezeNonBoundaryCallback(FREEZE_NON_BOUNDARY_STEPS))
+
+
+class BoundaryScheduler(TrainerCallback):
+    """Kept for reference; scheduling is disabled by commenting out the callback."""
+
+    def __init__(self, start_temp, end_temp, start_progress, end_progress):
+        self.start_temp = start_temp
+        self.end_temp = end_temp
+        self.start_progress = start_progress
+        self.end_progress = end_progress
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        # Original scheduling logic retained for future experiments:
+        # if model is None:
+        #     return
+        # total_steps = state.max_steps if state and state.max_steps else None
+        # if not total_steps or total_steps <= 0:
+        #     return
+        # progress = min(1.0, state.global_step / total_steps)
+        # current_temp = self.start_temp + (self.end_temp - self.start_temp) * progress
+        # current_progress = self.start_progress + (self.end_progress - self.start_progress) * progress
+        # _set_boundary_temperature(model, current_temp)
+        # _set_boundary_target_progress(model, current_progress)
+        return
+
+
+# Example usage (disabled for now):
+# trainer.add_callback(
+#     BoundaryScheduler(
+#         start_temp=BOUNDARY_TEMP_START,
+#         end_temp=BOUNDARY_TEMP_END,
+#         start_progress=BOUNDARY_TARGET_PROGRESS_START,
+#         end_progress=BOUNDARY_TARGET_PROGRESS_END,
+#     )
+# )
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):

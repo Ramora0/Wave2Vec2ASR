@@ -22,17 +22,17 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         self._boundary_loss_total = 0.0
         self._boundary_loss_steps = 0
 
-    def set_boundary_target_mix(self, mix: float):
-        mix = float(mix)
-        mix = max(0.0, min(1.0, mix))
-        self.boundary_target_mix = mix
+    def set_boundary_target_progress(self, progress: float):
+        progress = float(progress)
+        progress = max(0.0, min(1.0, progress))
+        self.boundary_target_progress = progress
         if hasattr(self.model, "encoder"):
-            setattr(self.model.encoder, "boundary_target_mix", mix)
+            setattr(self.model.encoder, "boundary_target_progress", progress)
 
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
-        self.set_boundary_target_mix(1.0)
+        self.set_boundary_target_progress(1.0)
         self._reset_boundary_loss_tracker()
 
     @classmethod
@@ -70,6 +70,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             # Initialize boundary and position counters in encoder
             model.model.encoder.total_boundaries = 0
             model.model.encoder.total_positions = 0
+            model.model.encoder.boundary_target_progress = 1.0
 
             # Reconstruct each predictor based on saved type information
             layer_types_dict = dict(layer_types)
@@ -545,7 +546,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # Initialize boundary and position counters
         self.total_boundaries = 0
         self.total_positions = 0
-        self.boundary_target_mix = 1.0
+        self.boundary_target_progress = 1.0
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":
@@ -714,9 +715,33 @@ class MagnetWhisperEncoder(WhisperEncoder):
                                     predictor_input.size(1),
                                 ).to(target_for_predictor.dtype)
 
-                            mix = getattr(self, "boundary_target_mix", 1.0)
-                            target_for_predictor = mix * target_for_predictor + (1.0 - mix) * per_item_totals
+                            safe_totals = per_item_totals.clamp(min=1.0)
+                            target_counts = target_for_predictor.to(per_item_totals.dtype)
+                            safe_targets = torch.where(
+                                target_counts > 0,
+                                target_counts,
+                                safe_totals,
+                            )
+
+                            compression_target = safe_totals / safe_targets
+                            compression_target = compression_target.clamp(min=1.0)
+
+                            progress_value = getattr(self, "boundary_target_progress", 1.0)
+                            progress_tensor = torch.tensor(
+                                float(progress_value),
+                                device=safe_totals.device,
+                                dtype=safe_totals.dtype,
+                            ).clamp(0.0, 1.0)
+
+                            compression_schedule = torch.lerp(
+                                torch.ones_like(compression_target),
+                                compression_target,
+                                progress_tensor,
+                            )
+                            target_for_predictor = safe_totals / compression_schedule
+
                             target_for_predictor = torch.minimum(target_for_predictor, per_item_totals)
+                            target_for_predictor = torch.clamp(target_for_predictor, min=0.0)
 
                         result = predictor_module(
                             predictor_input,
