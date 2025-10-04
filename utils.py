@@ -68,7 +68,99 @@ def max_pool_attention_mask(attention_mask, stride=2):
     return pooled_mask
 
 
-def downsample(boundaries, hidden):
+def hnet_downsample(boundaries, hidden, probs=None):
+    """
+    H-Net-style downsampling with smoothing.
+
+    - Downsampler: select vectors at boundary positions (b_t == 1).
+    - Smoothing module (EMA over chunks): z[i] = P[i] * x[i] + (1 - P[i]) * z[i-1],
+      with P[0] := 1 (ensures the first kept vector is not smoothed).
+
+    Args:
+        boundaries (torch.Tensor): (B, L) int/float in {0,1}. 1 marks *end* of a segment at index t (keep t).
+        hidden     (torch.Tensor): (B, L, D) hidden states.
+        probs      (torch.Tensor, optional): (B, L) real in [0,1], boundary probabilities p_t aligned to `boundaries`.
+                                             If None, uses boundaries.float() and forces first kept prob to 1 per batch.
+
+    Returns:
+        torch.Tensor: Smoothed, downsampled states of shape (S, B, D), where
+                      S = max(# of ones in `boundaries[b]`) across the batch.
+                      (Rows beyond a shorter example’s true #kept are zero-padded before smoothing and
+                       do not contribute downstream if you later mask by per-batch counts.)
+    """
+    B, L, D = hidden.shape
+    device, dtype = hidden.device, hidden.dtype
+
+    if L == 0:
+        return torch.zeros((0, B, D), device=device, dtype=dtype)
+
+    # Ensure integer mask
+    b = boundaries.long()
+    # Per-batch count of kept positions (number of 1s)
+    seg_counts = b.sum(dim=1)  # (B,)
+    S = int(seg_counts.max().item()) if B > 0 else 0
+    if S == 0:
+        return torch.zeros((0, B, D), device=device, dtype=dtype)
+
+    # Rank the boundary positions (1..count) so we can scatter them into [0..S-1]
+    # rank_t = cumulative count of 1s up to and including t
+    rank = b.cumsum(dim=1)  # (B, L)
+    # We only care about indices where b==1; map them to [0..S-1]
+    # safe even where b==0; we’ll zero those srcs
+    idx_scatter = (rank - 1).clamp(min=0)
+
+    # Select-only downsampling by scatter (zeros where not kept)
+    kept_hidden = torch.zeros(B, S, D, device=device, dtype=dtype)
+    src_hidden = hidden * b.unsqueeze(-1)  # zero non-kept time steps
+    kept_hidden.scatter_add_(
+        dim=1,
+        index=idx_scatter.unsqueeze(-1).expand(-1, -1, D),
+        src=src_hidden,
+    )
+    # Because each kept index receives exactly one contribution, this is equivalent to a gather.
+
+    # Boundary probabilities aligned with kept positions
+    if probs is None:
+        p = b.to(hidden.dtype)
+    else:
+        p = probs.to(hidden.dtype).clamp(0, 1)
+
+    kept_p = torch.zeros(B, S, device=device, dtype=hidden.dtype)
+    src_p = p * b  # zero elsewhere
+    kept_p.scatter_add_(dim=1, index=idx_scatter, src=src_p)
+
+    # Ensure first kept position per batch has P=1, as in the paper (p1 := 1.0).
+    # For batches with at least one kept position, set kept_p[:, 0] = 1
+    if S > 0:
+        has_any = (seg_counts > 0).to(hidden.dtype)
+        if S == 1:
+            kept_p = has_any.unsqueeze(-1)
+        else:
+            kept_p = torch.cat([
+                has_any.unsqueeze(-1),
+                kept_p[:, 1:],
+            ], dim=1)
+
+    # EMA smoothing across the kept sequence dimension (i over chunks)
+    smoothed_chunks = []
+    prev = kept_hidden[:, 0, :]
+    smoothed_chunks.append(prev)
+    for i in range(1, S):
+        Pi = kept_p[:, i].unsqueeze(-1)
+        prev = Pi * kept_hidden[:, i, :] + (1.0 - Pi) * prev
+        smoothed_chunks.append(prev)
+    smoothed = torch.stack(smoothed_chunks, dim=1)
+
+    # Return (S, B, D) to match your previous interface
+    return smoothed.transpose(0, 1)
+
+
+def downsample(
+    boundaries,
+    hidden,
+    assignment_temperature: float = 20.0,
+    mask_scale: float = 20.0,
+):
     """
     Downsample hidden states using boundary indicators while retaining gradient
     flow to the boundary scores. A new segment starts at index 0 and at every
@@ -78,6 +170,11 @@ def downsample(boundaries, hidden):
         boundaries (torch.Tensor): Tensor of shape (B, L) with values in [0, 1].
             A value of 1 marks the *end* of a segment at index t.
         hidden (torch.Tensor): Tensor of shape (B, L, D) containing hidden states.
+        assignment_temperature (float): Softmax temperature controlling how
+            sharply timesteps are assigned to segments. Larger values emulate
+            harder boundaries.
+        mask_scale (float): Sigmoid scale for suppressing padded segments. Use
+            large values to drive the mask toward binary behaviour.
 
     Returns:
         torch.Tensor: Pooled hidden states of shape (S, B, D), where S is the
@@ -105,12 +202,10 @@ def downsample(boundaries, hidden):
     segment_range = torch.arange(
         max_segments, device=device, dtype=dtype).view(1, max_segments, 1)
 
-    assignment_temperature = 20.0
     assignment_logits = -assignment_temperature * (
         segment_index.unsqueeze(1) - segment_range).abs()
     assignment = torch.softmax(assignment_logits, dim=1)
 
-    mask_scale = 20.0
     segment_mask = torch.sigmoid(
         mask_scale * (per_item_segments.view(batch_size, 1, 1)
                       - segment_range - 0.5)
@@ -119,7 +214,8 @@ def downsample(boundaries, hidden):
     assignment = assignment * segment_mask
 
     eps = float(torch.finfo(dtype).eps)
-    assignment = assignment / assignment.sum(dim=1, keepdim=True).clamp(min=eps)
+    assignment = assignment / \
+        assignment.sum(dim=1, keepdim=True).clamp(min=eps)
 
     segment_sums = torch.einsum('bsl,bld->bsd', assignment, hidden)
     segment_lengths = assignment.sum(dim=2)
@@ -234,7 +330,8 @@ def weighted_downsample(boundaries, hidden, weights, eps=1e-6):
 
     segment_weight_sum = torch.zeros(
         batch_size, max_segments, device=device, dtype=weights.dtype)
-    segment_weight_sum.scatter_add_(dim=1, index=index_scatter, src=exp_weights)
+    segment_weight_sum.scatter_add_(
+        dim=1, index=index_scatter, src=exp_weights)
 
     safe_eps = max(eps, float(finfo.tiny))
     segment_weight_sum = torch.clamp(segment_weight_sum, min=safe_eps)

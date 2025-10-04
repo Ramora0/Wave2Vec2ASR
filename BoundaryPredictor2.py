@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts
-from utils import downsample
+from old_downsample import downsample as legacy_downsample
 
 
 class BoundaryPredictor2(nn.Module):
@@ -13,6 +13,7 @@ class BoundaryPredictor2(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
+        self.allow_downsample_gradients = True
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -26,6 +27,9 @@ class BoundaryPredictor2(nn.Module):
 
     def set_prior(self, prior):
         self.prior = prior
+
+    def set_downsample_gradients(self, enabled: bool):
+        self.allow_downsample_gradients = bool(enabled)
 
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         normalized_hidden = F.normalize(hidden, dim=-1)
@@ -57,8 +61,18 @@ class BoundaryPredictor2(nn.Module):
                 hard_boundaries = torch.maximum(
                     hard_boundaries, last_real_mask.float())
 
-        pooled = downsample(hard_boundaries, hidden)
+        # pooled = downsample(
+        #     hard_boundaries,
+        #     hidden,
+        #     assignment_temperature=self.downsample_assignment_temp,
+        #     mask_scale=self.downsample_mask_scale,
+        # )
+        pooled = legacy_downsample(hard_boundaries, hidden)
+        self._validate_downsample_output(pooled, hard_boundaries)
         pooled = pooled.transpose(0, 1)
+
+        if not self.allow_downsample_gradients:
+            pooled = pooled.detach()
 
         shortened_attention_mask = None
         if attention_mask is not None:
@@ -132,3 +146,58 @@ class BoundaryPredictor2(nn.Module):
             target_boundary_counts,
         )
         return loss_values.mean()
+
+    def _validate_downsample_output(self, pooled, hard_boundaries, tol=1e-5):
+        """Raise if pooled segments disagree with boundary counts."""
+        if hard_boundaries.ndim != 2:
+            raise RuntimeError(
+                "Expected hard_boundaries to be 2D (B x L)."
+                f" Got shape {tuple(hard_boundaries.shape)}")
+
+        with torch.no_grad():
+            if torch.isnan(pooled).any():
+                raise RuntimeError(
+                    "Downsample produced NaNs."
+                    f" pooled={pooled.detach().cpu()}")
+
+            per_item_segments = hard_boundaries.sum(dim=1)
+            max_expected = int(per_item_segments.max().item()) if per_item_segments.numel() else 0
+
+            if pooled.size(0) != max_expected:
+                raise RuntimeError(
+                    "Segment count mismatch between pooled output and boundary sums."
+                    f" pooled_shape={tuple(pooled.shape)}"
+                    f" expected_max_segments={max_expected}"
+                    f" per_item_segments={per_item_segments.detach().cpu()}")
+
+            if max_expected == 0:
+                if pooled.numel() != 0:
+                    raise RuntimeError(
+                        "Expected zero pooled vectors but received non-empty tensor."
+                        f" pooled={pooled.detach().cpu()}")
+                return
+
+            for batch_idx in range(pooled.size(1)):
+                expected = int(per_item_segments[batch_idx].item())
+
+                if expected < max_expected:
+                    tail = pooled[expected:, batch_idx]
+                    if tail.abs().max().item() > tol:
+                        raise RuntimeError(
+                            "Non-zero pooled vectors found beyond declared boundaries."
+                            f" sequence={batch_idx}"
+                            f" expected_segments={expected}"
+                            f" offending_tail={tail.detach().cpu()}"
+                            f" boundaries={hard_boundaries[batch_idx].detach().cpu()}"
+                        )
+
+                if expected > 0:
+                    active = pooled[:expected, batch_idx]
+                    if active.abs().max().item() <= tol:
+                        raise RuntimeError(
+                            "All active pooled vectors are near zero."
+                            f" sequence={batch_idx}"
+                            f" expected_segments={expected}"
+                            f" active_vectors={active.detach().cpu()}"
+                            f" boundaries={hard_boundaries[batch_idx].detach().cpu()}"
+                        )

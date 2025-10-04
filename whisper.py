@@ -28,14 +28,15 @@ model = WhisperForConditionalGeneration.from_pretrained(
 
 # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
-SYLLABLE_BOUNDARY_LAYER = 1
+SYLLABLE_BOUNDARY_LAYER = 3
 SYLLABLE_BOUNDARY_PRIOR = 0.25
 BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
 BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
+# DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -55,6 +56,7 @@ def _set_boundary_target_progress(magnet_model, progress):
 
 _set_boundary_temperature(model, BOUNDARY_TEMP)
 _set_boundary_target_progress(model, BOUNDARY_TARGET_PROGRESS)
+# model.set_downsample_gradients_enabled(False)
 
 model.to("cuda")
 
@@ -87,7 +89,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=1e-5,
+    learning_rate=2e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,
@@ -117,28 +119,33 @@ class MagnetSeq2SeqTrainer(Seq2SeqTrainer):
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args)
 
-        boundary_params = []
-        other_params = []
+        # NOTE: differential learning rates are disabled for now. The original
+        # implementation is kept below for convenience:
+        #
+        # boundary_params = []
+        # other_params = []
+        # for name, param in self.model.named_parameters():
+        #     if not param.requires_grad:
+        #         continue
+        #     if "boundary_predictors" in name:
+        #         boundary_params.append(param)
+        #     else:
+        #         other_params.append(param)
+        # base_lr = self.args.learning_rate
+        # param_groups = []
+        # if other_params:
+        #     param_groups.append({"params": other_params, "lr": base_lr * 2.0})
+        # if boundary_params:
+        #     param_groups.append({"params": boundary_params, "lr": base_lr / 2.0})
+        # if not param_groups:
+        #     param_groups = [{"params": self.model.parameters()}]
 
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if "boundary_predictors" in name:
-                boundary_params.append(param)
-            else:
-                other_params.append(param)
+        params = [param for _, param in self.model.named_parameters()
+                  if param.requires_grad]
+        if not params:
+            params = list(self.model.parameters())
 
-        base_lr = self.args.learning_rate
-
-        param_groups = []
-        if other_params:
-            param_groups.append({"params": other_params, "lr": base_lr * 2.0})
-        if boundary_params:
-            param_groups.append(
-                {"params": boundary_params, "lr": base_lr / 2.0})
-
-        if not param_groups:
-            param_groups = [{"params": self.model.parameters()}]
+        param_groups = [{"params": params, "lr": self.args.learning_rate}]
 
         self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
 
@@ -176,6 +183,12 @@ class CompressionRatioCallback(TrainerCallback):
             model, "boundary_target_progress", None)
         if boundary_target_progress is not None:
             log_payload["train/boundary_target_progress"] = boundary_target_progress
+
+        # downsample_grad_enabled = getattr(
+        #     model, "downsample_gradients_enabled", None)
+        # if downsample_grad_enabled is not None:
+        #     log_payload["train/downsample_gradients_enabled"] = float(
+        #         bool(downsample_grad_enabled))
 
         wandb.log(log_payload)
 
@@ -257,6 +270,41 @@ class BoundaryScheduler(TrainerCallback):
 #         end_progress=BOUNDARY_TARGET_PROGRESS_END,
 #     )
 # )
+
+
+# class DownsampleGradScheduler(TrainerCallback):
+#     def __init__(self, warmup_steps: int):
+#         self.warmup_steps = warmup_steps
+#         self._enabled = warmup_steps <= 0
+#
+#     def _set_flag(self, model, enabled: bool):
+#         if model is None:
+#             return
+#         if hasattr(model, "set_downsample_gradients_enabled"):
+#             model.set_downsample_gradients_enabled(enabled)
+#
+#     def on_train_begin(self, args, state, control, model=None, **kwargs):
+#         if self.warmup_steps <= 0:
+#             self._enabled = True
+#             self._set_flag(model, True)
+#         else:
+#             self._enabled = False
+#             self._set_flag(model, False)
+#
+#     def on_step_begin(self, args, state, control, model=None, **kwargs):
+#         if model is None or self._enabled:
+#             return
+#         if state.global_step >= self.warmup_steps:
+#             self._set_flag(model, True)
+#             self._enabled = True
+#
+#     def on_train_end(self, args, state, control, model=None, **kwargs):
+#         if not self._enabled:
+#             self._set_flag(model, True)
+#             self._enabled = True
+
+
+# trainer.add_callback(DownsampleGradScheduler(DOWNSAMPLE_NO_GRAD_STEPS))
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):
