@@ -22,7 +22,7 @@ class BoundaryPredictor1(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.downsample_assignment_temp = 5.0
+        self.downsample_assignment_temp = 8.0
         self.downsample_mask_scale = 5.0
 
         hidden = hidden_dim
@@ -31,6 +31,9 @@ class BoundaryPredictor1(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1)
         )
+
+        with torch.no_grad():
+            self.boundary_mlp[-1].bias.fill_(-2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -79,7 +82,9 @@ class BoundaryPredictor1(nn.Module):
             assignment_temperature=self.downsample_assignment_temp,
             mask_scale=self.downsample_mask_scale,
         )
-        pooled = pooled_hard + (pooled_soft - pooled_soft.detach())
+        grad_scale = 0.05
+        pooled = pooled_hard + grad_scale * \
+            (pooled_soft - pooled_soft.detach())
 
         pooled = pooled.transpose(0, 1)
 

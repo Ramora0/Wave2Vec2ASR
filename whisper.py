@@ -29,14 +29,15 @@ model = WhisperForConditionalGeneration.from_pretrained(
 # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
 SYLLABLE_BOUNDARY_LAYER = 3
-SYLLABLE_BOUNDARY_PRIOR = 0.25
+SYLLABLE_COMPRESSION_TARGET = 12.0
+SYLLABLE_BOUNDARY_PRIOR = 1.0 / SYLLABLE_COMPRESSION_TARGET
 BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
 BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+model.load_magnet(boundary_priors, "BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):

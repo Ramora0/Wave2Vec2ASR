@@ -5,6 +5,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts
 from old_downsample import downsample as legacy_downsample
+from utils import downsample as differentiable_downsample
 
 
 class BoundaryPredictor2(nn.Module):
@@ -14,6 +15,9 @@ class BoundaryPredictor2(nn.Module):
         self.prior = prior
         self.threshold = threshold
         self.allow_downsample_gradients = True
+        self.downsample_assignment_temp = 5.0
+        self.downsample_mask_scale = 5.0
+        self.grad_scale = 0.05
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -61,14 +65,22 @@ class BoundaryPredictor2(nn.Module):
                 hard_boundaries = torch.maximum(
                     hard_boundaries, last_real_mask.float())
 
-        # pooled = downsample(
-        #     hard_boundaries,
-        #     hidden,
-        #     assignment_temperature=self.downsample_assignment_temp,
-        #     mask_scale=self.downsample_mask_scale,
-        # )
-        pooled = legacy_downsample(hard_boundaries, hidden)
-        self._validate_downsample_output(pooled, hard_boundaries)
+        pooled_hard = legacy_downsample(hard_boundaries, hidden)
+
+        straight_through_boundaries = hard_boundaries + \
+            soft_boundaries - soft_boundaries.detach()
+
+        pooled_soft = differentiable_downsample(
+            straight_through_boundaries,
+            hidden,
+            assignment_temperature=self.downsample_assignment_temp,
+            mask_scale=self.downsample_mask_scale,
+        )
+
+        pooled = pooled_hard + self.grad_scale * \
+            (pooled_soft - pooled_soft.detach())
+
+        self._validate_downsample_output(pooled_hard, hard_boundaries)
         pooled = pooled.transpose(0, 1)
 
         if not self.allow_downsample_gradients:
