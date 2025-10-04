@@ -17,7 +17,7 @@ class BoundaryPredictor2(nn.Module):
         self.allow_downsample_gradients = True
         self.downsample_assignment_temp = 5.0
         self.downsample_mask_scale = 5.0
-        self.grad_scale = 0.05
+        self.grad_scale = 0.0
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -34,6 +34,9 @@ class BoundaryPredictor2(nn.Module):
 
     def set_downsample_gradients(self, enabled: bool):
         self.allow_downsample_gradients = bool(enabled)
+
+    def set_grad_scale(self, value: float):
+        self.grad_scale = float(value)
 
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         normalized_hidden = F.normalize(hidden, dim=-1)
@@ -77,7 +80,8 @@ class BoundaryPredictor2(nn.Module):
             mask_scale=self.downsample_mask_scale,
         )
 
-        pooled = pooled_hard + self.grad_scale * \
+        grad_scale = float(getattr(self, "grad_scale", 0.0))
+        pooled = pooled_hard + grad_scale * \
             (pooled_soft - pooled_soft.detach())
 
         self._validate_downsample_output(pooled_hard, hard_boundaries)

@@ -22,8 +22,9 @@ class BoundaryPredictor1(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.downsample_assignment_temp = 8.0
+        self.downsample_assignment_temp = 5.0
         self.downsample_mask_scale = 5.0
+        self.grad_scale = 0.0
 
         hidden = hidden_dim
         self.boundary_mlp = nn.Sequential(
@@ -37,6 +38,9 @@ class BoundaryPredictor1(nn.Module):
 
     def set_prior(self, prior):
         self.prior = prior
+
+    def set_grad_scale(self, value: float):
+        self.grad_scale = float(value)
 
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         logits = self.boundary_mlp(
@@ -82,7 +86,7 @@ class BoundaryPredictor1(nn.Module):
             assignment_temperature=self.downsample_assignment_temp,
             mask_scale=self.downsample_mask_scale,
         )
-        grad_scale = 0.05
+        grad_scale = float(getattr(self, "grad_scale", 0.0))
         pooled = pooled_hard + grad_scale * \
             (pooled_soft - pooled_soft.detach())
 
