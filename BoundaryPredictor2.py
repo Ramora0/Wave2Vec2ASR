@@ -17,7 +17,6 @@ class BoundaryPredictor2(nn.Module):
         self.allow_downsample_gradients = True
         self.downsample_assignment_temp = 5.0
         self.downsample_mask_scale = 5.0
-        self.grad_scale = 0.0
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -34,9 +33,6 @@ class BoundaryPredictor2(nn.Module):
 
     def set_downsample_gradients(self, enabled: bool):
         self.allow_downsample_gradients = bool(enabled)
-
-    def set_grad_scale(self, value: float):
-        self.grad_scale = float(value)
 
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         normalized_hidden = F.normalize(hidden, dim=-1)
@@ -70,19 +66,14 @@ class BoundaryPredictor2(nn.Module):
 
         pooled_hard = legacy_downsample(hard_boundaries, hidden)
 
-        straight_through_boundaries = hard_boundaries + \
-            soft_boundaries - soft_boundaries.detach()
-
         pooled_soft = differentiable_downsample(
-            straight_through_boundaries,
+            hard_boundaries,
             hidden,
             assignment_temperature=self.downsample_assignment_temp,
             mask_scale=self.downsample_mask_scale,
         )
 
-        grad_scale = float(getattr(self, "grad_scale", 0.0))
-        pooled = pooled_hard + grad_scale * \
-            (pooled_soft - pooled_soft.detach())
+        pooled = pooled_hard + (pooled_soft - pooled_soft.detach())
 
         self._validate_downsample_output(pooled_hard, hard_boundaries)
         pooled = pooled.transpose(0, 1)
@@ -177,7 +168,8 @@ class BoundaryPredictor2(nn.Module):
                     f" pooled={pooled.detach().cpu()}")
 
             per_item_segments = hard_boundaries.sum(dim=1)
-            max_expected = int(per_item_segments.max().item()) if per_item_segments.numel() else 0
+            max_expected = int(per_item_segments.max().item()
+                               ) if per_item_segments.numel() else 0
 
             if pooled.size(0) != max_expected:
                 raise RuntimeError(

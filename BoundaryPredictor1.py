@@ -24,7 +24,6 @@ class BoundaryPredictor1(nn.Module):
         self.threshold = threshold
         self.downsample_assignment_temp = 5.0
         self.downsample_mask_scale = 5.0
-        self.grad_scale = 0.0
 
         hidden = hidden_dim
         self.boundary_mlp = nn.Sequential(
@@ -39,9 +38,6 @@ class BoundaryPredictor1(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def set_grad_scale(self, value: float):
-        self.grad_scale = float(value)
-
     def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
         logits = self.boundary_mlp(
             hidden).squeeze(-1)
@@ -54,13 +50,13 @@ class BoundaryPredictor1(nn.Module):
 
         soft_boundaries = bernoulli.rsample()
 
-        hard_boundaries = (soft_boundaries > self.threshold).float()
-        hard_boundaries = (
-            hard_boundaries - soft_boundaries.detach() + soft_boundaries
-        )
+        if attention_mask is not None:
+            soft_boundaries = soft_boundaries * attention_mask
+
+        hard_samples = (soft_boundaries > self.threshold).float()
 
         if attention_mask is not None:
-            hard_boundaries = hard_boundaries * attention_mask
+            hard_samples = hard_samples * attention_mask
 
             pad_mask = attention_mask == 0
             if pad_mask.any():
@@ -68,27 +64,34 @@ class BoundaryPredictor1(nn.Module):
                     pad_mask.long().cumsum(dim=1) == 1)
                 last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
                 last_real_mask[:, -1] = False
-                hard_boundaries = torch.maximum(
-                    hard_boundaries, last_real_mask.float()
-                )
+                last_real_mask = last_real_mask.float()
+                hard_samples = torch.maximum(hard_samples, last_real_mask)
+                soft_boundaries = torch.maximum(
+                    soft_boundaries, last_real_mask)
+
+        hard_boundaries = (
+            hard_samples - soft_boundaries.detach() + soft_boundaries
+        )
+
+        if attention_mask is not None:
+            hidden_mask = attention_mask.unsqueeze(-1)
+            masked_hidden = hidden * hidden_mask
+        else:
+            masked_hidden = hidden
 
         # Weighted version retained for future experimentation.
         # pooled = weighted_downsample(
         #     hard_boundaries, hidden, segment_weights)  # S x B x D
-        pooled_hard = legacy_downsample(hard_boundaries, hidden)
-
-        straight_through_boundaries = hard_boundaries + \
-            soft_boundaries - soft_boundaries.detach()
+        pooled_hard = legacy_downsample(hard_boundaries, masked_hidden)
 
         pooled_soft = differentiable_downsample(
-            straight_through_boundaries,
-            hidden,
+            hard_boundaries,
+            masked_hidden,
             assignment_temperature=self.downsample_assignment_temp,
             mask_scale=self.downsample_mask_scale,
+            attention_mask=attention_mask,
         )
-        grad_scale = float(getattr(self, "grad_scale", 0.0))
-        pooled = pooled_hard + grad_scale * \
-            (pooled_soft - pooled_soft.detach())
+        pooled = pooled_hard + (pooled_soft - pooled_soft.detach())
 
         pooled = pooled.transpose(0, 1)
 
@@ -117,7 +120,7 @@ class BoundaryPredictor1(nn.Module):
 
         # loss = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
         if target_boundary_counts is not None:
-            loss = self.calc_loss_target_counts(
+            loss = self.calc_loss_target_counts_overall(
                 hard_boundaries, attention_mask, target_boundary_counts)
         else:
             loss = self.calc_loss(num_boundaries_tensor,
@@ -132,11 +135,35 @@ class BoundaryPredictor1(nn.Module):
         return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
 
     def calc_loss(self, num_boundaries, total_positions):
-        return binomial_loss(num_boundaries, total_positions, self.prior)
+        return 4 * binomial_loss(num_boundaries, total_positions, self.prior)
         # return hinge_loss(preds, self.prior + 0.05, .05) / (64 ** 2)
 
-    def calc_loss_target_counts(self, hard_boundaries, attention_mask, target_boundary_counts):
-        # Encourage boundary counts to match target segment counts via binomial loss.
+    def calc_loss_target_counts_overall(self, hard_boundaries, attention_mask, target_boundary_counts):
+        device = hard_boundaries.device
+
+        total_boundaries = hard_boundaries.sum().to(dtype=torch.float32)
+
+        if attention_mask is not None:
+            total_positions = attention_mask.sum().to(
+                device=device, dtype=torch.float32)
+        else:
+            total_positions = torch.tensor(
+                hard_boundaries.numel(),
+                device=device,
+                dtype=torch.float32,
+            )
+
+        target_total = target_boundary_counts.to(
+            device=device, dtype=torch.float32).sum()
+
+        clamped_positions = total_positions.clamp(min=1.0)
+        target_prob = (
+            target_total / clamped_positions).clamp(min=1e-6, max=1 - 1e-6)
+
+        loss = binomial_loss(total_boundaries, clamped_positions, target_prob)
+        return 4 * loss
+
+    def calc_loss_target_counts_per_item(self, hard_boundaries, attention_mask, target_boundary_counts):
         device = hard_boundaries.device
         per_item_boundaries = hard_boundaries.sum(dim=1)
 
@@ -157,7 +184,7 @@ class BoundaryPredictor1(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return loss_values.mean()
+        return 4 * loss_values.mean()
 
     def calc_example_loss(self, hard_boundaries, attention_mask=None):
         per_item_boundaries = hard_boundaries.sum(dim=1)

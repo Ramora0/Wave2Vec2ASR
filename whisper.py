@@ -2,6 +2,8 @@ from transformers import TrainerCallback
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 from transformers.trainer import Trainer
 import os
+import json
+from pathlib import Path
 # from SlidingWhisper import SlidingWhisper
 from evaluate import load
 from MagnetWhisper import MagnetWhisper
@@ -76,11 +78,13 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "magnet-phonemes"
+MODEL_NAME = "testing"
+MODEL_DIR = Path("./models") / MODEL_NAME
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
-    output_dir=f"./models/{MODEL_NAME}",
+    output_dir=str(MODEL_DIR),
 
     per_device_train_batch_size=16,
     per_device_eval_batch_size=128,
@@ -185,11 +189,6 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_target_progress is not None:
             log_payload["train/boundary_target_progress"] = boundary_target_progress
 
-        if hasattr(model, "get_boundary_grad_scale"):
-            grad_scale = model.get_boundary_grad_scale()
-            if grad_scale is not None:
-                log_payload["train/boundary_grad_scale"] = grad_scale
-
         # downsample_grad_enabled = getattr(
         #     model, "downsample_gradients_enabled", None)
         # if downsample_grad_enabled is not None:
@@ -201,41 +200,6 @@ class CompressionRatioCallback(TrainerCallback):
 
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())
-
-
-class BoundaryGradScaleCallback(TrainerCallback):
-    """Anneal boundary grad scale from 0 to target over training."""
-
-    def __init__(self, target_scale: float = 0.2, warmup_fraction: float = 0.01):
-        self.target_scale = float(target_scale)
-        self.warmup_fraction = float(warmup_fraction)
-
-    def _compute_progress(self, args, state):
-        total_steps = state.max_steps if state.max_steps and state.max_steps > 0 else None
-        if total_steps:
-            return min(1.0, max(0.0, state.global_step / max(1, total_steps)))
-
-        if state.epoch is not None and args.num_train_epochs and args.num_train_epochs > 0:
-            return min(1.0, max(0.0, state.epoch / args.num_train_epochs))
-
-        return None
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        progress = self._compute_progress(args, state)
-
-        if progress < self.warmup_fraction:
-            scale = 0.0
-        else:
-            denom = max(1e-8, 1.0 - self.warmup_fraction)
-            scale = self.target_scale * \
-                ((progress - self.warmup_fraction) / denom)
-            scale = min(scale, self.target_scale)
-
-        model.set_boundary_grad_scale(scale)
-
-
-trainer.add_callback(BoundaryGradScaleCallback(
-    target_scale=0.5, warmup_fraction=1/3.))
 
 
 class FreezeNonBoundaryCallback(TrainerCallback):
@@ -357,7 +321,7 @@ class BoundaryScheduler(TrainerCallback):
 trainer.train()
 # trainer.save_model(f"./models/{MODEL_NAME}")
 
-model.save_pretrained(f"./models/magnet-phonemes")
+# model.save_pretrained(f"./models/magnet-phonemes")
 # model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")
 model = model.to("cuda")
 

@@ -160,6 +160,7 @@ def downsample(
     hidden,
     assignment_temperature: float = 20.0,
     mask_scale: float = 20.0,
+    attention_mask=None,
 ):
     """
     Downsample hidden states using boundary indicators while retaining gradient
@@ -175,6 +176,9 @@ def downsample(
             harder boundaries.
         mask_scale (float): Sigmoid scale for suppressing padded segments. Use
             large values to drive the mask toward binary behaviour.
+        attention_mask (torch.Tensor, optional): Boolean or float mask of shape
+            (B, L) indicating valid timesteps. Masked positions are ignored when
+            computing segment assignments and pooled representations.
 
     Returns:
         torch.Tensor: Pooled hidden states of shape (S, B, D), where S is the
@@ -184,16 +188,15 @@ def downsample(
     device = hidden.device
     dtype = hidden.dtype
 
-    if seq_len == 0:
-        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
-
     boundaries = boundaries.to(dtype)
+
+    # Mask hidden states if attention mask provided (boundaries already masked by caller)
+    # if attention_mask is not None:
+    #     attention_mask = attention_mask.to(dtype)
+    #     hidden = hidden * attention_mask.unsqueeze(-1)
 
     per_item_segments = boundaries.sum(dim=1)
     max_segments = int(per_item_segments.max().item()) if batch_size > 0 else 0
-
-    if max_segments == 0:
-        return torch.zeros((0, batch_size, model_dim), device=device, dtype=dtype)
 
     shifted_boundaries = torch.cat(
         [torch.zeros_like(boundaries[:, :1]), boundaries[:, :-1]], dim=1)
@@ -203,7 +206,7 @@ def downsample(
         max_segments, device=device, dtype=dtype).view(1, max_segments, 1)
 
     assignment_logits = -assignment_temperature * (
-        segment_index.unsqueeze(1) - segment_range).abs()
+        segment_index.unsqueeze(1) - segment_range).pow(2)
     assignment = torch.softmax(assignment_logits, dim=1)
 
     segment_mask = torch.sigmoid(
@@ -216,6 +219,11 @@ def downsample(
     eps = float(torch.finfo(dtype).eps)
     assignment = assignment / \
         assignment.sum(dim=1, keepdim=True).clamp(min=eps)
+
+    # if attention_mask is not None:
+    #     assignment = assignment * attention_mask.unsqueeze(1)
+    #     assignment = assignment / \
+    #         assignment.sum(dim=1, keepdim=True).clamp(min=eps)
 
     segment_sums = torch.einsum('bsl,bld->bsd', assignment, hidden)
     segment_lengths = assignment.sum(dim=2)
