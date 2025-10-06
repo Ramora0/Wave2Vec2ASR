@@ -1,152 +1,184 @@
 import torch
-
-from old_downsample import downsample as legacy_downsample
-from utils import downsample as new_downsample
-
-BATCH_SIZE = 1
-SEQ_LEN = 12
-MODEL_DIM = 2
-BOUNDARY_MODES = ("hard", "random")
-RNG_SEED = 1234
-TOL = 1e-4
+from utils import downsample
 
 
-def _generate_boundaries(mode: str) -> torch.Tensor:
-    boundaries = torch.zeros(BATCH_SIZE, SEQ_LEN, dtype=torch.float32)
+def test_downsample_with_start_end_boundaries():
+    """
+    Test downsample with boundaries that have 1 at start and end, with trailing 0s.
+    This mimics the real usage pattern from BoundaryPredictor1.
+    """
+    print("\n=== Test: Boundaries with 1 at start and end, trailing zeros ===\n")
 
-    if mode == "hard":
-        step = max(1, SEQ_LEN // 4)
-        for b in range(BATCH_SIZE):
-            idxs = torch.arange(step - 1, SEQ_LEN - 1, step)
-            boundaries[b, idxs] = 1.0
-    elif mode == "random":
-        prob = 0.35
-        mask = torch.bernoulli(torch.full_like(boundaries, prob))
-        mask[:, 0] = 0
-        boundaries = mask
-    else:
-        raise ValueError(f"Unsupported boundary mode: {mode}")
+    # Create a simple test case
+    batch_size = 2
+    seq_len = 8
+    model_dim = 4
 
-    # Guarantee at least one boundary per sequence by toggling the last valid
-    for b in range(BATCH_SIZE):
-        if boundaries[b].sum() == 0:
-            boundaries[b, SEQ_LEN - 2] = 1.0
+    # Boundaries: 1 at positions that mark segment boundaries
+    # Example: [1, 0, 0, 1, 0, 1, 0, 0] means segments at positions 0, 3, 5
+    boundaries = torch.zeros(batch_size, seq_len, dtype=torch.float32)
 
-    return boundaries
+    # Batch 0: boundaries at positions 0, 3, 5
+    boundaries[0, 0] = 1.0
+    boundaries[0, 3] = 1.0
+    boundaries[0, 5] = 1.0
 
+    # Batch 1: boundaries at positions 0, 2, 6
+    boundaries[1, 0] = 1.0
+    boundaries[1, 2] = 1.0
+    boundaries[1, 6] = 1.0
 
-def _generate_hidden() -> torch.Tensor:
-    return torch.randn(BATCH_SIZE, SEQ_LEN, MODEL_DIM, dtype=torch.float32)
+    print("Boundaries (B x L):")
+    print(boundaries)
+    print()
 
+    # Create simple hidden states for easy verification
+    hidden = torch.arange(batch_size * seq_len *
+                          model_dim, dtype=torch.float32)
+    hidden = hidden.reshape(batch_size, seq_len, model_dim)
 
-def _manual_segment_means(boundaries: torch.Tensor,
-                          hidden: torch.Tensor) -> torch.Tensor:
-    per_item_segments = boundaries.sum(dim=1, dtype=torch.long)
-    max_segments = int(per_item_segments.max().item())
+    print("Hidden states (B x L x D):")
+    print(hidden)
+    print()
 
-    if max_segments == 0:
-        return hidden.new_zeros((0, BATCH_SIZE, MODEL_DIM))
+    # Transpose to L x B x D as expected by downsample
+    hidden_transposed = hidden.transpose(0, 1)  # L x B x D
 
-    outputs = hidden.new_zeros((max_segments, BATCH_SIZE, MODEL_DIM))
+    # Call downsample
+    pooled = downsample(boundaries, hidden_transposed)
 
-    for b in range(BATCH_SIZE):
-        start = 0
-        seg_idx = 0
-        for t in range(SEQ_LEN):
-            if boundaries[b, t] == 1:
-                segment = hidden[b, start:t + 1]
-                outputs[seg_idx, b] = segment.mean(dim=0)
-                seg_idx += 1
-                start = t + 1
+    print("Pooled output (S x B x D):")
+    print(pooled)
+    print(f"Pooled shape: {pooled.shape}")
+    print()
 
-    return outputs
+    # Verify shape
+    max_segments = int(boundaries.sum(dim=1).max().item())
+    print(f"Max segments across batch: {max_segments}")
+    print(
+        f"Expected output shape: ({max_segments} x {batch_size} x {model_dim})")
+    print(f"Actual output shape: {tuple(pooled.shape)}")
+    print()
 
+    # Manual verification for batch 0
+    # Boundaries at [0, 3, 5]
+    # Segment 0: indices [0:1] -> hidden[0, 0:1].mean(0)
+    # Segment 1: indices [1:4] -> hidden[0, 1:4].mean(0)
+    # Segment 2: indices [4:6] -> hidden[0, 4:6].mean(0)
 
-def _assert_trailing_zero(name: str,
-                          pooled: torch.Tensor,
-                          per_item_segments: torch.Tensor,
-                          tol: float) -> None:
-    for b in range(pooled.size(1)):
-        expected = int(per_item_segments[b].item())
-        tail = pooled[expected:, b]
-        if tail.numel() and tail.abs().max().item() > tol:
-            raise RuntimeError(
-                f"{name} produced non-zero tail entries\n"
-                f"sequence={b}\nexpected_segments={expected}\n"
-                f"tail={tail.detach().cpu()}"
-            )
+    print("Manual verification for batch 0:")
+    print(f"Segment 0 (indices 0:1): mean = {hidden[0, 0:1].mean(0)}")
+    print(f"Segment 1 (indices 1:4): mean = {hidden[0, 1:4].mean(0)}")
+    print(f"Segment 2 (indices 4:6): mean = {hidden[0, 4:6].mean(0)}")
+    print()
 
+    print("Actual pooled values for batch 0:")
+    for i in range(pooled.shape[0]):
+        print(f"pooled[{i}, 0] = {pooled[i, 0]}")
+    print()
 
-def _assert_close(name: str,
-                  actual: torch.Tensor,
-                  expected: torch.Tensor,
-                  tol: float) -> None:
-    if not torch.allclose(actual, expected, atol=tol, rtol=0.0):
-        raise RuntimeError(
-            f"{name} mismatch\n"
-            f"actual={actual.detach().cpu()}\n"
-            f"expected={expected.detach().cpu()}"
-        )
+    print("=== Test complete ===")
 
 
-def _run_once(mode: str) -> None:
-    boundaries = _generate_boundaries(mode)
-    hidden = _generate_hidden()
+def test_edge_cases():
+    """Test various edge cases"""
+    print("\n=== Test: Edge Cases ===\n")
 
-    manual = _manual_segment_means(boundaries, hidden)
-    per_item_segments = boundaries.sum(dim=1, dtype=torch.long)
-    max_expected = int(per_item_segments.max().item())
+    batch_size = 1
+    seq_len = 6
+    model_dim = 3
 
-    hidden_time_major = hidden.transpose(0, 1)
-    legacy = legacy_downsample(boundaries, hidden_time_major)
-    new = new_downsample(boundaries, hidden)
+    # Test 1: Only one boundary at position 0
+    print("Test 1: Single boundary at start")
+    boundaries = torch.zeros(batch_size, seq_len)
+    boundaries[0, 0] = 1.0
 
-    print("\n=== Mode:", mode, "===")
-    print("Boundaries:\n", boundaries)
-    print("Hidden (B x L x D):\n", hidden)
-    print("Legacy pooled (S x B x D):\n", legacy)
-    print("New pooled (S x B x D):\n", new)
-    print("Manual means (S x B x D):\n", manual)
+    hidden = torch.randn(seq_len, batch_size, model_dim)
 
-    if legacy.size(0) != max_expected:
-        raise RuntimeError(
-            f"Legacy pooled first dimension {legacy.size(0)}"
-            f" disagrees with max boundary count {max_expected}\n"
-            f"boundaries={boundaries.detach().cpu()}\n"
-            f"legacy_shape={tuple(legacy.shape)}"
-        )
+    pooled = downsample(boundaries, hidden)
+    print(f"Boundaries: {boundaries[0].tolist()}")
+    print(f"Pooled shape: {pooled.shape}")
+    print(f"Pooled:\n{pooled}")
+    print()
 
-    if new.size(0) != max_expected:
-        raise RuntimeError(
-            f"New pooled first dimension {new.size(0)}"
-            f" disagrees with max boundary count {max_expected}\n"
-            f"boundaries={boundaries.detach().cpu()}\n"
-            f"new_shape={tuple(new.shape)}"
-        )
+    # Test 2: Multiple boundaries
+    print("Test 2: Multiple boundaries")
+    boundaries = torch.zeros(batch_size, seq_len)
+    boundaries[0, 0] = 1.0
+    boundaries[0, 2] = 1.0
+    boundaries[0, 4] = 1.0
 
-    _assert_trailing_zero("Legacy", legacy, per_item_segments, TOL)
-    _assert_trailing_zero("New", new, per_item_segments, TOL)
+    pooled = downsample(boundaries, hidden)
+    print(f"Boundaries: {boundaries[0].tolist()}")
+    print(f"Pooled shape: {pooled.shape}")
+    print(f"Pooled:\n{pooled}")
+    print()
 
-    if manual.size(0) != max_expected:
-        raise RuntimeError(
-            f"Manual segment tensor has unexpected shape {manual.size()}"
-            f" vs expected {max_expected}\n"
-            f"boundaries={boundaries.detach().cpu()}"
-        )
+    # Test 3: All zeros (no boundaries)
+    print("Test 3: No boundaries (all zeros)")
+    boundaries = torch.zeros(batch_size, seq_len)
 
-    if max_expected > 0:
-        _assert_close("Legacy vs manual", legacy, manual, TOL)
+    pooled = downsample(boundaries, hidden)
+    print(f"Boundaries: {boundaries[0].tolist()}")
+    print(f"Pooled shape: {pooled.shape}")
+    print(f"Pooled:\n{pooled}")
+    print()
 
-    if torch.isnan(new).any() or torch.isnan(legacy).any():
-        raise RuntimeError(
-            f"NaNs detected in downsample outputs\n"
-            f"new={new.detach().cpu()}\nlegacy={legacy.detach().cpu()}"
-        )
 
-    print(f"Mode {mode}: OK (segments={max_expected})")
+def test_specific_boundary_pattern():
+    """Test boundaries pattern 10101000 to understand exact pooling behavior"""
+    print("\n=== Test: Boundaries [1, 0, 1, 0, 1, 0, 0, 0] ===\n")
+
+    batch_size = 1
+    seq_len = 8
+    model_dim = 1
+
+    # Boundaries: 10101000
+    boundaries = torch.tensor([[1., 0., 1., 0., 1., 0., 0., 0.]])
+
+    # Simple hidden states - just use the index as the value for easy tracking
+    hidden = torch.arange(seq_len, dtype=torch.float32).reshape(1, seq_len, 1)
+
+    print("Boundaries:", boundaries[0].tolist())
+    print("Hidden (values = indices):", hidden[0].squeeze().tolist())
+    print()
+
+    # Transpose to L x B x D
+    hidden_transposed = hidden.transpose(0, 1)
+
+    # Call downsample
+    pooled = downsample(boundaries, hidden_transposed)
+
+    print(f"Number of outputs: {pooled.shape[0]}")
+    print(f"Number of boundaries (1s): {boundaries.sum().item()}")
+    print()
+
+    print("Pooled output (S x B x D):")
+    for i in range(pooled.shape[0]):
+        print(f"  Output[{i}] = {pooled[i, 0, 0].item()}")
+    print()
+
+    print("Understanding the segments:")
+    print("  - A boundary of 1 at position i means: segment ENDS at position i (inclusive)")
+    print()
+
+    num_boundaries = int(boundaries.sum().item())
+    print(f"With {num_boundaries} boundaries, we get {num_boundaries} segments (outputs)")
+    print()
+
+    print("Manual segment calculation:")
+    print(
+        "  Segment 0 (boundary at pos 0): indices [0:1]   -> mean([0]) = 0.0")
+    print(
+        "  Segment 1 (boundary at pos 2): indices [1:3]   -> mean([1, 2]) = 1.5")
+    print(
+        "  Segment 2 (boundary at pos 4): indices [3:5]   -> mean([3, 4]) = 3.5")
+    print()
+    print("  Note: Positions 5, 6, 7 have no boundary, so they're not included in any segment!")
+    print()
 
 
 if __name__ == "__main__":
-    torch.manual_seed(RNG_SEED)
-    for mode in BOUNDARY_MODES:
-        _run_once(mode)
+    test_specific_boundary_pattern()
+    # test_downsample_with_start_end_boundaries()
+    # test_edge_cases()

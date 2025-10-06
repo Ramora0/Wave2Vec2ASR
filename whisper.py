@@ -94,7 +94,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=2e-5,
+    learning_rate=5e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,

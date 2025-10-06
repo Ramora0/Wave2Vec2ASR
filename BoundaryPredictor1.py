@@ -6,13 +6,12 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
-from old_downsample import downsample as legacy_downsample
-from utils import downsample as differentiable_downsample
+from utils import downsample
 # from utils import weighted_downsample  # Optional weighted pooling prototype
 
 
 class BoundaryPredictor1(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True):
         """
         input_dim: dimensionality of per-token vectors (D)
         hidden_dim: hidden size of the MLP
@@ -22,8 +21,6 @@ class BoundaryPredictor1(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.downsample_assignment_temp = 5.0
-        self.downsample_mask_scale = 5.0
 
         hidden = hidden_dim
         self.boundary_mlp = nn.Sequential(
@@ -32,8 +29,9 @@ class BoundaryPredictor1(nn.Module):
             nn.Linear(hidden, 1)
         )
 
-        with torch.no_grad():
-            self.boundary_mlp[-1].bias.fill_(-2.5)
+        if init_for_12:
+            with torch.no_grad():
+                self.boundary_mlp[-1].bias.fill_(-2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -79,20 +77,10 @@ class BoundaryPredictor1(nn.Module):
         else:
             masked_hidden = hidden
 
-        # Weighted version retained for future experimentation.
-        # pooled = weighted_downsample(
-        #     hard_boundaries, hidden, segment_weights)  # S x B x D
-        pooled_hard = legacy_downsample(hard_boundaries, masked_hidden)
+        # downsample expects L x B x D, so transpose from B x L x D
+        pooled = downsample(hard_boundaries, masked_hidden.transpose(0, 1))
 
-        pooled_soft = differentiable_downsample(
-            hard_boundaries,
-            masked_hidden,
-            assignment_temperature=self.downsample_assignment_temp,
-            mask_scale=self.downsample_mask_scale,
-            attention_mask=attention_mask,
-        )
-        pooled = pooled_hard + (pooled_soft - pooled_soft.detach())
-
+        # transpose back to B x S x D
         pooled = pooled.transpose(0, 1)
 
         shortened_attention_mask = None
