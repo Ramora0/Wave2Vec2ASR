@@ -68,31 +68,26 @@ def max_pool_attention_mask(attention_mask, stride=2):
     return pooled_mask
 
 
-def final(foo,
-          upsample):
+def final(foo):
     """
         Input:
             B x L x S
     """
+    # what the heck
     autoregressive = foo != 0
     lel = 1 - foo
 
     lel[autoregressive] = 0
 
-    dim = 2 if upsample else 1
-
-    lel = lel / (lel.sum(dim=dim, keepdim=True) + 1e-9)
+    lel = lel / (lel.sum(dim=1, keepdim=True) + 1e-9)
 
     return lel
 
 
-def common(boundaries, upsample=False):
-    boundaries = boundaries.clone()
+def common(boundaries):
+    boundaries = boundaries.clone()  # Remove
 
     n_segments = boundaries.sum(dim=-1).max().item()
-
-    if upsample:
-        n_segments += 1
 
     if n_segments == 0:
         return None
@@ -107,8 +102,7 @@ def common(boundaries, upsample=False):
 
     hh1 = boundaries.cumsum(1)
 
-    if not upsample:
-        hh1 -= boundaries
+    hh1 -= boundaries
 
     foo = tmp - hh1.unsqueeze(-1)
 
@@ -121,6 +115,7 @@ def downsample(boundaries, hidden):
 
         - The first element of boundaries tensor is always 0 and doesn't matter
         - 1 starts a new group
+        - We discard last group because it won't be used (in terms of upsampling)
 
         Input:
             boundaries: B x L
@@ -128,13 +123,19 @@ def downsample(boundaries, hidden):
         Output:
             shortened_hidden: S x B x D
     """
+    # Preserve the input dtype
+    input_dtype = hidden.dtype
 
-    foo = common(boundaries, upsample=False)  # B x L x S
+    foo = common(boundaries)  # B x L x S
 
     if foo is None:
-        return hidden.new_zeros(0, hidden.size(1), hidden.size(2))
+        # No boundaries found, return an empty tensor with correct dimensions
+        return torch.empty(0, hidden.size(1), hidden.size(2), device=hidden.device, dtype=input_dtype)
     else:
-        bar = final(foo=foo, upsample=False)  # B x L x S
+        bar = final(foo=foo)  # B x L x S
+
+        # Cast bar to the same dtype as hidden to ensure einsum preserves dtype
+        bar = bar.to(dtype=input_dtype)
 
         shortened_hidden = torch.einsum('lbd,bls->sbd', hidden, bar)
 

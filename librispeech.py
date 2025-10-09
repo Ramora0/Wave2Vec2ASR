@@ -39,16 +39,22 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         self.decoder_start_token_id = decoder_start_token_id
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": feature["input_features"]} for feature in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        input_features = [{"input_features": feature["input_features"]}
+                          for feature in features]
+        batch = self.processor.feature_extractor.pad(
+            input_features, return_tensors="pt")
 
-        attention_masks = torch.stack([feature["attention_mask"] for feature in features])
+        attention_masks = torch.stack(
+            [feature["attention_mask"] for feature in features])
         batch["attention_mask"] = attention_masks
 
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        label_features = [{"input_ids": feature["labels"]}
+                          for feature in features]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, return_tensors="pt")
 
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100)
 
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
@@ -68,7 +74,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                 )
                 syllable_counts.append(count_syllables(text))
 
-            syllable_tensor = torch.tensor(syllable_counts, dtype=torch.float32)
+            syllable_tensor = torch.tensor(
+                syllable_counts, dtype=torch.float32)
             batch["target_boundary_counts"] = syllable_tensor.unsqueeze(0)
 
         return batch
@@ -108,7 +115,8 @@ def build_compute_metrics(tokenizer: WhisperTokenizer) -> Callable[[Any], Dict[s
         pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
+        wer = 100 * \
+            wer_metric.compute(predictions=pred_str, references=label_str)
         return {"wer": wer}
 
     return compute_metrics
@@ -118,7 +126,8 @@ def create_librispeech_data_module(decoder_start_token_id: int) -> LibriSpeechDa
     processor = load_whisper_processor()
     tokenizer = processor.tokenizer
     dataset = load_librispeech_dataset()
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor, decoder_start_token_id=decoder_start_token_id)
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor, decoder_start_token_id=decoder_start_token_id)
     compute_metrics = build_compute_metrics(tokenizer)
     return LibriSpeechDataModule(
         dataset=dataset,
@@ -131,12 +140,17 @@ def create_librispeech_data_module(decoder_start_token_id: int) -> LibriSpeechDa
 
 def build_map_to_pred(model, processor: WhisperProcessor):
     def map_to_pred(batch):
-        input_features = torch.tensor(batch["input_features"]).unsqueeze(0).to("cuda")
+        input_features = torch.tensor(
+            batch["input_features"]).unsqueeze(0).to("cuda")
+        attention_mask = torch.tensor(
+            batch["attention_mask"]).unsqueeze(0).to("cuda")
 
-        batch["reference"] = processor.tokenizer._normalize(processor.decode(batch["labels"]))
+        batch["reference"] = processor.tokenizer._normalize(
+            processor.decode(batch["labels"]))
 
         with torch.no_grad():
-            predicted_ids = model.generate(input_features)[0]
+            predicted_ids = model.generate(
+                input_features, attention_mask=attention_mask)[0]
         transcription = processor.decode(predicted_ids)
         batch["prediction"] = processor.tokenizer._normalize(transcription)
         return batch
@@ -154,7 +168,8 @@ def test_inference_speed(model, dataset_subset, num_samples: int = 100):
     for i, sample in enumerate(dataset_subset):
         if i >= num_samples:
             break
-        input_features = torch.tensor(sample["input_features"]).unsqueeze(0).to("cuda")
+        input_features = torch.tensor(
+            sample["input_features"]).unsqueeze(0).to("cuda")
         samples.append(input_features)
 
     if not samples:
@@ -177,7 +192,8 @@ def test_inference_speed(model, dataset_subset, num_samples: int = 100):
     total_time = sum(times)
 
     print(f"Average inference time per sample: {avg_time:.4f} seconds")
-    print(f"Total inference time for {len(samples)} samples: {total_time:.4f} seconds")
+    print(
+        f"Total inference time for {len(samples)} samples: {total_time:.4f} seconds")
     print(f"Samples per second: {len(samples) / total_time:.2f}")
 
     return avg_time, total_time
@@ -213,7 +229,8 @@ def preprocess_librispeech_dataset(
     tokenizer: WhisperTokenizer,
     *,
     num_proc: int = 4,
-    output_path: Union[str, Path] = Path(SCRATCH_PATH) / "librispeech-processed",
+    output_path: Union[str, Path] = Path(
+        SCRATCH_PATH) / "librispeech-processed",
 ) -> DatasetDict:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

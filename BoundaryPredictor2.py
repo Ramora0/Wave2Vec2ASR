@@ -34,8 +34,17 @@ class BoundaryPredictor2(nn.Module):
     def set_downsample_gradients(self, enabled: bool):
         self.allow_downsample_gradients = bool(enabled)
 
-    def forward(self, hidden, attention_mask=None, target_boundary_counts=None):
+    def forward(
+        self,
+        hidden,
+        attention_mask=None,
+        target_boundary_counts=None,
+        return_log_probs=False,
+        return_unreduced_boundary_loss=False,
+        return_boundary_masks=False,
+    ):
         normalized_hidden = F.normalize(hidden, dim=-1)
+        batch_size = hidden.size(0)
         q_hidden = self.q_proj_layer(normalized_hidden[:, :-1])
         k_hidden = self.k_proj_layer(normalized_hidden[:, 1:])
 
@@ -49,11 +58,11 @@ class BoundaryPredictor2(nn.Module):
         )
 
         soft_boundaries = bernoulli.rsample()
-        hard_boundaries = (soft_boundaries > self.threshold).float()
-        hard_boundaries = hard_boundaries - soft_boundaries.detach() + soft_boundaries
+        hard_samples = (soft_boundaries > self.threshold).float()
 
         if attention_mask is not None:
-            hard_boundaries = hard_boundaries * attention_mask
+            soft_boundaries = soft_boundaries * attention_mask
+            hard_samples = hard_samples * attention_mask
 
             pad_mask = attention_mask == 0
             if pad_mask.any():
@@ -61,8 +70,13 @@ class BoundaryPredictor2(nn.Module):
                     pad_mask.long().cumsum(dim=1) == 1)
                 last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
                 last_real_mask[:, -1] = False
-                hard_boundaries = torch.maximum(
-                    hard_boundaries, last_real_mask.float())
+                boundary_mask = last_real_mask.float()
+                hard_samples = torch.maximum(hard_samples, boundary_mask)
+                soft_boundaries = torch.maximum(soft_boundaries, boundary_mask)
+
+        hard_boundaries = (
+            hard_samples - soft_boundaries.detach() + soft_boundaries
+        )
 
         pooled_hard = legacy_downsample(hard_boundaries, hidden)
 
@@ -108,26 +122,68 @@ class BoundaryPredictor2(nn.Module):
             )
 
         if target_boundary_counts is not None:
-            loss = self.calc_loss_target_counts(
-                hard_boundaries, attention_mask, target_boundary_counts
+            per_sample_loss = self.calc_loss_target_counts(
+                hard_boundaries,
+                attention_mask,
+                target_boundary_counts,
+                reduce=False,
             )
+            loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
         else:
-            loss = self.calc_loss(num_boundaries_tensor,
-                                  total_positions_tensor)
+            _ = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
             raise NotImplementedError(
                 "Loss without target counts not implemented")
 
-        self.last_loss = loss
+        if target_boundary_counts is not None:
+            if return_unreduced_boundary_loss:
+                self.last_loss = per_sample_loss.mean()
+            else:
+                self.last_loss = loss
 
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()
 
-        return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
+        log_prob = None
+        if return_log_probs:
+            probs_clamped = torch.clamp(probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            action_mask = hard_samples.detach().to(torch.float32)
+            log_prob_t = action_mask * torch.log(probs_clamped) + \
+                (1 - action_mask) * torch.log1p(-probs_clamped)
+            if attention_mask is not None:
+                log_prob_t = log_prob_t * attention_mask.to(torch.float32)
+            log_prob = log_prob_t.sum(dim=1)
+
+        if return_boundary_masks:
+            boundary_mask_out = hard_boundaries.detach()
+            return (
+                pooled,
+                loss,
+                num_boundaries,
+                total_positions,
+                shortened_attention_mask,
+                log_prob,
+                boundary_mask_out,
+            )
+
+        return (
+            pooled,
+            loss,
+            num_boundaries,
+            total_positions,
+            shortened_attention_mask,
+            log_prob,
+        )
 
     def calc_loss(self, num_boundaries, total_positions):
         return binomial_loss(num_boundaries, total_positions, self.prior)
 
-    def calc_loss_target_counts(self, hard_boundaries, attention_mask, target_boundary_counts):
+    def calc_loss_target_counts(
+        self,
+        hard_boundaries,
+        attention_mask,
+        target_boundary_counts,
+        reduce=True,
+    ):
         device = hard_boundaries.device
         per_item_boundaries = hard_boundaries.sum(dim=1)
 
@@ -152,7 +208,9 @@ class BoundaryPredictor2(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return loss_values.mean()
+        if reduce:
+            return loss_values.mean()
+        return loss_values
 
     def _validate_downsample_output(self, pooled, hard_boundaries, tol=1e-5):
         """Raise if pooled segments disagree with boundary counts."""

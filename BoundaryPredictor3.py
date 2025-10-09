@@ -42,7 +42,15 @@ class BoundaryPredictor3(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def forward(self, hidden):
+    def forward(
+        self,
+        hidden,
+        attention_mask=None,
+        target_boundary_counts=None,
+        return_log_probs=False,
+        return_unreduced_boundary_loss=False,
+        return_boundary_masks=False,
+    ):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
             # Move normalization to before the projection layer
@@ -77,13 +85,31 @@ class BoundaryPredictor3(nn.Module):
         loss = self.calc_loss(hard_boundaries)
         self.last_loss = loss  # Store the calculated loss
 
-        # Calculate compression metrics
-        # Total boundaries across all sequences in batch
         num_boundaries = hard_boundaries.sum().item()
-        # Total positions across all sequences in batch
         total_positions = hard_boundaries.numel()
 
-        return pooled, loss, num_boundaries, total_positions
+        shortened_attention_mask = attention_mask
+        log_prob = None
+        if return_boundary_masks:
+            boundary_mask_out = hard_boundaries.detach()
+            return (
+                pooled,
+                loss,
+                num_boundaries,
+                total_positions,
+                shortened_attention_mask,
+                log_prob,
+                boundary_mask_out,
+            )
+
+        return (
+            pooled,
+            loss,
+            num_boundaries,
+            total_positions,
+            shortened_attention_mask,
+            log_prob,
+        )
 
     def calc_loss(self, preds):
         return binomial_loss(preds, self.prior)

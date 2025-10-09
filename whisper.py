@@ -19,17 +19,19 @@ from librispeech import (
 
 print("hi")
 
-# Load the model
+# Load the model from old-save
+model = MagnetWhisper.from_pretrained("./models/old-save")
 
-model = WhisperForConditionalGeneration.from_pretrained(
-    "openai/whisper-small",
-    # torch_dtype=torch.float16,
-    token="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"
-    # attn_implementation="flash_attention_2"
-)
+# # Load the model
+# model = WhisperForConditionalGeneration.from_pretrained(
+#     "openai/whisper-small",
+#     # torch_dtype=torch.float16,
+#     token="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"
+#     # attn_implementation="flash_attention_2"
+# )
 
-# Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
-model.__class__ = MagnetWhisper
+# # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
+# model.__class__ = MagnetWhisper
 SYLLABLE_BOUNDARY_LAYER = 3
 SYLLABLE_COMPRESSION_TARGET = 12.0
 SYLLABLE_BOUNDARY_PRIOR = 1.0 / SYLLABLE_COMPRESSION_TARGET
@@ -38,8 +40,8 @@ BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+# boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
+# model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -62,6 +64,8 @@ _set_boundary_target_progress(model, BOUNDARY_TARGET_PROGRESS)
 # model.set_downsample_gradients_enabled(False)
 
 model.to("cuda")
+# Don't manually convert to fp16 - let the trainer's AMP handle it
+# model.half()  # Convert model to fp16
 
 model.generation_config.language = "english"
 model.generation_config.task = "transcribe"
@@ -86,7 +90,7 @@ training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=16,
+    per_device_train_batch_size=32,
     per_device_eval_batch_size=128,
 
     fp16=True,
@@ -94,7 +98,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=5e-5,
+    learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,
@@ -103,7 +107,7 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     save_steps=16000,
     save_total_limit=2,
-    eval_steps=4000,
+    eval_steps=2000,
     logging_steps=50,
     report_to="wandb",
     greater_is_better=False,
@@ -201,6 +205,8 @@ class CompressionRatioCallback(TrainerCallback):
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())
 
+# Add gradient scheduler callback
+
 
 class FreezeNonBoundaryCallback(TrainerCallback):
     def __init__(self, freeze_steps: int):
@@ -240,6 +246,36 @@ class FreezeNonBoundaryCallback(TrainerCallback):
 
 
 # trainer.add_callback(FreezeNonBoundaryCallback(FREEZE_NON_BOUNDARY_STEPS))
+
+
+class GradientScheduler(TrainerCallback):
+    """Schedule the gradient contribution from downsample operation."""
+
+    def __init__(self, start_alpha=0.0, end_alpha=0.33):
+        self.start_alpha = start_alpha
+        self.end_alpha = end_alpha
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
+
+        # Linear schedule from start_alpha to end_alpha
+        progress = min(1.0, state.global_step / total_steps)
+        current_alpha = self.start_alpha + \
+            (self.end_alpha - self.start_alpha) * progress
+
+        # Set alpha for all boundary predictors
+        predictors = getattr(model.model.encoder, "boundary_predictors", [])
+        for predictor in predictors:
+            if hasattr(predictor, "set_gradient_schedule_alpha"):
+                predictor.set_gradient_schedule_alpha(current_alpha)
+
+
+trainer.add_callback(GradientScheduler(start_alpha=0.0, end_alpha=0.1))
 
 
 class BoundaryScheduler(TrainerCallback):
@@ -319,7 +355,7 @@ class BoundaryScheduler(TrainerCallback):
 # trainer.add_callback(EvaluateFirstStepCallback())
 
 trainer.train()
-# trainer.save_model(f"./models/{MODEL_NAME}")
+# trainer.save_model(f"./models/old-save")
 
 # model.save_pretrained(f"./models/magnet-phonemes")
 # model = MagnetWhisper.from_pretrained(f"./models/{MODEL_NAME}")

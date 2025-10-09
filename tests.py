@@ -1,184 +1,161 @@
 import torch
-from utils import downsample
 
 
-def test_downsample_with_start_end_boundaries():
-    """
-    Test downsample with boundaries that have 1 at start and end, with trailing 0s.
-    This mimics the real usage pattern from BoundaryPredictor1.
-    """
-    print("\n=== Test: Boundaries with 1 at start and end, trailing zeros ===\n")
+def final(foo, temperature: float = 10.0):
+    print("[final] input foo shape:", foo.shape)
+    print("[final] temperature:", temperature)
 
-    # Create a simple test case
-    batch_size = 2
-    seq_len = 8
-    model_dim = 4
+    # Soft mask that heavily favors foo == 0 but keeps gradients alive elsewhere
+    weights = torch.exp(-temperature * foo.abs())
+    print("[final] raw soft weights:", weights)
 
-    # Boundaries: 1 at positions that mark segment boundaries
-    # Example: [1, 0, 0, 1, 0, 1, 0, 0] means segments at positions 0, 3, 5
-    boundaries = torch.zeros(batch_size, seq_len, dtype=torch.float32)
+    denominator = weights.sum(dim=1, keepdim=True) + 1e-9
+    print("[final] denominator (sum over dim=1):", denominator)
 
-    # Batch 0: boundaries at positions 0, 3, 5
-    boundaries[0, 0] = 1.0
-    boundaries[0, 3] = 1.0
-    boundaries[0, 5] = 1.0
+    normalized = weights / denominator
+    print("[final] normalized soft weights:", normalized)
 
-    # Batch 1: boundaries at positions 0, 2, 6
-    boundaries[1, 0] = 1.0
-    boundaries[1, 2] = 1.0
-    boundaries[1, 6] = 1.0
-
-    print("Boundaries (B x L):")
-    print(boundaries)
-    print()
-
-    # Create simple hidden states for easy verification
-    hidden = torch.arange(batch_size * seq_len *
-                          model_dim, dtype=torch.float32)
-    hidden = hidden.reshape(batch_size, seq_len, model_dim)
-
-    print("Hidden states (B x L x D):")
-    print(hidden)
-    print()
-
-    # Transpose to L x B x D as expected by downsample
-    hidden_transposed = hidden.transpose(0, 1)  # L x B x D
-
-    # Call downsample
-    pooled = downsample(boundaries, hidden_transposed)
-
-    print("Pooled output (S x B x D):")
-    print(pooled)
-    print(f"Pooled shape: {pooled.shape}")
-    print()
-
-    # Verify shape
-    max_segments = int(boundaries.sum(dim=1).max().item())
-    print(f"Max segments across batch: {max_segments}")
-    print(
-        f"Expected output shape: ({max_segments} x {batch_size} x {model_dim})")
-    print(f"Actual output shape: {tuple(pooled.shape)}")
-    print()
-
-    # Manual verification for batch 0
-    # Boundaries at [0, 3, 5]
-    # Segment 0: indices [0:1] -> hidden[0, 0:1].mean(0)
-    # Segment 1: indices [1:4] -> hidden[0, 1:4].mean(0)
-    # Segment 2: indices [4:6] -> hidden[0, 4:6].mean(0)
-
-    print("Manual verification for batch 0:")
-    print(f"Segment 0 (indices 0:1): mean = {hidden[0, 0:1].mean(0)}")
-    print(f"Segment 1 (indices 1:4): mean = {hidden[0, 1:4].mean(0)}")
-    print(f"Segment 2 (indices 4:6): mean = {hidden[0, 4:6].mean(0)}")
-    print()
-
-    print("Actual pooled values for batch 0:")
-    for i in range(pooled.shape[0]):
-        print(f"pooled[{i}, 0] = {pooled[i, 0]}")
-    print()
-
-    print("=== Test complete ===")
+    return normalized
 
 
-def test_edge_cases():
-    """Test various edge cases"""
-    print("\n=== Test: Edge Cases ===\n")
+def common(boundaries):
+    print("[common] raw boundaries:", boundaries)
+    boundaries = boundaries.clone()
+    print("[common] cloned boundaries:", boundaries)
 
-    batch_size = 1
-    seq_len = 6
-    model_dim = 3
+    n_segments = boundaries.sum(dim=-1).max().item()
+    print("[common] n_segments:", n_segments)
 
-    # Test 1: Only one boundary at position 0
-    print("Test 1: Single boundary at start")
-    boundaries = torch.zeros(batch_size, seq_len)
-    boundaries[0, 0] = 1.0
+    if n_segments == 0:
+        print("[common] no segments found, returning None")
+        return None
 
-    hidden = torch.randn(seq_len, batch_size, model_dim)
+    tmp = torch.zeros_like(boundaries).unsqueeze(2) + torch.arange(
+        start=0,
+        end=n_segments,
+        device=boundaries.device
+    )
+    print("[common] tmp shape:", tmp.shape)
+    print("[common] tmp sample:", tmp)
 
-    pooled = downsample(boundaries, hidden)
-    print(f"Boundaries: {boundaries[0].tolist()}")
-    print(f"Pooled shape: {pooled.shape}")
-    print(f"Pooled:\n{pooled}")
-    print()
+    hh1 = boundaries.cumsum(1)
+    print("[common] cumulative sum hh1:", hh1)
 
-    # Test 2: Multiple boundaries
-    print("Test 2: Multiple boundaries")
-    boundaries = torch.zeros(batch_size, seq_len)
-    boundaries[0, 0] = 1.0
-    boundaries[0, 2] = 1.0
-    boundaries[0, 4] = 1.0
+    hh1 -= boundaries
+    print("[common] hh1 after subtracting boundaries:", hh1)
 
-    pooled = downsample(boundaries, hidden)
-    print(f"Boundaries: {boundaries[0].tolist()}")
-    print(f"Pooled shape: {pooled.shape}")
-    print(f"Pooled:\n{pooled}")
-    print()
+    foo = tmp - hh1.unsqueeze(-1)
+    print("[common] foo shape:", foo.shape)
+    print("[common] foo sample:", foo)
 
-    # Test 3: All zeros (no boundaries)
-    print("Test 3: No boundaries (all zeros)")
-    boundaries = torch.zeros(batch_size, seq_len)
-
-    pooled = downsample(boundaries, hidden)
-    print(f"Boundaries: {boundaries[0].tolist()}")
-    print(f"Pooled shape: {pooled.shape}")
-    print(f"Pooled:\n{pooled}")
-    print()
+    return foo
 
 
-def test_specific_boundary_pattern():
-    """Test boundaries pattern 10101000 to understand exact pooling behavior"""
-    print("\n=== Test: Boundaries [1, 0, 1, 0, 1, 0, 0, 0] ===\n")
+def downsample(boundaries, hidden):
+    print("[downsample] boundaries shape:", boundaries.shape)
+    print("[downsample] hidden shape:", hidden.shape)
 
-    batch_size = 1
-    seq_len = 8
-    model_dim = 1
+    input_dtype = hidden.dtype
+    print("[downsample] input dtype:", input_dtype)
 
-    # Boundaries: 10101000
-    boundaries = torch.tensor([[1., 0., 1., 0., 1., 0., 0., 0.]])
+    foo = common(boundaries)
+    print("[downsample] result of common (foo):", foo)
 
-    # Simple hidden states - just use the index as the value for easy tracking
-    hidden = torch.arange(seq_len, dtype=torch.float32).reshape(1, seq_len, 1)
+    if foo is None:
+        print("[downsample] foo is None, returning empty tensor")
+        return torch.empty(0, hidden.size(1), hidden.size(2), device=hidden.device, dtype=input_dtype)
+    else:
+        bar = final(foo=foo)
+        print("[downsample] bar (after final):", bar)
 
-    print("Boundaries:", boundaries[0].tolist())
-    print("Hidden (values = indices):", hidden[0].squeeze().tolist())
-    print()
+        bar = bar.to(dtype=input_dtype)
+        print("[downsample] bar dtype after cast:", bar.dtype)
 
-    # Transpose to L x B x D
-    hidden_transposed = hidden.transpose(0, 1)
+        shortened_hidden = torch.einsum('lbd,bls->sbd', hidden, bar)
+        print("[downsample] shortened_hidden shape:", shortened_hidden.shape)
+        print("[downsample] shortened_hidden tensor:", shortened_hidden)
 
-    # Call downsample
-    pooled = downsample(boundaries, hidden_transposed)
-
-    print(f"Number of outputs: {pooled.shape[0]}")
-    print(f"Number of boundaries (1s): {boundaries.sum().item()}")
-    print()
-
-    print("Pooled output (S x B x D):")
-    for i in range(pooled.shape[0]):
-        print(f"  Output[{i}] = {pooled[i, 0, 0].item()}")
-    print()
-
-    print("Understanding the segments:")
-    print("  - A boundary of 1 at position i means: segment ENDS at position i (inclusive)")
-    print()
-
-    num_boundaries = int(boundaries.sum().item())
-    print(f"With {num_boundaries} boundaries, we get {num_boundaries} segments (outputs)")
-    print()
-
-    print("Manual segment calculation:")
-    print(
-        "  Segment 0 (boundary at pos 0): indices [0:1]   -> mean([0]) = 0.0")
-    print(
-        "  Segment 1 (boundary at pos 2): indices [1:3]   -> mean([1, 2]) = 1.5")
-    print(
-        "  Segment 2 (boundary at pos 4): indices [3:5]   -> mean([3, 4]) = 3.5")
-    print()
-    print("  Note: Positions 5, 6, 7 have no boundary, so they're not included in any segment!")
-    print()
+        return shortened_hidden
 
 
 if __name__ == "__main__":
-    test_specific_boundary_pattern()
-    # test_downsample_with_start_end_boundaries()
-    # test_edge_cases()
+    torch.set_printoptions(precision=4, sci_mode=False)
+
+    # Simple 1-batch example
+    batch_size = 1
+    seq_length = 5
+    hidden_dim = 3
+
+    # Boundaries tensor with a start token (0) and two boundaries set to 1
+    boundaries = torch.tensor([[0, 1, 0, 1, 0]], dtype=torch.float32)
+    print("[main] boundaries tensor:", boundaries)
+
+    # Hidden tensor shaped (L, B, D)
+    hidden = torch.arange(seq_length * batch_size * hidden_dim, dtype=torch.float32).reshape(seq_length, batch_size, hidden_dim)
+    print("[main] hidden tensor:", hidden)
+
+    shortened_hidden = downsample(boundaries, hidden)
+    print("[main] final shortened_hidden:", shortened_hidden)
+
+    print("\n[main] checking gradient flow w.r.t. boundaries")
+    boundaries_grad = boundaries.clone().detach().requires_grad_(True)
+    try:
+        shortened_hidden_grad = downsample(boundaries_grad, hidden)
+        loss = shortened_hidden_grad.sum()
+        print("[main] loss from shortened_hidden_grad.sum():", loss)
+        loss.backward()
+        print("[main] boundaries_grad.grad:", boundaries_grad.grad)
+    except RuntimeError as exc:
+        print("[main] encountered RuntimeError while checking gradients:", exc)
+
+    print("\n[main] suboptimal boundary fine-tuning demo")
+    torch.manual_seed(0)
+
+    # Hidden states with two obvious clusters but intentionally poor boundary placement
+    hidden_demo = torch.tensor([
+        [0.0],  # timeslice 0
+        [2.0],  # timeslice 1
+        [4.0],  # timeslice 2
+        [10.0],  # timeslice 3
+        [12.0],  # timeslice 4
+    ], dtype=torch.float32).reshape(5, 1, 1)
+    print("[demo] hidden_demo:", hidden_demo.squeeze(-1).squeeze(-1))
+
+    # Boundaries start two segments at indices 1 and 3 (second segment misses the last value we care about)
+    boundaries_demo = torch.tensor([[0.0, 1.0, 0.0, 1.0, 0.0]], dtype=torch.float32, requires_grad=True)
+    print("[demo] initial boundaries_demo:", boundaries_demo.detach())
+
+    target_segments = torch.tensor([[[1.0]], [[11.0]]])
+    print("[demo] target shortened representation:", target_segments.squeeze(-1).squeeze(-1))
+
+    shortened_demo = downsample(boundaries_demo, hidden_demo)
+    print("[demo] shortened_demo output:", shortened_demo.squeeze(-1).squeeze(-1))
+
+    demo_loss = torch.nn.functional.mse_loss(shortened_demo, target_segments)
+    print("[demo] loss before gradient step:", demo_loss.item())
+
+    demo_loss.backward()
+    print("[demo] boundary gradients:", boundaries_demo.grad)
+
+    # Attempt a tiny gradient step while renormalizing to keep roughly two segments
+    step_size = 0.05
+    with torch.no_grad():
+        updated_boundaries = boundaries_demo - step_size * boundaries_demo.grad
+        updated_boundaries.clamp_(min=0.0)
+        updated_boundaries[0, 0] = 0.0  # keep first token fixed at zero
+
+        original_sum = boundaries_demo.detach().sum()
+        updated_sum = updated_boundaries.sum()
+        if updated_sum > 0:
+            scale = (original_sum / updated_sum).item()
+            updated_boundaries.mul_(scale)
+
+    print("[demo] renormalized updated_boundaries:", updated_boundaries.detach())
+
+    try:
+        shortened_after = downsample(updated_boundaries.detach(), hidden_demo)
+        new_loss = torch.nn.functional.mse_loss(shortened_after, target_segments)
+        print("[demo] shortened_after output:", shortened_after.squeeze(-1).squeeze(-1))
+        print("[demo] loss after naive gradient step:", new_loss.item())
+    except RuntimeError as exc:
+        print("[demo] downsample failed after update with RuntimeError:", exc)
