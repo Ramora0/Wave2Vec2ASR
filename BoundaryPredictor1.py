@@ -36,7 +36,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(-2.5)
+                self.boundary_mlp[-1].bias.fill_(+3)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -52,7 +52,8 @@ class BoundaryPredictor1(nn.Module):
         target_boundary_counts=None,
         return_log_probs=False,
         return_unreduced_boundary_loss=False,
-        return_boundary_masks=False,
+        return_confidence=False,
+        return_entropy=False,
     ):
         logits = self.boundary_mlp(
             hidden).squeeze(-1)
@@ -99,16 +100,15 @@ class BoundaryPredictor1(nn.Module):
         # both return (S, B, D)
 
         # Call old downsample (no gradients) - expects (B, L, D)
-        pooled_old = old_downsample(
-            hard_boundaries, masked_hidden).to(masked_hidden.dtype)
+        # pooled_old = old_downsample(
+        #     hard_boundaries, masked_hidden).to(masked_hidden.dtype)
 
         # Call new downsample (with gradients) - expects (L, B, D)
         pooled_new = new_downsample(
             hard_boundaries, masked_hidden.transpose(0, 1))
 
         # Use STE: values from old, gradients from new (scheduled)
-        pooled = pooled_old.detach() + (pooled_new - pooled_new.detach()) * \
-            self.gradient_schedule_alpha
+        pooled = pooled_new
 
         # Debug: Check dtypes
         # print("old dtype:", pooled_old.dtype, "new dtype:", pooled_new.dtype)
@@ -184,17 +184,29 @@ class BoundaryPredictor1(nn.Module):
             log_prob = self.compute_log_prob(
                 hard_samples, probs, attention_mask)  # (B,)
 
-        if return_boundary_masks:
-            boundary_mask_out = hard_boundaries.detach()
-            return (
-                pooled,
-                loss,
-                num_boundaries,
-                total_positions,
-                shortened_attention_mask,
-                log_prob,
-                boundary_mask_out,
+        confidence = None
+        if return_confidence:
+            confidence_map = torch.abs(probs - 0.5)
+            if attention_mask is not None:
+                mask = attention_mask.to(confidence_map.dtype)
+                denom = mask.sum(dim=1).clamp(min=1.0)
+                confidence = (confidence_map * mask).sum(dim=1) / denom
+            else:
+                confidence = confidence_map.mean(dim=1)
+            confidence = confidence.detach()
+
+        entropy = None
+        if return_entropy:
+            probs_clamped = torch.clamp(
+                probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            entropy_map = -(
+                probs_clamped * torch.log(probs_clamped)
+                + (1.0 - probs_clamped) * torch.log1p(-probs_clamped)
             )
+            if attention_mask is not None:
+                entropy_map = entropy_map * \
+                    attention_mask.to(entropy_map.dtype)
+            entropy = entropy_map.sum(dim=1)
 
         return (
             pooled,
@@ -203,6 +215,8 @@ class BoundaryPredictor1(nn.Module):
             total_positions,
             shortened_attention_mask,
             log_prob,
+            confidence,
+            entropy,
         )
 
     def calc_loss(self, num_boundaries, total_positions):
@@ -293,7 +307,7 @@ class BoundaryPredictor1(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return 10 * loss_values  # (B,) - don't reduce
+        return loss_values  # (B,) - don't reduce
 
     def calc_example_loss_unreduced(self, hard_boundaries, attention_mask=None):
         """Return per-sample boundary losses (unreduced) for GRPO."""
@@ -305,6 +319,10 @@ class BoundaryPredictor1(nn.Module):
                 per_item_boundaries, hard_boundaries.size(1), dtype=torch.float)
 
         # Compute loss per example (don't reduce)
+        # TEST: Override prior to 1.0 for 1x compression
+        # per_example_loss = binomial_loss(
+        #     per_item_boundaries, per_item_totals, self.prior
+        # )
         per_example_loss = binomial_loss(
             per_item_boundaries, per_item_totals, self.prior
         )

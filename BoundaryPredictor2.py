@@ -41,7 +41,8 @@ class BoundaryPredictor2(nn.Module):
         target_boundary_counts=None,
         return_log_probs=False,
         return_unreduced_boundary_loss=False,
-        return_boundary_masks=False,
+        return_confidence=False,
+        return_entropy=False,
     ):
         normalized_hidden = F.normalize(hidden, dim=-1)
         batch_size = hidden.size(0)
@@ -153,17 +154,28 @@ class BoundaryPredictor2(nn.Module):
                 log_prob_t = log_prob_t * attention_mask.to(torch.float32)
             log_prob = log_prob_t.sum(dim=1)
 
-        if return_boundary_masks:
-            boundary_mask_out = hard_boundaries.detach()
-            return (
-                pooled,
-                loss,
-                num_boundaries,
-                total_positions,
-                shortened_attention_mask,
-                log_prob,
-                boundary_mask_out,
+        confidence = None
+        if return_confidence:
+            confidence_map = torch.abs(probs - 0.5)
+            if attention_mask is not None:
+                mask = attention_mask.to(confidence_map.dtype)
+                confidence_map = confidence_map * mask
+                denom = mask.sum(dim=1).clamp(min=1.0)
+                confidence = confidence_map.sum(dim=1) / denom
+            else:
+                confidence = confidence_map.mean(dim=1)
+            confidence = confidence.detach()
+
+        entropy = None
+        if return_entropy:
+            probs_clamped = torch.clamp(probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            entropy_map = -(
+                probs_clamped * torch.log(probs_clamped)
+                + (1.0 - probs_clamped) * torch.log1p(-probs_clamped)
             )
+            if attention_mask is not None:
+                entropy_map = entropy_map * attention_mask.to(entropy_map.dtype)
+            entropy = entropy_map.sum(dim=1)
 
         return (
             pooled,
@@ -172,6 +184,8 @@ class BoundaryPredictor2(nn.Module):
             total_positions,
             shortened_attention_mask,
             log_prob,
+            confidence,
+            entropy,
         )
 
     def calc_loss(self, num_boundaries, total_positions):

@@ -39,6 +39,7 @@ class GRPOBoundaryTrainer:
         callbacks=None,
         amp_enabled=False,
         amp_dtype=torch.float16,
+        entropy_bonus_weight=0.01,
     ):
         """
         Args:
@@ -52,6 +53,7 @@ class GRPOBoundaryTrainer:
             callbacks: Optional iterable of callables invoked on training events
             amp_enabled: Enable autocast mixed precision (CUDA only)
             amp_dtype: Autocast dtype to use when amp_enabled
+            entropy_bonus_weight: Weight for entropy bonus in reward (default: 0.01)
         """
         self.model = model
         self.K = num_samples
@@ -60,6 +62,7 @@ class GRPOBoundaryTrainer:
         self.normalize_advantages_flag = normalize_advantages_flag
         self.amp_enabled = bool(amp_enabled) and torch.cuda.is_available()
         self.amp_dtype = amp_dtype if self.amp_enabled else None
+        self.entropy_bonus_weight = entropy_bonus_weight
 
         # Freeze model except boundary predictors if requested
         if freeze_non_boundary:
@@ -147,7 +150,8 @@ class GRPOBoundaryTrainer:
                 return_unreduced_loss=True,  # Get per-sample ASR losses (K*B,)
                 return_boundary_log_probs=True,  # Get log probs for policy gradient (K*B,)
                 return_unreduced_boundary_loss=True,  # Get per-sample boundary losses (K*B,)
-                return_boundary_masks=True,  # Get hard boundary masks for diversity metrics
+                return_boundary_confidence=True,  # Get confidence estimates for diagnostics
+                return_entropy=True,  # Get entropy for entropy bonus
             )
 
         # Extract log probabilities from model (summed across all boundary predictor layers)
@@ -156,51 +160,69 @@ class GRPOBoundaryTrainer:
             raise RuntimeError("Boundary log probabilities not returned; ensure return_boundary_log_probs=True")
         log_probs_all = log_probs_all.to(torch.float32)
 
-        # Extract boundary loss for logging
+        # Extract boundary loss for logging (move to CPU immediately)
         boundary_loss_all = self.model._boundary_loss
         if boundary_loss_all is None:
             boundary_loss_all = torch.zeros_like(outputs.loss)
         elif boundary_loss_all.dim() == 0:
             boundary_loss_all = boundary_loss_all.expand_as(outputs.loss)
-        boundary_loss_all = boundary_loss_all.to(torch.float32)
+        boundary_loss_all = boundary_loss_all.to(torch.float32).cpu()  # Move to CPU for logging
 
-        boundary_masks_all = getattr(self.model, "_boundary_masks", None)
-        boundary_diversity = None
-        if boundary_masks_all is not None:
-            try:
-                boundary_masks = boundary_masks_all.to(torch.float32).view(self.K, batch_size, -1).permute(1, 0, 2)
-                if self.K > 1 and boundary_masks.size(-1) > 0:
-                    cdf = boundary_masks.cumsum(dim=-1)
-                    total_counts = cdf[:, :, -1:].clamp(min=1.0)
-                    cdf = cdf / total_counts
-                    diffs = []
-                    for i in range(self.K):
-                        for j in range(i + 1, self.K):
-                            diffs.append((cdf[:, i] - cdf[:, j]).abs().mean(dim=1))
-                    if diffs:
-                        boundary_diversity = torch.stack(diffs, dim=0).mean().item()
-            except RuntimeError:
-                boundary_diversity = None
+        boundary_conf_all = getattr(self.model, "_boundary_confidence", None)
+        if boundary_conf_all is not None:
+            # Already moved to CPU in MagnetWhisper
+            boundary_conf_all = boundary_conf_all.to(torch.float32)
+
+        # Extract entropy for bonus (already on CPU)
+        entropy_all = getattr(self.model, "_entropy", None)
+        if entropy_all is not None:
+            entropy_all = entropy_all.to(torch.float32)
 
         # Reshape to (B, K) - each audio has K configurations
         # Note: per_sample_losses now contains TOTAL loss (ASR + boundary) for each sample
-        per_sample_losses = outputs.loss.to(torch.float32).view(self.K, batch_size).T  # (K, B) -> (B, K)
-        log_probs = log_probs_all.view(self.K, batch_size).T  # (K, B) -> (B, K)
-        boundary_losses = boundary_loss_all.view(self.K, batch_size).T  # (K, B) -> (B, K)
+        # Move losses to CPU immediately as they're only used for rewards (detached)
+        per_sample_losses = outputs.loss.to(torch.float32).cpu().view(self.K, batch_size).T  # (K, B) -> (B, K)
+        log_probs = log_probs_all.view(self.K, batch_size).T  # (K, B) -> (B, K) - KEEP ON GPU for gradients
+        boundary_losses = boundary_loss_all.view(self.K, batch_size).T  # (K, B) -> (B, K) - already on CPU
+
+        avg_confidence = None
+        conf_std = None
+        if boundary_conf_all is not None:
+            try:
+                conf_view = boundary_conf_all.view(self.K, batch_size).T  # (B, K)
+                avg_confidence = conf_view.mean().item()
+                conf_std = conf_view.std().item()
+            except RuntimeError:
+                avg_confidence = None
+                conf_std = None
+
+        avg_entropy = None
+        if entropy_all is not None:
+            try:
+                entropy_view = entropy_all.view(self.K, batch_size).T  # (B, K)
+                avg_entropy = entropy_view.mean().item()
+            except RuntimeError:
+                avg_entropy = None
 
         # Get compression ratio
         compression_ratio = self.model.get_and_reset_compression_ratio()
 
         # === Step 2: Compute advantages from detached losses ===
         # Rewards are negative losses (detached - no gradients through ASR!)
+        # Note: per_sample_losses is already on CPU, so advantages computed on CPU
         with torch.no_grad():
-            rewards_per_audio = -per_sample_losses.detach()  # (B, K)
+            rewards_per_audio = -per_sample_losses  # (B, K) - already detached and on CPU
+
+            # Add entropy bonus to reward (encourages exploration)
+            if entropy_all is not None and self.entropy_bonus_weight > 0:
+                entropy_bonus = entropy_view * self.entropy_bonus_weight  # (B, K)
+                rewards_per_audio = rewards_per_audio + entropy_bonus
 
             # Compute advantages for each audio independently (each gets its own baseline)
             advantages = torch.stack([
                 compute_grpo_advantages(rewards_per_audio[b])  # Compute for each audio's K samples
                 for b in range(batch_size)
-            ])  # (B, K)
+            ])  # (B, K) - on CPU
 
         if self.normalize_advantages_flag:
             advantages = normalize_advantages(advantages)
@@ -214,7 +236,9 @@ class GRPOBoundaryTrainer:
         # Negative because we want to maximize, but optimizer minimizes
         # advantages are detached (pure reward signal, no gradients)
         # log_probs have gradients flowing back to boundary_mlp
-        policy_loss = -(advantages.detach() * log_probs).mean()
+        # Move advantages to GPU only for this computation (log_probs is on GPU)
+        advantages_gpu = advantages.to(log_probs.device)
+        policy_loss = -(advantages_gpu * log_probs).mean()
         total_policy_loss = policy_loss.item()
 
         # Backpropagate - gradients ONLY through log_probs → boundary predictors
@@ -234,6 +258,12 @@ class GRPOBoundaryTrainer:
             ).item()
             self.optimizer.step()
 
+        # Clear model's stored tensors to free GPU memory
+        self.model._boundary_log_probs = None
+        self.model._boundary_loss = None
+        self.model._boundary_confidence = None
+        self.model._entropy = None
+
         # === Step 4: Log metrics ===
         with torch.no_grad():
             metrics = {
@@ -247,8 +277,13 @@ class GRPOBoundaryTrainer:
                 "train/learning_rate": self.optimizer.param_groups[0]["lr"],
             }
 
-            if boundary_diversity is not None:
-                metrics["train/boundary_diversity"] = boundary_diversity
+            if avg_confidence is not None:
+                metrics["train/boundary_confidence"] = avg_confidence
+                if conf_std is not None:
+                    metrics["train/boundary_confidence_std"] = conf_std
+
+            if avg_entropy is not None:
+                metrics["train/entropy"] = avg_entropy
 
             # Add boundary predictor settings (similar to whisper.py)
         self.global_step += 1
@@ -303,8 +338,10 @@ class GRPOBoundaryTrainer:
             # Log to wandb
             if self.global_step == 1 or (step + 1) % log_interval == 0:
                 log_payload = dict(metrics)
+                # Log epoch as a monotonically increasing value (epoch + progress)
                 if total_steps and total_steps > 0:
-                    log_payload["train/epoch_progress"] = min(1.0, (step + 1) / total_steps)
+                    epoch_progress = min(1.0, (step + 1) / total_steps)
+                    log_payload["epoch"] = epoch + epoch_progress - 1  # epoch is 1-indexed, so subtract 1
                 wandb.log(log_payload, step=self.global_step)
 
             # Invoke callbacks (e.g., periodic evaluation)

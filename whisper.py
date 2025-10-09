@@ -20,18 +20,18 @@ from librispeech import (
 print("hi")
 
 # Load the model from old-save
-model = MagnetWhisper.from_pretrained("./models/old-save")
+# model = MagnetWhisper.from_pretrained("./models/old-save")
 
 # # Load the model
-# model = WhisperForConditionalGeneration.from_pretrained(
-#     "openai/whisper-small",
-#     # torch_dtype=torch.float16,
-#     token="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"
-#     # attn_implementation="flash_attention_2"
-# )
+model = WhisperForConditionalGeneration.from_pretrained(
+    "openai/whisper-small",
+    # torch_dtype=torch.float16,
+    token="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"
+    # attn_implementation="flash_attention_2"
+)
 
 # # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
-# model.__class__ = MagnetWhisper
+model.__class__ = MagnetWhisper
 SYLLABLE_BOUNDARY_LAYER = 3
 SYLLABLE_COMPRESSION_TARGET = 12.0
 SYLLABLE_BOUNDARY_PRIOR = 1.0 / SYLLABLE_COMPRESSION_TARGET
@@ -40,8 +40,8 @@ BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-# boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
-# model.load_magnet(boundary_priors, "BoundaryPredictor1")
+boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -98,7 +98,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=1e-5,
+    learning_rate=2e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,
@@ -204,8 +204,6 @@ class CompressionRatioCallback(TrainerCallback):
 
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())
-
-# Add gradient scheduler callback
 
 
 class FreezeNonBoundaryCallback(TrainerCallback):

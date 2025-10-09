@@ -49,7 +49,8 @@ class BoundaryPredictor3(nn.Module):
         target_boundary_counts=None,
         return_log_probs=False,
         return_unreduced_boundary_loss=False,
-        return_boundary_masks=False,
+        return_confidence=False,
+        return_entropy=False,
     ):
         cos_sim = torch.einsum(
             "b l d, b l d -> b l",
@@ -90,17 +91,20 @@ class BoundaryPredictor3(nn.Module):
 
         shortened_attention_mask = attention_mask
         log_prob = None
-        if return_boundary_masks:
-            boundary_mask_out = hard_boundaries.detach()
-            return (
-                pooled,
-                loss,
-                num_boundaries,
-                total_positions,
-                shortened_attention_mask,
-                log_prob,
-                boundary_mask_out,
+
+        confidence = None
+        if return_confidence:
+            confidence_map = torch.abs(probs - 0.5)
+            confidence = confidence_map.mean(dim=1).detach()
+
+        entropy = None
+        if return_entropy:
+            probs_clamped = torch.clamp(probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            entropy_map = -(
+                probs_clamped * torch.log(probs_clamped)
+                + (1.0 - probs_clamped) * torch.log1p(-probs_clamped)
             )
+            entropy = entropy_map.sum(dim=1)
 
         return (
             pooled,
@@ -109,6 +113,8 @@ class BoundaryPredictor3(nn.Module):
             total_positions,
             shortened_attention_mask,
             log_prob,
+            confidence,
+            entropy,
         )
 
     def calc_loss(self, preds):
