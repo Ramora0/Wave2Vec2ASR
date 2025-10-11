@@ -27,6 +27,12 @@ class BoundaryPredictor1(nn.Module):
         self.threshold = threshold
         self.gradient_schedule_alpha = 0.0  # Start with no gradients from downsample
 
+        # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
+        self.compression_schedule = 1.0  # Start at max compression by default
+
+        # Store target prior for scheduling (prior will be scheduled from 1.0 to target_prior)
+        self.target_prior = prior
+
         hidden = hidden_dim
         self.boundary_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden),
@@ -36,7 +42,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(+3)
+                self.boundary_mlp[-1].bias.fill_(2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -44,6 +50,72 @@ class BoundaryPredictor1(nn.Module):
     def set_gradient_schedule_alpha(self, alpha):
         """Set the alpha value for gradient scheduling (0.0 to 0.33)"""
         self.gradient_schedule_alpha = float(alpha)
+
+    def set_compression_schedule(self, schedule_value):
+        """
+        Set the compression schedule value (0.0 to 1.0).
+        0.0 = no compression (every token is a boundary)
+        1.0 = max compression (only target_boundary_counts boundaries)
+        """
+        self.compression_schedule = float(schedule_value)
+
+    def get_scheduled_prior(self):
+        """
+        Compute the effective prior based on compression schedule using inverse linear interpolation.
+
+        The prior is scheduled such that 1/prior increases linearly from 1.0 to 1/target_prior:
+        - When compression_schedule = 0.0: prior = 1.0 (no compression)
+        - When compression_schedule = 1.0: prior = target_prior (full compression)
+
+        Returns:
+            Effective prior value interpolated based on compression_schedule
+        """
+        # Inverse linear interpolation: 1/prior scales linearly
+        # prior = target_prior / (target_prior + schedule * (1 - target_prior))
+        schedule = self.compression_schedule
+        target = self.target_prior
+
+        # Handle edge case where target_prior = 1.0
+        if abs(target - 1.0) < 1e-8:
+            return 1.0
+
+        scheduled_prior = target / (target + schedule * (1.0 - target))
+        return scheduled_prior
+
+    def get_scheduled_target_counts(self, target_boundary_counts, attention_mask=None):
+        """
+        Compute the effective target boundary counts based on compression schedule.
+        Interpolates between max boundaries (sequence length) and target_boundary_counts.
+
+        Args:
+            target_boundary_counts: Original target counts (B,) or scalar
+            attention_mask: (B, L) attention mask to determine actual sequence lengths
+
+        Returns:
+            Effective target counts interpolated based on compression_schedule
+        """
+        if target_boundary_counts is None:
+            return None
+
+        # Determine max boundaries per sample
+        if attention_mask is not None:
+            # Max boundaries = sequence length for each sample
+            max_boundaries = attention_mask.sum(
+                dim=1).to(dtype=torch.float32)  # (B,)
+        else:
+            # If no mask, assume all positions are valid
+            # We need the sequence length - this will be batch size dependent
+            # For now, use a large number or infer from context
+            max_boundaries = target_boundary_counts * \
+                12.0  # Placeholder, will be overridden
+
+        # Interpolate: schedule=0 -> max_boundaries, schedule=1 -> target_boundary_counts
+        # effective = target + (max - target) * (1 - schedule)
+        effective_counts = target_boundary_counts + \
+            (max_boundaries - target_boundary_counts) * \
+            (1.0 - self.compression_schedule)
+
+        return effective_counts
 
     def forward(
         self,
@@ -153,23 +225,30 @@ class BoundaryPredictor1(nn.Module):
             total_positions_tensor = torch.tensor(
                 hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
 
+        # Apply compression scheduling to target_boundary_counts
+        if target_boundary_counts is not None:
+            effective_target_counts = self.get_scheduled_target_counts(
+                target_boundary_counts, attention_mask)
+        else:
+            effective_target_counts = None
+
         # Compute loss (either reduced scalar or unreduced per-sample)
         if return_unreduced_boundary_loss:
             # For GRPO: return per-sample boundary losses (B,)
-            if target_boundary_counts is not None:
+            if effective_target_counts is not None:
                 loss = self.calc_loss_target_counts_per_item_unreduced(
-                    hard_boundaries, attention_mask, target_boundary_counts)
+                    hard_boundaries, attention_mask, effective_target_counts)
             else:
                 loss = self.calc_example_loss_unreduced(
                     hard_boundaries, attention_mask)
         else:
             # Normal training: return scalar loss
-            if target_boundary_counts is not None:
-                loss = self.calc_loss_target_counts_overall(
-                    hard_boundaries, attention_mask, target_boundary_counts)
-            else:
-                loss = self.calc_loss(num_boundaries_tensor,
-                                      total_positions_tensor)
+            # if effective_target_counts is not None:
+            #     loss = self.calc_loss_target_counts_overall(
+            #         hard_boundaries, attention_mask, effective_target_counts)
+            # else:
+            loss = self.calc_loss(num_boundaries_tensor,
+                                  total_positions_tensor)
 
         # Store the calculated loss (for backward compatibility)
         if not return_unreduced_boundary_loss:
@@ -220,7 +299,8 @@ class BoundaryPredictor1(nn.Module):
         )
 
     def calc_loss(self, num_boundaries, total_positions):
-        return binomial_loss(num_boundaries, total_positions, self.prior)
+        scheduled_prior = self.get_scheduled_prior()
+        return binomial_loss(num_boundaries, total_positions, scheduled_prior)
         # return hinge_loss(preds, self.prior + 0.05, .05) / (64 ** 2)
 
     def calc_loss_target_counts_overall(self, hard_boundaries, attention_mask, target_boundary_counts):
@@ -280,8 +360,9 @@ class BoundaryPredictor1(nn.Module):
                 per_item_boundaries, hard_boundaries.size(1), dtype=torch.float)
 
         # Compute loss per example and normalize by batch size
+        scheduled_prior = self.get_scheduled_prior()
         per_example_loss = binomial_loss(
-            per_item_boundaries, per_item_totals, self.prior
+            per_item_boundaries, per_item_totals, scheduled_prior
         )
         return per_example_loss.mean()
 
@@ -323,8 +404,9 @@ class BoundaryPredictor1(nn.Module):
         # per_example_loss = binomial_loss(
         #     per_item_boundaries, per_item_totals, self.prior
         # )
+        scheduled_prior = self.get_scheduled_prior()
         per_example_loss = binomial_loss(
-            per_item_boundaries, per_item_totals, self.prior
+            per_item_boundaries, per_item_totals, scheduled_prior
         )
         return per_example_loss  # (B,) - don't reduce
 

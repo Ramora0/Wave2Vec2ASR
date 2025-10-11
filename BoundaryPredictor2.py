@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts
-from old_downsample import downsample as legacy_downsample
-from utils import downsample as differentiable_downsample
+from utils import downsample
 
 
 class BoundaryPredictor2(nn.Module):
@@ -14,9 +13,12 @@ class BoundaryPredictor2(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.allow_downsample_gradients = True
-        self.downsample_assignment_temp = 5.0
-        self.downsample_mask_scale = 5.0
+
+        # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
+        self.compression_schedule = 1.0  # Start at max compression by default
+
+        # Store target prior for scheduling (prior will be scheduled from 1.0 to target_prior)
+        self.target_prior = prior
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -31,8 +33,36 @@ class BoundaryPredictor2(nn.Module):
     def set_prior(self, prior):
         self.prior = prior
 
-    def set_downsample_gradients(self, enabled: bool):
-        self.allow_downsample_gradients = bool(enabled)
+    def set_compression_schedule(self, schedule_value):
+        """
+        Set the compression schedule value (0.0 to 1.0).
+        0.0 = no compression (every token is a boundary)
+        1.0 = max compression (only target_boundary_counts boundaries)
+        """
+        self.compression_schedule = float(schedule_value)
+
+    def get_scheduled_prior(self):
+        """
+        Compute the effective prior based on compression schedule using inverse linear interpolation.
+
+        The prior is scheduled such that 1/prior increases linearly from 1.0 to 1/target_prior:
+        - When compression_schedule = 0.0: prior = 1.0 (no compression)
+        - When compression_schedule = 1.0: prior = target_prior (full compression)
+
+        Returns:
+            Effective prior value interpolated based on compression_schedule
+        """
+        # Inverse linear interpolation: 1/prior scales linearly
+        # prior = target_prior / (target_prior + schedule * (1 - target_prior))
+        schedule = self.compression_schedule
+        target = self.target_prior
+
+        # Handle edge case where target_prior = 1.0
+        if abs(target - 1.0) < 1e-8:
+            return 1.0
+
+        scheduled_prior = target / (target + schedule * (1.0 - target))
+        return scheduled_prior
 
     def forward(
         self,
@@ -79,22 +109,20 @@ class BoundaryPredictor2(nn.Module):
             hard_samples - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled_hard = legacy_downsample(hard_boundaries, hidden)
+        # Apply attention mask to hidden before downsampling
+        if attention_mask is not None:
+            hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+            masked_hidden = hidden * hidden_mask
+        else:
+            masked_hidden = hidden
 
-        pooled_soft = differentiable_downsample(
-            hard_boundaries,
-            hidden,
-            assignment_temperature=self.downsample_assignment_temp,
-            mask_scale=self.downsample_mask_scale,
+        # Call downsample - expects (L, B, D), returns (S, B, D)
+        pooled = downsample(
+            hard_boundaries, masked_hidden.transpose(0, 1)
         )
 
-        pooled = pooled_hard + (pooled_soft - pooled_soft.detach())
-
-        self._validate_downsample_output(pooled_hard, hard_boundaries)
+        # Transpose to B x S x D
         pooled = pooled.transpose(0, 1)
-
-        if not self.allow_downsample_gradients:
-            pooled = pooled.detach()
 
         shortened_attention_mask = None
         if attention_mask is not None:
@@ -122,18 +150,17 @@ class BoundaryPredictor2(nn.Module):
                 dtype=torch.float,
             )
 
-        if target_boundary_counts is not None:
-            per_sample_loss = self.calc_loss_target_counts(
-                hard_boundaries,
-                attention_mask,
-                target_boundary_counts,
-                reduce=False,
-            )
-            loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
-        else:
-            _ = self.calc_loss(num_boundaries_tensor, total_positions_tensor)
-            raise NotImplementedError(
-                "Loss without target counts not implemented")
+        # if target_boundary_counts is not None:
+        #     per_sample_loss = self.calc_loss_target_counts(
+        #         hard_boundaries,
+        #         attention_mask,
+        #         target_boundary_counts,
+        #         reduce=False,
+        #     )
+        #     loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
+        # else:
+        loss = self.calc_loss(num_boundaries_tensor,
+                              total_positions_tensor)
 
         if target_boundary_counts is not None:
             if return_unreduced_boundary_loss:
@@ -146,7 +173,8 @@ class BoundaryPredictor2(nn.Module):
 
         log_prob = None
         if return_log_probs:
-            probs_clamped = torch.clamp(probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            probs_clamped = torch.clamp(
+                probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
             action_mask = hard_samples.detach().to(torch.float32)
             log_prob_t = action_mask * torch.log(probs_clamped) + \
                 (1 - action_mask) * torch.log1p(-probs_clamped)
@@ -168,13 +196,15 @@ class BoundaryPredictor2(nn.Module):
 
         entropy = None
         if return_entropy:
-            probs_clamped = torch.clamp(probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
+            probs_clamped = torch.clamp(
+                probs, min=1e-8, max=1 - 1e-8).to(torch.float32)
             entropy_map = -(
                 probs_clamped * torch.log(probs_clamped)
                 + (1.0 - probs_clamped) * torch.log1p(-probs_clamped)
             )
             if attention_mask is not None:
-                entropy_map = entropy_map * attention_mask.to(entropy_map.dtype)
+                entropy_map = entropy_map * \
+                    attention_mask.to(entropy_map.dtype)
             entropy = entropy_map.sum(dim=1)
 
         return (
@@ -189,7 +219,8 @@ class BoundaryPredictor2(nn.Module):
         )
 
     def calc_loss(self, num_boundaries, total_positions):
-        return binomial_loss(num_boundaries, total_positions, self.prior)
+        scheduled_prior = self.get_scheduled_prior()
+        return binomial_loss(num_boundaries, total_positions, scheduled_prior)
 
     def calc_loss_target_counts(
         self,

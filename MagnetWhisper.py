@@ -29,19 +29,10 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         if hasattr(self.model, "encoder"):
             setattr(self.model.encoder, "boundary_target_progress", progress)
 
-    def set_downsample_gradients_enabled(self, enabled: bool):
-        enabled = bool(enabled)
-        self.downsample_gradients_enabled = enabled
-        if hasattr(self.model, "set_downsample_gradients_enabled"):
-            self.model.set_downsample_gradients_enabled(enabled)
-        elif hasattr(self.model, "encoder") and hasattr(self.model.encoder, "set_downsample_gradients_enabled"):
-            self.model.encoder.set_downsample_gradients_enabled(enabled)
-
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
         self.model.load_magnet(lp, predictor_type)
         self.set_boundary_target_progress(1.0)
-        self.set_downsample_gradients_enabled(True)
         self._reset_boundary_loss_tracker()
 
     @classmethod
@@ -80,7 +71,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             model.model.encoder.total_boundaries = 0
             model.model.encoder.total_positions = 0
             model.model.encoder.boundary_target_progress = 1.0
-            model.model.encoder.downsample_gradients_enabled = True
 
             # Reconstruct each predictor based on saved type information
             layer_types_dict = dict(layer_types)
@@ -139,7 +129,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 boundary_predictor.threshold = threshold_dict[idx]
 
         model._reset_boundary_loss_tracker()
-        model.set_downsample_gradients_enabled(True)
 
         return model
 
@@ -421,10 +410,6 @@ class MagnetWhisperModel(WhisperModel):
 
         self.decoder.__class__ = MagnetWhisperDecoder
 
-    def set_downsample_gradients_enabled(self, enabled: bool):
-        if hasattr(self.encoder, "set_downsample_gradients_enabled"):
-            self.encoder.set_downsample_gradients_enabled(enabled)
-
     def forward(
         self,
         input_features: Optional[torch.FloatTensor] = None,
@@ -632,7 +617,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
         self.total_boundaries = 0
         self.total_positions = 0
         self.boundary_target_progress = 1.0
-        self.downsample_gradients_enabled = True
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":
@@ -651,8 +635,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     1,
                     0.5
                 )
-                self.boundary_predictors[layer_idx].set_downsample_gradients(
-                    self.downsample_gradients_enabled)
             elif predictor_type == "BoundaryPredictor3":
                 self.boundary_predictors[layer_idx] = BoundaryPredictor3(
                     768,
@@ -664,17 +646,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
             else:
                 raise ValueError(
                     f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3")
-
-        # Ensure predictors reflect current gradient setting
-        self.set_downsample_gradients_enabled(
-            self.downsample_gradients_enabled)
-
-    def set_downsample_gradients_enabled(self, enabled: bool):
-        enabled = bool(enabled)
-        self.downsample_gradients_enabled = enabled
-        for predictor in getattr(self, "boundary_predictors", []):
-            if hasattr(predictor, "set_downsample_gradients"):
-                predictor.set_downsample_gradients(enabled)
 
     def forward(
         self,

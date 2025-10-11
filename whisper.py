@@ -32,16 +32,13 @@ model = WhisperForConditionalGeneration.from_pretrained(
 
 # # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
-SYLLABLE_BOUNDARY_LAYER = 3
-SYLLABLE_COMPRESSION_TARGET = 12.0
-SYLLABLE_BOUNDARY_PRIOR = 1.0 / SYLLABLE_COMPRESSION_TARGET
 BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
 BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_priors = [(SYLLABLE_BOUNDARY_LAYER, SYLLABLE_BOUNDARY_PRIOR)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+boundary_priors = [(3, 0.08)]
+model.load_magnet(boundary_priors, "BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -193,6 +190,14 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_target_progress is not None:
             log_payload["train/boundary_target_progress"] = boundary_target_progress
 
+        # Log scheduled_prior from boundary predictors
+        predictors = getattr(model.model.encoder, "boundary_predictors", [])
+        if predictors:
+            # Log the scheduled prior value
+            if hasattr(predictors[0], "get_scheduled_prior"):
+                scheduled_prior = predictors[0].get_scheduled_prior()
+                log_payload["train/scheduled_prior"] = scheduled_prior
+
         # downsample_grad_enabled = getattr(
         #     model, "downsample_gradients_enabled", None)
         # if downsample_grad_enabled is not None:
@@ -274,6 +279,84 @@ class GradientScheduler(TrainerCallback):
 
 
 trainer.add_callback(GradientScheduler(start_alpha=0.0, end_alpha=0.1))
+
+
+class CompressionScheduler(TrainerCallback):
+    """
+    Schedule the compression rate during training.
+
+    The schedule_fn takes training progress (0.0 to 1.0) and returns
+    compression_schedule value (0.0 to 1.0) where:
+    - 0.0 = no compression (every token is a boundary)
+    - 1.0 = max compression (only target_boundary_counts boundaries)
+    """
+
+    def __init__(self, schedule_fn=None, start_value=0.0, end_value=1.0):
+        """
+        Args:
+            schedule_fn: Optional function that takes progress (0-1) and returns compression (0-1).
+                        If None, uses linear schedule from start_value to end_value.
+            start_value: Starting compression value (used if schedule_fn is None)
+            end_value: Ending compression value (used if schedule_fn is None)
+        """
+        self.schedule_fn = schedule_fn
+        self.start_value = start_value
+        self.end_value = end_value
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
+
+        # Calculate training progress (0.0 to 1.0)
+        progress = min(1.0, state.global_step / total_steps)
+
+        # Compute compression schedule value
+        if self.schedule_fn is not None:
+            compression_value = self.schedule_fn(progress)
+        else:
+            # Linear schedule from start to end
+            compression_value = self.start_value + \
+                (self.end_value - self.start_value) * progress
+
+        # Set compression schedule for all boundary predictors
+        predictors = getattr(model.model.encoder, "boundary_predictors", [])
+        for predictor in predictors:
+            if hasattr(predictor, "set_compression_schedule"):
+                predictor.set_compression_schedule(compression_value)
+
+
+# Enable compression scheduling (uncomment to use):
+# Linear schedule (gradually increase compression from 0% to 100%):
+trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
+#
+# Alternative scheduling functions:
+#
+# Cosine schedule (smooth S-curve):
+# import math
+# def cosine_schedule(progress):
+#     return 0.5 * (1 - math.cos(math.pi * progress))
+# trainer.add_callback(CompressionScheduler(schedule_fn=cosine_schedule))
+#
+# Step schedule (sudden jump at 50%):
+# def step_schedule(progress):
+#     return 0.0 if progress < 0.5 else 1.0
+# trainer.add_callback(CompressionScheduler(schedule_fn=step_schedule))
+#
+# Exponential schedule (fast at first, then slow):
+# def exponential_schedule(progress):
+#     return 1.0 - math.exp(-5 * progress)
+# trainer.add_callback(CompressionScheduler(schedule_fn=exponential_schedule))
+#
+# Warmup then constant (reach full compression early):
+# def warmup_schedule(progress, warmup=0.2):
+#     if progress < warmup:
+#         return progress / warmup
+#     return 1.0
+# trainer.add_callback(CompressionScheduler(schedule_fn=warmup_schedule))
 
 
 class BoundaryScheduler(TrainerCallback):
