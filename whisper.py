@@ -331,7 +331,7 @@ class CompressionScheduler(TrainerCallback):
 
 # Enable compression scheduling (uncomment to use):
 # Linear schedule (gradually increase compression from 0% to 100%):
-trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
+# trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
 #
 # Alternative scheduling functions:
 #
