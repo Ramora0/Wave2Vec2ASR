@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts
-from utils import downsample
+from smooth_downsample import downsample_with_smoothed_grad
 
 
 class BoundaryPredictor2(nn.Module):
@@ -116,8 +116,8 @@ class BoundaryPredictor2(nn.Module):
         else:
             masked_hidden = hidden
 
-        # Call downsample - expects (L, B, D), returns (S, B, D)
-        pooled = downsample(
+        # Call downsample with smoothed gradients - expects (B, T) and (T, B, C), returns (S, B, C)
+        pooled = downsample_with_smoothed_grad(
             hard_boundaries, masked_hidden.transpose(0, 1)
         )
 

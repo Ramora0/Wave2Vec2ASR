@@ -40,7 +40,8 @@ def binomial_loss(num_boundaries, total_positions, prior):
 def binomial_loss_from_target_counts(num_boundaries, total_positions, target_counts, eps=1e-6):
     """Binomial loss where the expected count matches target boundary counts."""
     if not isinstance(num_boundaries, torch.Tensor):
-        raise ValueError("num_boundaries must be a tensor for per-example loss computation")
+        raise ValueError(
+            "num_boundaries must be a tensor for per-example loss computation")
 
     device = num_boundaries.device
     num_boundaries = num_boundaries.to(dtype=torch.float32)
@@ -49,7 +50,8 @@ def binomial_loss_from_target_counts(num_boundaries, total_positions, target_cou
 
     clamped_totals = total_positions.clamp(min=1.0)
     clamped_targets = torch.minimum(target_counts, clamped_totals)
-    target_probs = (clamped_targets / clamped_totals).clamp(min=eps, max=1 - eps)
+    target_probs = (clamped_targets /
+                    clamped_totals).clamp(min=eps, max=1 - eps)
 
     binomial = torch.distributions.binomial.Binomial(
         total_count=clamped_totals,

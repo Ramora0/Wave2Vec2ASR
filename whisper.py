@@ -278,7 +278,7 @@ class GradientScheduler(TrainerCallback):
                 predictor.set_gradient_schedule_alpha(current_alpha)
 
 
-trainer.add_callback(GradientScheduler(start_alpha=0.0, end_alpha=0.1))
+# trainer.add_callback(GradientScheduler(start_alpha=0.0, end_alpha=0.1))
 
 
 class CompressionScheduler(TrainerCallback):
@@ -332,6 +332,17 @@ class CompressionScheduler(TrainerCallback):
 # Enable compression scheduling (uncomment to use):
 # Linear schedule (gradually increase compression from 0% to 100%):
 # trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
+
+# Warmup schedule: reach full compression at 1/3 through training, then stay there
+def compression_warmup_schedule(progress, warmup=2.0/3.0):
+    """Ramp from 0 to 1.0 in first 1/3 of training, then stay at 1.0"""
+    if progress < warmup:
+        return progress / warmup
+    return 1.0
+
+
+trainer.add_callback(CompressionScheduler(
+    schedule_fn=compression_warmup_schedule))
 #
 # Alternative scheduling functions:
 #

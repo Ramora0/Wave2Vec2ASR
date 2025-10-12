@@ -8,6 +8,7 @@ from tqdm import tqdm
 from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
 from old_downsample import downsample as old_downsample
 from smooth_downsample import downsample_with_smoothed_grad
+from utils import downsample
 # from utils import weighted_downsample  # Optional weighted pooling prototype
 
 # Blend constant: 0.0 = old downsample, 1.0 = new downsample
@@ -176,10 +177,13 @@ class BoundaryPredictor1(nn.Module):
         #     hard_boundaries, masked_hidden).to(masked_hidden.dtype)
 
         # Call smooth downsample (with smoothed gradients) - expects (B, T) and (T, B, C)
-        pooled_new = downsample_with_smoothed_grad(
+        # pooled_new = downsample_with_smoothed_grad(
+        #     hard_boundaries,
+        #     masked_hidden.transpose(0, 1),
+        #     smoothing_kernel_size=5)
+        pooled_new = downsample(
             hard_boundaries,
-            masked_hidden.transpose(0, 1),
-            smoothing_kernel_size=5)
+            masked_hidden.transpose(0, 1))
 
         # Use STE: values from old, gradients from new (scheduled)
         pooled = pooled_new
