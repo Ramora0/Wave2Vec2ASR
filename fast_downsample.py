@@ -4,10 +4,13 @@ from utils import downsample, common, final
 
 LAST_DEBUG_INFO = None
 BOUNDARY_THRESHOLD = 0.5
+CUSTOM_BOUNDARY_GRAD_WEIGHT = .1
+DEFAULT_BOUNDARY_GRAD_WEIGHT = 1
 
 
 def _binarize_boundaries(boundaries):
     return (boundaries >= BOUNDARY_THRESHOLD).to(boundaries.dtype)
+
 
 def _get_segment_info(boundaries_for_batch, L):
     """
@@ -25,7 +28,7 @@ def _get_segment_info(boundaries_for_batch, L):
         idx_val = b_idx.item()
         segment_lengths.append(idx_val - last_boundary)
         last_boundary = idx_val
-    
+
     return boundary_indices, torch.tensor(segment_lengths, device=boundaries_for_batch.device)
 
 
@@ -41,19 +44,23 @@ def simulate_left_shift(boundaries, hidden, b, i, original_output):
         return None
 
     boundary_indices, segment_lengths = _get_segment_info(boundaries[b], L)
-    if boundary_indices is None: return None
+    if boundary_indices is None:
+        return None
 
     k = (boundary_indices == i).nonzero(as_tuple=True)[0]
-    if len(k) == 0: return None
+    if len(k) == 0:
+        return None
     k = k.item()
 
-    if k >= len(segment_lengths) - 1: # Cannot shift the last boundary if it affects a non-existent next segment
+    # Cannot shift the last boundary if it affects a non-existent next segment
+    if k >= len(segment_lengths) - 1:
         return None
 
     len_k = segment_lengths[k]
     len_k_plus_1 = segment_lengths[k+1]
 
-    if len_k <= 1: return None # Cannot make a zero-length segment
+    if len_k <= 1:
+        return None  # Cannot make a zero-length segment
 
     mean_k = original_output[k, b, :]
     mean_k_plus_1 = original_output[k+1, b, :]
@@ -79,18 +86,22 @@ def simulate_right_shift(boundaries, hidden, b, i, original_output):
         return None
 
     boundary_indices, segment_lengths = _get_segment_info(boundaries[b], L)
-    if boundary_indices is None: return None
+    if boundary_indices is None:
+        return None
 
     k = (boundary_indices == i).nonzero(as_tuple=True)[0]
-    if len(k) == 0: return None
+    if len(k) == 0:
+        return None
     k = k.item()
 
-    if k >= len(segment_lengths) - 1: return None
+    if k >= len(segment_lengths) - 1:
+        return None
 
     len_k = segment_lengths[k]
     len_k_plus_1 = segment_lengths[k+1]
 
-    if len_k_plus_1 <= 1: return None
+    if len_k_plus_1 <= 1:
+        return None
 
     mean_k = original_output[k, b, :]
     mean_k_plus_1 = original_output[k+1, b, :]
@@ -153,31 +164,51 @@ class FastFiniteDifferenceDownsample(torch.autograd.Function):
 
                 delta_left = 0.0
                 delta_right = 0.0
-                
+                can_move_left = False
+                can_move_right = False
+
                 k = (boundary_indices == i).nonzero(as_tuple=True)[0].item()
 
                 # Right shift
-                diffs_right = simulate_right_shift(binary_boundaries, hidden, b, i, original_output)
+                diffs_right = simulate_right_shift(
+                    binary_boundaries, hidden, b, i, original_output)
                 if diffs_right is not None:
                     diff_k, diff_k_plus_1 = diffs_right
                     d_right = (grad_output[k, b, :] * diff_k).sum()
                     d_right += (grad_output[k+1, b, :] * diff_k_plus_1).sum()
                     delta_right = d_right.item()
+                    can_move_right = True
 
                 # Left shift
-                diffs_left = simulate_left_shift(binary_boundaries, hidden, b, i, original_output)
+                diffs_left = simulate_left_shift(
+                    binary_boundaries, hidden, b, i, original_output)
                 if diffs_left is not None:
                     diff_k, diff_k_plus_1 = diffs_left
                     d_left = (grad_output[k, b, :] * diff_k).sum()
                     d_left += (grad_output[k+1, b, :] * diff_k_plus_1).sum()
                     delta_left = d_left.item()
+                    can_move_left = True
 
-                # Apply finite difference gradients
-                if i > 0:
+                # Only apply gradients for beneficial moves to prevent bad moves from blocking good ones
+                # delta_left/right = dL/dboundary (how much loss increases with that move)
+                # Negative delta = loss decreases (good move), positive delta = loss increases (bad move)
+
+                # Only apply gradient if the move reduces loss (delta < 0)
+                if can_move_left and i > 0 and delta_left < 0:
+                    # Moving left is beneficial, apply the gradient
                     grad_boundaries[b, i-1] += delta_left * gradient_scale
-                grad_boundaries[b, i] -= (delta_left + delta_right) * gradient_scale
-                if i < L - 1:
+
+                if can_move_right and i < L - 1 and delta_right < 0:
+                    # Moving right is beneficial, apply the gradient
                     grad_boundaries[b, i+1] += delta_right * gradient_scale
+
+                # Center position: sum gradients from beneficial moves only
+                beneficial_left_grad = delta_left if (
+                    can_move_left and delta_left < 0) else 0.0
+                beneficial_right_grad = delta_right if (
+                    can_move_right and delta_right < 0) else 0.0
+                grad_boundaries[b, i] -= (beneficial_left_grad +
+                                          beneficial_right_grad) * gradient_scale
 
                 if debug_records is not None:
                     debug_records.append({
@@ -188,7 +219,29 @@ class FastFiniteDifferenceDownsample(torch.autograd.Function):
                         "delta_right": delta_right,
                         "grad_after": float(grad_boundaries[b, i].item()),
                     })
-        
+        if DEFAULT_BOUNDARY_GRAD_WEIGHT != 0.0:
+            with torch.enable_grad():
+                boundaries_autograd = boundaries.detach().clone().requires_grad_(True)
+                hidden_detached = hidden.detach()
+                default_output = downsample(
+                    boundaries_autograd, hidden_detached)
+                default_grad = torch.autograd.grad(
+                    outputs=default_output,
+                    inputs=boundaries_autograd,
+                    grad_outputs=grad_output,
+                    retain_graph=False,
+                    allow_unused=True,
+                )[0]
+
+            if default_grad is None:
+                default_grad = torch.zeros_like(grad_boundaries)
+
+            grad_boundaries = (
+                CUSTOM_BOUNDARY_GRAD_WEIGHT * grad_boundaries
+                + DEFAULT_BOUNDARY_GRAD_WEIGHT *
+                (default_grad * gradient_scale).to(grad_boundaries.dtype)
+            )
+
         foo = common(binary_boundaries)
         if foo is None:
             grad_hidden = torch.zeros_like(hidden)

@@ -12,6 +12,7 @@ import wandb
 from tqdm import tqdm
 
 from MagnetWhisper import MagnetWhisper
+from transformers import WhisperForConditionalGeneration
 from librispeech import (
     create_librispeech_data_module,
     build_map_to_pred,
@@ -26,9 +27,6 @@ from evaluate import load
 - #samples
 - boundary temperature
 """
-
-# Model checkpoint (pre-trained with compression-only)
-MODEL_CHECKPOINT = "./models/old-save"
 
 # GRPO hyperparameters
 BATCH_SIZE = 16  # Tuned for A100 (effective batch = 16 * 8 = 128 rollouts)
@@ -235,7 +233,6 @@ def main():
     # Initialize wandb
     wandb.init(
         config={
-            "model_checkpoint": MODEL_CHECKPOINT,
             "num_samples": NUM_SAMPLES,
             "clip_eps": CLIP_EPS,
             "learning_rate": LEARNING_RATE,
@@ -248,8 +245,16 @@ def main():
     )
 
     # Load pre-trained model
-    print(f"\nLoading model from {MODEL_CHECKPOINT}...")
-    model = MagnetWhisper.from_pretrained(MODEL_CHECKPOINT)
+    print(f"\nLoading model...")
+    # model = MagnetWhisper.from_pretrained("./models/old-save")
+    model = WhisperForConditionalGeneration.from_pretrained(
+        "openai/whisper-small",
+        token="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"
+    )
+    model.__class__ = MagnetWhisper
+    boundary_priors = [(3, 0.08)]
+    model.load_magnet(boundary_priors, "BoundaryPredictor1")
+    # model.model.encoder.boundary_predictors[2].temperature = 0
     model.to("cuda")
 
     # Optional torch.compile for faster training (opt-in)

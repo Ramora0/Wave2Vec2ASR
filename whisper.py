@@ -38,7 +38,7 @@ BOUNDARY_TARGET_PROGRESS = 1.0
 FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(3, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -334,15 +334,18 @@ class CompressionScheduler(TrainerCallback):
 # trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
 
 # Warmup schedule: reach full compression at 1/3 through training, then stay there
-def compression_warmup_schedule(progress, warmup=2.0/3.0):
-    """Ramp from 0 to 1.0 in first 1/3 of training, then stay at 1.0"""
-    if progress < warmup:
-        return progress / warmup
-    return 1.0
+# Compression schedule uses discrete steps rather than a smooth ramp.
+COMPRESSION_SCHEDULE_STEPS = 12
+
+
+def compression_schedule(progress):
+    """Advance compression in discrete steps during warmup, then hold at 1.0"""
+    steps = 6
+    return int(steps * progress + 1) / steps
 
 
 trainer.add_callback(CompressionScheduler(
-    schedule_fn=compression_warmup_schedule))
+    schedule_fn=compression_schedule))
 #
 # Alternative scheduling functions:
 #

@@ -43,7 +43,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(2.5)
+                self.boundary_mlp[-1].bias.fill_(-2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -132,12 +132,14 @@ class BoundaryPredictor1(nn.Module):
             hidden).squeeze(-1)
         probs = torch.sigmoid(logits)
 
+        # if self.training:
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            temperature=self.temp,
+            temperature=1,
             probs=probs,
         )
-
         soft_boundaries = bernoulli.rsample()
+        # else:
+        #     soft_boundaries = probs
 
         if attention_mask is not None:
             soft_boundaries = soft_boundaries * attention_mask
@@ -158,9 +160,9 @@ class BoundaryPredictor1(nn.Module):
                 soft_boundaries = torch.maximum(
                     soft_boundaries, last_real_mask)
 
-        hard_boundaries = (
-            hard_samples - soft_boundaries.detach() + soft_boundaries
-        )
+        # STE: forward pass stays binary (hard_samples) while gradients flow through soft_boundaries
+        hard_boundaries = hard_samples + \
+            (soft_boundaries - soft_boundaries.detach())
 
         if attention_mask is not None:
             hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
@@ -394,7 +396,7 @@ class BoundaryPredictor1(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return loss_values  # (B,) - don't reduce
+        return 10 * loss_values  # (B,) - don't reduce
 
     def calc_example_loss_unreduced(self, hard_boundaries, attention_mask=None):
         """Return per-sample boundary losses (unreduced) for GRPO."""
@@ -414,7 +416,7 @@ class BoundaryPredictor1(nn.Module):
         per_example_loss = binomial_loss(
             per_item_boundaries, per_item_totals, scheduled_prior
         )
-        return per_example_loss  # (B,) - don't reduce
+        return 10 * per_example_loss  # (B,) - don't reduce
 
     # ========== RL Methods (for GRPO training) ==========
     # These methods are used only for RL training and don't affect normal training
@@ -461,9 +463,9 @@ class BoundaryPredictor1(nn.Module):
                 hard_samples = torch.maximum(hard_samples, last_real_mask)
 
         # Straight-through estimator
-        hard_boundaries = (
-            hard_samples - soft_boundaries.detach() + soft_boundaries
-        )
+        # STE: keep discrete values but let gradients follow the relaxed sample
+        hard_boundaries = hard_samples + \
+            (soft_boundaries - soft_boundaries.detach())
 
         # Compute log probability of the sampled boundaries
         # log p(boundaries) = sum_t [b_t * log(p_t) + (1-b_t) * log(1-p_t)]
