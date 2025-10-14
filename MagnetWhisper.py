@@ -205,8 +205,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         cache_position: Optional[torch.LongTensor] = None,
         target_boundary_counts: Optional[torch.Tensor] = None,
         return_unreduced_loss: Optional[bool] = False,
-        return_boundary_log_probs: Optional[bool] = False,
-        return_unreduced_boundary_loss: Optional[bool] = False,
+        boundary_rl: Optional[bool] = False,
         return_boundary_confidence: Optional[bool] = False,
         return_entropy: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
@@ -241,9 +240,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # attention_mask = torch.ones_like(
-        #     attention_mask) if attention_mask is None else attention_mask
-
         if labels is not None:
             if labels.shape[1] > self.max_target_positions:
                 raise ValueError(
@@ -253,9 +249,6 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 decoder_input_ids = shift_tokens_right(
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
-
-        # print(
-        #     f"[MagnetWhisper] attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
 
         model_output = self.model(
             input_features,
@@ -275,8 +268,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             return_dict=return_dict,
             cache_position=cache_position,
             target_boundary_counts=target_boundary_counts,
-            return_boundary_log_probs=return_boundary_log_probs,
-            return_unreduced_boundary_loss=return_unreduced_boundary_loss,
+            boundary_rl=boundary_rl,
             return_boundary_confidence=return_boundary_confidence,
             return_entropy=return_entropy,
         )
@@ -429,8 +421,7 @@ class MagnetWhisperModel(WhisperModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         target_boundary_counts: Optional[torch.Tensor] = None,
-        return_boundary_log_probs: Optional[bool] = False,
-        return_unreduced_boundary_loss: Optional[bool] = False,
+        boundary_rl: Optional[bool] = False,
         return_boundary_confidence: Optional[bool] = False,
         return_entropy: Optional[bool] = False,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqModelOutput]:
@@ -460,9 +451,6 @@ class MagnetWhisperModel(WhisperModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # print(
-        #     f"[MagnetWhisperModel] attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
-
         encoder_attention_mask = attention_mask
 
         if encoder_outputs is None:
@@ -477,12 +465,10 @@ class MagnetWhisperModel(WhisperModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
                 target_boundary_counts=target_boundary_counts,
-                return_boundary_log_probs=return_boundary_log_probs,
-                return_unreduced_boundary_loss=return_unreduced_boundary_loss,
+                boundary_rl=boundary_rl,
                 return_boundary_confidence=return_boundary_confidence,
                 return_entropy=return_entropy,
             )
-        # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
             encoder_outputs = BaseModelOutput(
                 last_hidden_state=encoder_outputs[0],
@@ -492,8 +478,6 @@ class MagnetWhisperModel(WhisperModel):
                     encoder_outputs) > 2 else None,
             )
 
-        # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
-        # Create cross-attention mask from encoder attention mask
         cross_attention_mask = None
         if (
             hasattr(encoder_outputs, 'encoder_attention_mask')
@@ -538,72 +522,29 @@ class MagnetWhisperModel(WhisperModel):
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
-    # Dont actually use -inf for masking
     def _convert_attention_mask_to_2d(self, attention_mask):
-        """
-        Convert a 1D attention mask to a 4D attention mask where only positions
-        with value 1 can attend to other positions with value 1.
-
-        Args:
-            attention_mask: 1D tensor of shape (batch_size, seq_length) with 1s and 0s
-
-        Returns:
-            4D attention mask of shape (batch_size, 1, seq_length, seq_length) where
-            mask[i, 0, j, k] = 0 if both position j and k should attend to each other, -1e9 otherwise
-        """
         if attention_mask is None:
             return None
 
         batch_size, seq_length = attention_mask.shape
-
-        # Create 2D mask: only positions with 1 can attend to other positions with 1
-        # Shape: (batch_size, seq_length, seq_length)
         attention_mask_2d = attention_mask.unsqueeze(
             1) * attention_mask.unsqueeze(2)
-
-        # Convert to attention mask format: 0 for allowed, -1e9 for blocked
-        # Where original mask had 1s, we want 0 (allowed attention)
-        # Where original mask had 0s, we want -1e9 (blocked attention)
         attention_mask_2d = (1 - attention_mask_2d) * -1e9
-
-        # Add head dimension: (batch_size, 1, seq_length, seq_length)
         attention_mask_4d = attention_mask_2d.unsqueeze(1)
 
         return attention_mask_4d
 
     def _create_cross_attention_mask(self, encoder_attention_mask, decoder_input_ids):
-        """
-        Create a 2D cross-attention mask that allows decoder tokens to attend to 
-        non-padded encoder tokens while masking out padded encoder positions.
-
-        Args:
-            encoder_attention_mask: 1D tensor of shape (batch_size, encoder_seq_length) 
-                                  with 1s for valid tokens and 0s for padding
-            decoder_input_ids: tensor of shape (batch_size, decoder_seq_length)
-
-        Returns:
-            4D cross-attention mask of shape (batch_size, 1, decoder_seq_length, encoder_seq_length)
-            where mask[i, 0, j, k] = 0 if decoder position j can attend to encoder position k, 
-            -1e9 if encoder position k is padded and should be masked out
-        """
         if encoder_attention_mask is None:
             return None
 
         batch_size, encoder_seq_length = encoder_attention_mask.shape
         decoder_seq_length = decoder_input_ids.shape[1] if decoder_input_ids is not None else 1
 
-        # Expand encoder mask to cover all decoder positions
-        # Shape: (batch_size, decoder_seq_length, encoder_seq_length)
         cross_attention_mask = encoder_attention_mask.unsqueeze(1).expand(
             batch_size, decoder_seq_length, encoder_seq_length
         )
-
-        # Convert to attention mask format: 0 for allowed attention, -1e9 for blocked
-        # Where encoder_attention_mask has 1s (valid), we want 0 (allowed attention)
-        # Where encoder_attention_mask has 0s (padding), we want -1e9 (blocked attention)
         cross_attention_mask = (1 - cross_attention_mask) * -1e9
-
-        # Add head dimension: (batch_size, 1, decoder_seq_length, encoder_seq_length)
         cross_attention_mask_4d = cross_attention_mask.unsqueeze(1)
 
         return cross_attention_mask_4d
@@ -612,8 +553,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
         )
-        self.compression_ratios = {}  # Track compression ratios by layer
-        # Initialize boundary and position counters
+        self.compression_ratios = {}
         self.total_boundaries = 0
         self.total_positions = 0
         self.boundary_target_progress = 1.0
@@ -656,38 +596,27 @@ class MagnetWhisperEncoder(WhisperEncoder):
         output_hidden_states=None,
         return_dict=None,
         target_boundary_counts=None,
-        return_boundary_log_probs=False,
-        return_unreduced_boundary_loss=False,
+        boundary_rl=False,
         return_boundary_confidence=False,
         return_entropy=False,
     ):
         r"""
         Args:
             input_features (`torch.LongTensor` of shape `(batch_size, feature_size, sequence_length)`):
-                Float values of mel features extracted from the raw speech waveform. Raw speech waveform can be
-                obtained by loading a `.flac` or `.wav` audio file into an array of type `List[float]` or a
-                `numpy.ndarray`, *e.g.* via the soundfile library (`pip install soundfile`). To prepare the array into
-                `input_features`, the [`AutoFeatureExtractor`] should be used for extracting the mel features, padding
-                and conversion into a tensor of type `torch.FloatTensor`. See [`~WhisperFeatureExtractor.__call__`]
+                Float values of mel features extracted from the raw speech waveform.
             attention_mask (`torch.Tensor`, *optional*):
-                Optional padding mask over the input features. The mask is pooled down to match the convolutional
-                stride and propagated through the encoder stack.
+                Optional padding mask over the input features.
             head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
-                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
+                Mask to nullify selected heads of the attention modules.
             output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
+                Whether or not to return the attentions tensors of all attention layers.
             output_hidden_states (`bool`, *optional*):
-                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
-                for more detail.
+                Whether or not to return the hidden states of all layers.
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
 
-        expected_seq_length = self.config.max_source_positions * \
+        expected_seq_length = self.config.max_source_positions *
             self.conv1.stride[0] * self.conv2.stride[0]
         if input_features.shape[-1] != expected_seq_length:
             raise ValueError(
@@ -708,9 +637,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
             attention_mask = max_pool_attention_mask(attention_mask)
 
         embed_pos = self.embed_positions.weight
-
-        # print("Embed pos", embed_pos.shape)
-        # print("Inputs embeds", inputs_embeds.shape)
         hidden_states = inputs_embeds + embed_pos[:inputs_embeds.shape[1], :]
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
@@ -718,17 +644,16 @@ class MagnetWhisperEncoder(WhisperEncoder):
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        # check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
             assert head_mask.size()[0] == (
                 len(self.layers)
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
         boundary_loss = 0
-        total_log_probs = None  # For RL: accumulate log probs across layers
+        total_log_probs = None
         total_confidence = None
         confidence_layers = 0
-        total_entropy = None  # For RL: accumulate entropy across layers
+        total_entropy = None
         entropy_layers = 0
 
         target_matrix: Optional[torch.Tensor] = None
@@ -736,24 +661,16 @@ class MagnetWhisperEncoder(WhisperEncoder):
             target_matrix = target_boundary_counts.to(hidden_states.device)
 
         target_pointer = 0
-
-        # Convert 1D attention mask to 4D if provided
-        # print(
-        #     f"[MagnetWhisperEncoder] Input attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
         attention_mask_4d = self._convert_attention_mask_to_2d(attention_mask)
-        # print(
-        #     f"[MagnetWhisperEncoder] Converted attention_mask_4d shape: {attention_mask_4d.shape if attention_mask_4d is not None else None}")
-        # Keep track of the 1D attention mask for boundary predictors
         attention_mask_1d = attention_mask
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             to_drop = False
             if self.training:
                 dropout_probability = torch.rand([])
-                if dropout_probability < self.layerdrop:  # skip the layer
+                if dropout_probability < self.layerdrop:
                     to_drop = True
 
             if to_drop:
@@ -763,14 +680,14 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     layer_outputs = self._gradient_checkpointing_func(
                         encoder_layer.__call__,
                         hidden_states,
-                        attention_mask_4d,  # Use pre-computed 4D attention mask
+                        attention_mask_4d,
                         (head_mask[idx] if head_mask is not None else None),
                         output_attentions,
                     )
                 else:
                     layer_outputs = encoder_layer(
                         hidden_states,
-                        attention_mask_4d,  # Use pre-computed 4D attention mask
+                        attention_mask_4d,
                         layer_head_mask=(
                             head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
@@ -832,8 +749,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                             predictor_input,
                             attention_mask_1d,
                             target_boundary_counts=target_for_predictor,
-                            return_log_probs=return_boundary_log_probs,
-                            return_unreduced_boundary_loss=return_unreduced_boundary_loss,
+                            rl=boundary_rl,
                             return_confidence=return_boundary_confidence,
                             return_entropy=return_entropy,
                         )
@@ -841,12 +757,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
                         result = predictor_module(
                             predictor_input,
                             attention_mask_1d,
-                            return_log_probs=return_boundary_log_probs,
-                            return_unreduced_boundary_loss=return_unreduced_boundary_loss,
+                            rl=boundary_rl,
                             return_confidence=return_boundary_confidence,
                             return_entropy=return_entropy,
                         )
-                    # Unpack result based on length
                     if len(result) == 8:
                         final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
                     elif len(result) == 7:
@@ -857,7 +771,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                         layer_confidence = None
                         layer_entropy = None
 
-                    # Accumulate log probs across layers for policy gradient
                     if layer_log_prob is not None:
                         if total_log_probs is None:
                             total_log_probs = layer_log_prob
@@ -869,17 +782,13 @@ class MagnetWhisperEncoder(WhisperEncoder):
                     if layer_entropy is not None:
                         total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
                         entropy_layers += 1
-                    # Update the 1D attention mask for subsequent boundary predictors
                     attention_mask_1d = shortened_attention_mask_1d
-                    # Convert the shortened 1D mask to 4D for subsequent encoder layers
                     attention_mask_4d = self._convert_attention_mask_to_2d(
                         shortened_attention_mask_1d)
-                    # Update encoder's counters
                     self.total_boundaries += num_boundaries
                     self.total_positions += total_positions
-                    # Track per-layer compression ratio
                     if total_positions > 0:
-                        self.compression_ratios[idx] = num_boundaries / \
+                        self.compression_ratios[idx] = num_boundaries /
                             total_positions
                     else:
                         self.compression_ratios[idx] = 0.0
@@ -900,8 +809,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
         else:
             avg_confidence = None
 
-        # Total entropy is already summed across layers (not averaged)
-        # This gives us the total entropy of the boundary distribution
         entropy = total_entropy if entropy_layers > 0 else None
 
         if not return_dict:
@@ -922,6 +829,6 @@ class MagnetModelOutput(BaseModelOutput):
     boundary_loss: Optional[torch.FloatTensor] = None
     compression_ratios: Optional[Dict] = None
     encoder_attention_mask: Optional[torch.LongTensor] = None
-    boundary_log_probs: Optional[torch.FloatTensor] = None  # For RL policy gradient
-    boundary_confidence: Optional[torch.FloatTensor] = None  # For boundary confidence diagnostics
-    entropy: Optional[torch.FloatTensor] = None  # For entropy bonus in RL
+    boundary_log_probs: Optional[torch.FloatTensor] = None
+    boundary_confidence: Optional[torch.FloatTensor] = None
+    entropy: Optional[torch.FloatTensor] = None

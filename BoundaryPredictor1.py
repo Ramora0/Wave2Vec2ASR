@@ -123,46 +123,53 @@ class BoundaryPredictor1(nn.Module):
         hidden,
         attention_mask=None,
         target_boundary_counts=None,
-        return_log_probs=False,
-        return_unreduced_boundary_loss=False,
+        rl=False,
         return_confidence=False,
         return_entropy=False,
     ):
-        logits = self.boundary_mlp(
-            hidden).squeeze(-1)
+        logits = self.boundary_mlp(hidden).squeeze(-1)
         probs = torch.sigmoid(logits)
 
-        # if self.training:
-        bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            temperature=1,
-            probs=probs,
-        )
-        soft_boundaries = bernoulli.rsample()
-        # else:
-        #     soft_boundaries = probs
-
-        if attention_mask is not None:
-            soft_boundaries = soft_boundaries * attention_mask
-
-        hard_samples = (soft_boundaries > self.threshold).float()
+        if rl:
+            # RL mode: sample hard boundaries directly
+            bernoulli = torch.distributions.Bernoulli(probs=probs)
+            hard_samples = bernoulli.sample()
+            soft_boundaries = None  # Not used in RL mode
+        else:
+            # Supervised mode: use RelaxedBernoulli for differentiable boundaries (STE)
+            bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+                temperature=self.temp,
+                probs=probs,
+            )
+            soft_boundaries = bernoulli.rsample()
+            hard_samples = (soft_boundaries > self.threshold).float()
 
         if attention_mask is not None:
             hard_samples = hard_samples * attention_mask
+            if soft_boundaries is not None:
+                soft_boundaries = soft_boundaries * attention_mask
 
+            # Ensure the last real token is always a boundary
             pad_mask = attention_mask == 0
             if pad_mask.any():
                 first_pad_mask = pad_mask & (
                     pad_mask.long().cumsum(dim=1) == 1)
-                last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
+                last_real_mask = torch.roll(
+                    first_pad_mask, shifts=-1, dims=1)
                 last_real_mask[:, -1] = False
                 last_real_mask = last_real_mask.float()
                 hard_samples = torch.maximum(hard_samples, last_real_mask)
-                soft_boundaries = torch.maximum(
-                    soft_boundaries, last_real_mask)
+                if soft_boundaries is not None:
+                    soft_boundaries = torch.maximum(
+                        soft_boundaries, last_real_mask)
 
-        # STE: forward pass stays binary (hard_samples) while gradients flow through soft_boundaries
-        hard_boundaries = hard_samples + \
-            (soft_boundaries - soft_boundaries.detach())
+        # In supervised mode, use STE. In RL mode, use the hard samples directly.
+        if rl:
+            hard_boundaries = hard_samples
+        else:
+            # STE: forward pass stays binary (hard_samples) while gradients flow through soft_boundaries
+            hard_boundaries = hard_samples + \
+                (soft_boundaries - soft_boundaries.detach())
 
         if attention_mask is not None:
             hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
@@ -170,44 +177,11 @@ class BoundaryPredictor1(nn.Module):
         else:
             masked_hidden = hidden
 
-        # old_downsample expects boundaries (B, L) and hidden (B, L, D)
-        # downsample_with_smoothed_grad expects boundaries (B, T) and hidden (T, B, C)
-        # returns (S, B, C)
-
-        # Call old downsample (no gradients) - expects (B, L, D)
-        # pooled_old = old_downsample(
-        #     hard_boundaries, masked_hidden).to(masked_hidden.dtype)
-
-        # Call smooth downsample (with smoothed gradients) - expects (B, T) and (T, B, C)
-        # pooled_new = downsample_with_smoothed_grad(
-        #     hard_boundaries,
-        #     masked_hidden.transpose(0, 1),
-        #     smoothing_kernel_size=5)
         pooled_new = downsample(
             hard_boundaries,
             masked_hidden.transpose(0, 1))
 
-        # Use STE: values from old, gradients from new (scheduled)
         pooled = pooled_new
-
-        # Debug: Check dtypes
-        # print("old dtype:", pooled_old.dtype, "new dtype:", pooled_new.dtype)
-        # print(masked_hidden.dtype, hidden.dtype)
-
-        # Check if they give the same result (convert to same dtype for comparison)
-        # if not torch.allclose(pooled_old, pooled_new, rtol=1e-5, atol=1e-6):
-        #     max_diff = (pooled_old - pooled_new).abs().max().item()
-        #     raise RuntimeError(
-        #         f"Downsample implementations differ! Max difference: {max_diff:.6e}\n"
-        #         f"Old shape: {pooled_old.shape}, dtype: {pooled_old.dtype}\n"
-        #         f"New shape: {pooled_new.shape}, dtype: {pooled_new.dtype}"
-        #     )
-
-        # Blend between old (no grad) and new (with grad)
-        # pooled = (1.0 - DOWNSAMPLE_BLEND) * pooled_old + \
-        #     DOWNSAMPLE_BLEND * pooled_new
-
-        # transpose from (S, B, C) to (B, S, C)
         pooled = pooled.transpose(0, 1)
 
         shortened_attention_mask = None
@@ -240,36 +214,25 @@ class BoundaryPredictor1(nn.Module):
         else:
             effective_target_counts = None
 
-        # Compute loss (either reduced scalar or unreduced per-sample)
-        if return_unreduced_boundary_loss:
-            # For GRPO: return per-sample boundary losses (B,)
+        log_prob = None
+        if rl:
+            # For RL: return per-sample boundary losses (B,) and log_prob
             if effective_target_counts is not None:
                 loss = self.calc_loss_target_counts_per_item_unreduced(
                     hard_boundaries, attention_mask, effective_target_counts)
             else:
                 loss = self.calc_example_loss_unreduced(
                     hard_boundaries, attention_mask)
+            log_prob = self.compute_log_prob(
+                hard_samples, probs, attention_mask)  # (B,)
         else:
             # Normal training: return scalar loss
-            # if effective_target_counts is not None:
-            #     loss = self.calc_loss_target_counts_overall(
-            #         hard_boundaries, attention_mask, effective_target_counts)
-            # else:
             loss = self.calc_loss(num_boundaries_tensor,
                                   total_positions_tensor)
-
-        # Store the calculated loss (for backward compatibility)
-        if not return_unreduced_boundary_loss:
             self.last_loss = loss
 
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()
-
-        # Compute log probabilities for RL training (policy gradient)
-        log_prob = None
-        if return_log_probs:
-            log_prob = self.compute_log_prob(
-                hard_samples, probs, attention_mask)  # (B,)
 
         confidence = None
         if return_confidence:
@@ -418,60 +381,6 @@ class BoundaryPredictor1(nn.Module):
         )
         return 10 * per_example_loss  # (B,) - don't reduce
 
-    # ========== RL Methods (for GRPO training) ==========
-    # These methods are used only for RL training and don't affect normal training
-
-    def sample_with_log_prob(self, hidden, attention_mask=None):
-        """
-        Sample boundaries and return log probabilities for RL training.
-        This is separate from forward() to not interfere with normal training.
-
-        Args:
-            hidden: (B, L, D) hidden states
-            attention_mask: (B, L) attention mask
-
-        Returns:
-            hard_boundaries: (B, L) sampled boundaries (with STE)
-            log_probs: (B,) log probability of the sampled sequence
-        """
-        logits = self.boundary_mlp(hidden).squeeze(-1)  # (B, L)
-        probs = torch.sigmoid(logits)
-
-        # Sample from Bernoulli distribution
-        bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            temperature=self.temp,
-            probs=probs,
-        )
-        soft_boundaries = bernoulli.rsample()
-
-        if attention_mask is not None:
-            soft_boundaries = soft_boundaries * attention_mask
-
-        hard_samples = (soft_boundaries > self.threshold).float()
-
-        if attention_mask is not None:
-            hard_samples = hard_samples * attention_mask
-
-            # Ensure last real position is a boundary
-            pad_mask = attention_mask == 0
-            if pad_mask.any():
-                first_pad_mask = pad_mask & (
-                    pad_mask.long().cumsum(dim=1) == 1)
-                last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
-                last_real_mask[:, -1] = False
-                last_real_mask = last_real_mask.float()
-                hard_samples = torch.maximum(hard_samples, last_real_mask)
-
-        # Straight-through estimator
-        # STE: keep discrete values but let gradients follow the relaxed sample
-        hard_boundaries = hard_samples + \
-            (soft_boundaries - soft_boundaries.detach())
-
-        # Compute log probability of the sampled boundaries
-        # log p(boundaries) = sum_t [b_t * log(p_t) + (1-b_t) * log(1-p_t)]
-        log_probs = self.compute_log_prob(hard_samples, probs, attention_mask)
-
-        return hard_boundaries, log_probs
 
     def compute_log_prob(self, boundaries, probs=None, attention_mask=None):
         """
