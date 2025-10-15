@@ -30,7 +30,7 @@ from evaluate import load
 
 # GRPO hyperparameters
 BATCH_SIZE = 8  # Tuned for A100 (effective batch = 16 * 8 = 128 rollouts)
-NUM_SAMPLES = 8  # Number of boundary samples per audio (K) - tuned for A100
+NUM_SAMPLES = 4  # Number of boundary samples per audio (K) - tuned for A100
 CLIP_EPS = 0.2  # PPO clipping epsilon
 LEARNING_RATE = 1e-5  # Learning rate for boundary predictors
 # Learning rate for Whisper model (set to None to only train boundary predictors)
@@ -231,7 +231,7 @@ def main():
         token="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"
     )
     model.__class__ = MagnetWhisper
-    boundary_priors = [(1, 0.25)]
+    boundary_priors = [(1, 1)]
     model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
     model.to("cuda")

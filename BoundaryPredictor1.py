@@ -67,7 +67,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(+2.5)
+                self.boundary_mlp[-1].bias.fill_(2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -167,7 +167,8 @@ class BoundaryPredictor1(nn.Module):
             #         f"Difference: {(explore_probs - probs).abs().mean().item():.4f}")
             bernoulli = torch.distributions.Bernoulli(probs=explore_probs)
             hard_samples = bernoulli.sample()
-            hard_boundaries = hard_samples
+            # hard_boundaries = hard_samples
+            hard_boundaries = torch.ones_like(hard_samples)
             soft_boundaries = None  # Not used in RL mode
         else:
             # Supervised mode
@@ -212,15 +213,11 @@ class BoundaryPredictor1(nn.Module):
                     soft_boundaries = torch.maximum(
                         soft_boundaries, last_real_mask)
 
-        if attention_mask is not None:
-            hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-            masked_hidden = hidden * hidden_mask
-        else:
-            masked_hidden = hidden
-
         pooled_new = downsample(
             hard_boundaries,
-            masked_hidden.transpose(0, 1))
+            hidden.transpose(0, 1),
+            attention_mask=attention_mask
+        )
 
         pooled = pooled_new
         pooled = pooled.transpose(0, 1)
