@@ -29,10 +29,12 @@ from evaluate import load
 """
 
 # GRPO hyperparameters
-BATCH_SIZE = 16  # Tuned for A100 (effective batch = 16 * 8 = 128 rollouts)
+BATCH_SIZE = 8  # Tuned for A100 (effective batch = 16 * 8 = 128 rollouts)
 NUM_SAMPLES = 8  # Number of boundary samples per audio (K) - tuned for A100
 CLIP_EPS = 0.2  # PPO clipping epsilon
-LEARNING_RATE = 1e-4  # Lower LR for RL fine-tuning
+LEARNING_RATE = 1e-5  # Learning rate for boundary predictors
+# Learning rate for Whisper model (set to None to only train boundary predictors)
+WHISPER_LEARNING_RATE = 2e-6
 NORMALIZE_ADVANTAGES = True  # Whether to normalize advantages
 ENTROPY_BONUS_WEIGHT = 0  # Weight for entropy bonus to encourage exploration
 
@@ -210,6 +212,7 @@ def main():
             "num_samples": NUM_SAMPLES,
             "clip_eps": CLIP_EPS,
             "learning_rate": LEARNING_RATE,
+            "whisper_learning_rate": WHISPER_LEARNING_RATE,
             "normalize_advantages": NORMALIZE_ADVANTAGES,
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
@@ -219,7 +222,7 @@ def main():
 
     # Load pre-trained model
     print(f"\nLoading model...")
-    # model = MagnetWhisper.from_pretrained("./models/old-save")
+    # model = MagnetWhisper.from_pretrained("./models/12x/checkpoint-26367")
     # model.load_magnet([(3, 0.08)], "BoundaryPredictor1")
 
     # Load a brand-new model
@@ -228,7 +231,7 @@ def main():
         token="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"
     )
     model.__class__ = MagnetWhisper
-    boundary_priors = [(3, 0.08)]
+    boundary_priors = [(1, 0.25)]
     model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
     model.to("cuda")
@@ -289,10 +292,11 @@ def main():
         clip_eps=CLIP_EPS,
         learning_rate=LEARNING_RATE,
         normalize_advantages_flag=NORMALIZE_ADVANTAGES,
-        freeze_non_boundary=True,  # Only train boundary predictors
+        freeze_non_boundary=False,  # Train full model with differential learning rates
         amp_enabled=AMP_ENABLED,
         amp_dtype=AMP_DTYPE,
         entropy_bonus_weight=ENTROPY_BONUS_WEIGHT,
+        whisper_learning_rate=WHISPER_LEARNING_RATE,  # Lower LR for Whisper model
     )
 
     print(f"GRPO trainer initialized with K={NUM_SAMPLES} samples per audio")

@@ -24,9 +24,9 @@ def explore_placements(probs, confidence=5.0):
     exploration = 100.0: Minimal exploration (nearly Bernoulli)
     exploration = ∞:    Exact Bernoulli distribution
     """
-    # torch.set_printoptions(threshold=float('inf'))
-    # print(probs[0])
-    # torch.set_printoptions(threshold=10)
+    torch.set_printoptions(threshold=float('inf'))
+    print(probs[0])
+    torch.set_printoptions(threshold=10)
     original_dtype = probs.dtype
     probs_float = probs.float()
     alpha = probs_float * confidence
@@ -67,7 +67,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(-2.5)
+                self.boundary_mlp[-1].bias.fill_(+2.5)
 
     def set_prior(self, prior):
         self.prior = prior
@@ -173,12 +173,16 @@ class BoundaryPredictor1(nn.Module):
             # Supervised mode
             # if self.training:
             # Use RelaxedBernoulli for differentiable boundaries (STE) during training
-            bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-                temperature=self.temp,
-                probs=probs,
-            )
-            soft_boundaries = bernoulli.rsample()
+            # bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+            #     temperature=self.temp,
+            #     probs=probs,
+            # )
+            # soft_boundaries = bernoulli.rsample()
+            # hard_samples = (soft_boundaries > self.threshold).float()
+
+            soft_boundaries = probs
             hard_samples = (soft_boundaries > self.threshold).float()
+
             hard_boundaries = hard_samples + \
                 (soft_boundaries - soft_boundaries.detach())
             # else:
@@ -254,12 +258,15 @@ class BoundaryPredictor1(nn.Module):
         log_prob = None
         if rl:
             # For RL: return per-sample boundary losses (B,) and log_prob
-            if effective_target_counts is not None:
-                loss = self.calc_loss_target_counts_per_item_unreduced(
-                    hard_boundaries, attention_mask, effective_target_counts)
-            else:
-                loss = self.calc_example_loss_unreduced(
-                    hard_boundaries, attention_mask)
+            # if effective_target_counts is not None:
+            #     loss = self.calc_loss_target_counts_per_item_unreduced(
+            #         hard_boundaries, attention_mask, effective_target_counts)
+            # else:
+            loss = self.calc_example_loss_unreduced(
+                hard_boundaries, attention_mask)
+            # Cap loss at 1.0 for stable RL training - provides consistent gradient
+            # signal regardless of how far from target, allowing natural curriculum
+            loss = torch.clamp(loss, max=1.0)
             log_prob = self.compute_log_prob(
                 hard_samples, probs, attention_mask)  # (B,)
         else:
@@ -396,7 +403,7 @@ class BoundaryPredictor1(nn.Module):
             per_item_totals,
             target_boundary_counts,
         )
-        return 10 * loss_values  # (B,) - don't reduce
+        return loss_values  # (B,) - don't reduce
 
     def calc_example_loss_unreduced(self, hard_boundaries, attention_mask=None):
         """Return per-sample boundary losses (unreduced) for GRPO."""
@@ -416,7 +423,7 @@ class BoundaryPredictor1(nn.Module):
         per_example_loss = binomial_loss(
             per_item_boundaries, per_item_totals, scheduled_prior
         )
-        return 10 * per_example_loss  # (B,) - don't reduce
+        return per_example_loss  # (B,) - don't reduce
 
     def compute_log_prob(self, boundaries, probs=None, attention_mask=None):
         """

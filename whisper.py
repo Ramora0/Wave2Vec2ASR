@@ -340,8 +340,9 @@ COMPRESSION_SCHEDULE_STEPS = 12
 
 def compression_schedule(progress):
     """Advance compression in discrete steps during warmup, then hold at 1.0"""
-    steps = 6
-    return int(steps * progress + 1) / steps
+    # steps = 6
+    # return int(steps * progress + 1) / steps
+    return 1
 
 
 trainer.add_callback(CompressionScheduler(

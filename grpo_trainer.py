@@ -40,6 +40,7 @@ class GRPOBoundaryTrainer:
         amp_enabled=False,
         amp_dtype=torch.float16,
         entropy_bonus_weight=0.001,
+        whisper_learning_rate=None,
     ):
         """
         Args:
@@ -48,12 +49,13 @@ class GRPOBoundaryTrainer:
             clip_eps: PPO clipping epsilon
             learning_rate: Learning rate for boundary predictor
             normalize_advantages_flag: Whether to normalize advantages
-            freeze_non_boundary: If True, only train boundary predictors
+            freeze_non_boundary: If True, only train boundary predictors (ignored if whisper_learning_rate is set)
             base_batch_size: Nominal dataloader batch size (before K expansion)
             callbacks: Optional iterable of callables invoked on training events
             amp_enabled: Enable autocast mixed precision (CUDA only)
             amp_dtype: Autocast dtype to use when amp_enabled
             entropy_bonus_weight: Weight for entropy bonus in loss (default: 0.01)
+            whisper_learning_rate: Learning rate for Whisper model parameters (if None, only train boundary predictors)
         """
         self.model = model
         self.K = num_samples
@@ -64,15 +66,25 @@ class GRPOBoundaryTrainer:
         self.amp_dtype = amp_dtype if self.amp_enabled else None
         self.entropy_bonus_weight = entropy_bonus_weight
 
-        # Freeze model except boundary predictors if requested
-        if freeze_non_boundary:
+        # Determine if we should train the full model or just boundary predictors
+        train_full_model = whisper_learning_rate is not None
+
+        # Freeze model except boundary predictors if not training full model
+        if not train_full_model and freeze_non_boundary:
             self._freeze_non_boundary_params()
 
-        # Create optimizer for boundary predictors only
+        # Create optimizer with parameter groups for differential learning rates
         boundary_params = []
+        whisper_params = []
+
         for name, param in model.named_parameters():
-            if "boundary_predictors" in name and param.requires_grad:
+            if not param.requires_grad:
+                continue
+
+            if "boundary_predictors" in name:
                 boundary_params.append(param)
+            else:
+                whisper_params.append(param)
 
         if not boundary_params:
             raise ValueError(
@@ -80,7 +92,21 @@ class GRPOBoundaryTrainer:
                 "Make sure boundary predictors are initialized."
             )
 
-        self.optimizer = AdamW(boundary_params, lr=learning_rate)
+        # Build parameter groups for optimizer
+        param_groups = [
+            {"params": boundary_params, "lr": learning_rate, "name": "boundary_predictors"}
+        ]
+
+        if train_full_model and whisper_params:
+            param_groups.append(
+                {"params": whisper_params, "lr": whisper_learning_rate, "name": "whisper_model"}
+            )
+            print(f"Training full model: {len(boundary_params)} boundary params (LR={learning_rate}), "
+                  f"{len(whisper_params)} Whisper params (LR={whisper_learning_rate})")
+        else:
+            print(f"Training boundary predictors only: {len(boundary_params)} params (LR={learning_rate})")
+
+        self.optimizer = AdamW(param_groups)
         self.global_step = 0
 
         self.callbacks = list(callbacks) if callbacks else []
@@ -152,8 +178,8 @@ class GRPOBoundaryTrainer:
                 target_boundary_counts=target_boundary_counts_repeated,
                 return_unreduced_loss=True,  # Get per-sample ASR losses (K*B,)
                 boundary_rl=True,  # Enable RL mode for boundary predictors
-                return_boundary_confidence=True,  # Get confidence estimates for diagnostics
-                return_entropy=True,  # Get entropy for entropy bonus
+                return_boundary_confidence=False,  # Get confidence estimates for diagnostics
+                return_entropy=False,  # Get entropy for entropy bonus
             )
 
         # Extract log probabilities from model (summed across all boundary predictor layers)
@@ -315,6 +341,12 @@ class GRPOBoundaryTrainer:
                 "train/grad_norm": grad_norm,
                 "train/learning_rate": self.optimizer.param_groups[0]["lr"],
             }
+
+            # Log learning rates for all parameter groups
+            if len(self.optimizer.param_groups) > 1:
+                for i, param_group in enumerate(self.optimizer.param_groups):
+                    group_name = param_group.get("name", f"group_{i}")
+                    metrics[f"train/lr_{group_name}"] = param_group["lr"]
 
             if avg_confidence is not None:
                 metrics["train/boundary_confidence"] = avg_confidence
