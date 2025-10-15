@@ -151,10 +151,7 @@ class GRPOBoundaryTrainer:
                 attention_mask=attention_mask_repeated,
                 target_boundary_counts=target_boundary_counts_repeated,
                 return_unreduced_loss=True,  # Get per-sample ASR losses (K*B,)
-                # Get log probs for policy gradient (K*B,)
-                return_boundary_log_probs=True,
-                # Get per-sample boundary losses (K*B,)
-                return_unreduced_boundary_loss=True,
+                boundary_rl=True,  # Enable RL mode for boundary predictors
                 return_boundary_confidence=True,  # Get confidence estimates for diagnostics
                 return_entropy=True,  # Get entropy for entropy bonus
             )
@@ -165,6 +162,17 @@ class GRPOBoundaryTrainer:
             raise RuntimeError(
                 "Boundary log probabilities not returned; ensure return_boundary_log_probs=True")
         log_probs_all = log_probs_all.to(torch.float32)
+
+        # ---- START DEBUGGING (fp16 overflow) ----
+        if torch.isinf(log_probs_all).any() or torch.isnan(log_probs_all).any():
+            print(
+                "!!! Corrupted values detected in log_probs_all immediately after model forward pass !!!")
+            print(f"Contains inf: {torch.isinf(log_probs_all).any()}")
+            print(f"Contains NaN: {torch.isnan(log_probs_all).any()}")
+            # Optional: Stop execution to inspect
+            raise RuntimeError(
+                "Overflow detected in model forward pass, resulting in inf/nan log_probs.")
+        # ---- END DEBUGGING ----
 
         # Extract boundary loss for logging (move to CPU immediately)
         boundary_loss_all = self.model._boundary_loss
@@ -267,6 +275,15 @@ class GRPOBoundaryTrainer:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), max_norm=1.0
             ).item()
+            for name, param in self.model.named_parameters():
+                if "boundary_predictors" in name and param.grad is not None:
+                    grad_norm = param.grad.norm()
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        print(f"🚨 CORRUPTED GRADIENT: {name}")
+                        print(
+                            f"   grad min/max/norm: {param.grad.min()}/{param.grad.max()}/{grad_norm}")
+                        print(
+                            f"   param min/max: {param.data.min()}/{param.data.max()}")
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:

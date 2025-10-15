@@ -15,6 +15,30 @@ from utils import downsample
 DOWNSAMPLE_BLEND = 1.0
 
 
+def explore_placements(probs, confidence=5.0):
+    """
+    exploration: LOWER = more exploration, HIGHER = less exploration
+
+    exploration = 1.0:  Maximum exploration (very wide Beta)
+    exploration = 10.0: Moderate exploration
+    exploration = 100.0: Minimal exploration (nearly Bernoulli)
+    exploration = ∞:    Exact Bernoulli distribution
+    """
+    # torch.set_printoptions(threshold=float('inf'))
+    # print(probs[0])
+    # torch.set_printoptions(threshold=10)
+    original_dtype = probs.dtype
+    probs_float = probs.float()
+    alpha = probs_float * confidence
+    beta = (1 - probs_float) * confidence
+    # Ensure alpha and beta are > 0 for the Beta distribution
+    alpha = torch.clamp(alpha, min=1e-8)
+    beta = torch.clamp(beta, min=1e-8)
+    beta_dist = torch.distributions.Beta(alpha, beta)
+    explored_probs = beta_dist.sample()
+    return explored_probs.to(original_dtype)
+
+
 class BoundaryPredictor1(nn.Module):
     def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True):
         """
@@ -132,20 +156,40 @@ class BoundaryPredictor1(nn.Module):
 
         if rl:
             # RL mode: sample hard boundaries directly
-            bernoulli = torch.distributions.Bernoulli(probs=probs)
+            # if not self.training:
+            # Disable exploration during evaluation
+            explore_probs = probs
+            # else:
+            #     # Enable exploration during training
+            #     explore_probs = explore_placements(probs, confidence=0.1)
+            #     # Print the difference in the probabilities
+            #     print(
+            #         f"Difference: {(explore_probs - probs).abs().mean().item():.4f}")
+            bernoulli = torch.distributions.Bernoulli(probs=explore_probs)
             hard_samples = bernoulli.sample()
+            hard_boundaries = hard_samples
             soft_boundaries = None  # Not used in RL mode
         else:
-            # Supervised mode: use RelaxedBernoulli for differentiable boundaries (STE)
+            # Supervised mode
+            # if self.training:
+            # Use RelaxedBernoulli for differentiable boundaries (STE) during training
             bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
                 temperature=self.temp,
                 probs=probs,
             )
             soft_boundaries = bernoulli.rsample()
             hard_samples = (soft_boundaries > self.threshold).float()
+            hard_boundaries = hard_samples + \
+                (soft_boundaries - soft_boundaries.detach())
+            # else:
+            #     # Use standard Bernoulli during evaluation
+            #     bernoulli = torch.distributions.Bernoulli(probs=probs)
+            #     hard_samples = bernoulli.sample()
+            #     hard_boundaries = hard_samples
+            #     soft_boundaries = None
 
         if attention_mask is not None:
-            hard_samples = hard_samples * attention_mask
+            hard_boundaries = hard_boundaries * attention_mask
             if soft_boundaries is not None:
                 soft_boundaries = soft_boundaries * attention_mask
 
@@ -158,18 +202,11 @@ class BoundaryPredictor1(nn.Module):
                     first_pad_mask, shifts=-1, dims=1)
                 last_real_mask[:, -1] = False
                 last_real_mask = last_real_mask.float()
-                hard_samples = torch.maximum(hard_samples, last_real_mask)
+                hard_boundaries = torch.maximum(
+                    hard_boundaries, last_real_mask)
                 if soft_boundaries is not None:
                     soft_boundaries = torch.maximum(
                         soft_boundaries, last_real_mask)
-
-        # In supervised mode, use STE. In RL mode, use the hard samples directly.
-        if rl:
-            hard_boundaries = hard_samples
-        else:
-            # STE: forward pass stays binary (hard_samples) while gradients flow through soft_boundaries
-            hard_boundaries = hard_samples + \
-                (soft_boundaries - soft_boundaries.detach())
 
         if attention_mask is not None:
             hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
@@ -380,7 +417,6 @@ class BoundaryPredictor1(nn.Module):
             per_item_boundaries, per_item_totals, scheduled_prior
         )
         return 10 * per_example_loss  # (B,) - don't reduce
-
 
     def compute_log_prob(self, boundaries, probs=None, attention_mask=None):
         """

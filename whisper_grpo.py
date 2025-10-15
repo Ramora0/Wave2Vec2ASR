@@ -32,9 +32,9 @@ from evaluate import load
 BATCH_SIZE = 16  # Tuned for A100 (effective batch = 16 * 8 = 128 rollouts)
 NUM_SAMPLES = 8  # Number of boundary samples per audio (K) - tuned for A100
 CLIP_EPS = 0.2  # PPO clipping epsilon
-LEARNING_RATE = 1e-6  # Lower LR for RL fine-tuning
+LEARNING_RATE = 1e-4  # Lower LR for RL fine-tuning
 NORMALIZE_ADVANTAGES = True  # Whether to normalize advantages
-ENTROPY_BONUS_WEIGHT = 0.01  # Weight for entropy bonus to encourage exploration
+ENTROPY_BONUS_WEIGHT = 0  # Weight for entropy bonus to encourage exploration
 
 # Training settings
 NUM_EPOCHS = 3
@@ -43,9 +43,8 @@ EVAL_STEPS = 1500 * 16 // BATCH_SIZE
 SAVE_STEPS = 2000 * 16 // BATCH_SIZE
 
 # Model settings
-BOUNDARY_TEMP = 1  # Temperature for boundary sampling
 USE_FP16 = True
-AMP_DTYPE = torch.float16
+AMP_DTYPE = torch.float16 if USE_FP16 else torch.float32
 AMP_ENABLED = USE_FP16 and torch.cuda.is_available()
 
 # Paths
@@ -54,61 +53,52 @@ MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _set_boundary_temperature(magnet_model, temperature):
-    """Set temperature for boundary predictors."""
-    predictors = getattr(magnet_model.model.encoder, "boundary_predictors", [])
-    for predictor in predictors:
-        if hasattr(predictor, "temp"):
-            predictor.temp = temperature
-    magnet_model.boundary_temperature = temperature
+# def scale_boundary_predictor_confidence(model, scale_factor):
+#     """
+#     Scale all weights and biases in the boundary predictor MLPs by a constant factor.
+
+#     This reduces the confidence of the boundary predictors by making their logits smaller,
+#     which results in probabilities closer to 0.5 (less confident predictions).
+
+#     A scale_factor < 1.0 will reduce confidence (e.g., 0.5 halves the magnitude of outputs).
+#     A scale_factor > 1.0 will increase confidence.
+
+#     Args:
+#         model: MagnetWhisper model instance
+#         scale_factor: Factor to multiply weights and biases by (e.g., 0.5 for less confidence)
+
+#     Returns:
+#         int: Number of boundary predictors scaled
+#     """
+#     import torch.nn as nn
+
+#     predictors = model.model.encoder.boundary_predictors
+
+#     num_scaled = 0
+#     with torch.no_grad():
+#         for i, predictor in enumerate(predictors):
+#             if isinstance(predictor, nn.Identity):
+#                 continue  # Skip if no boundary predictor
+
+#             # Iterate through all layers in the MLP
+#             layer_count = 0
+#             for layer in predictor.boundary_mlp:
+#                 if isinstance(layer, nn.Linear):
+#                     # Scale weights and biases
+#                     layer.weight.mul_(scale_factor)
+#                     if layer.bias is not None:
+#                         layer.bias.mul_(scale_factor)
+#                     layer_count += 1
+
+#             print(
+#                 f"Scaled boundary predictor {i}: {layer_count} Linear layers with factor {scale_factor}")
+#             num_scaled += 1
+
+#     print(f"Total boundary predictors scaled: {num_scaled}")
+#     return num_scaled
 
 
-def scale_boundary_predictor_confidence(model, scale_factor):
-    """
-    Scale all weights and biases in the boundary predictor MLPs by a constant factor.
-
-    This reduces the confidence of the boundary predictors by making their logits smaller,
-    which results in probabilities closer to 0.5 (less confident predictions).
-
-    A scale_factor < 1.0 will reduce confidence (e.g., 0.5 halves the magnitude of outputs).
-    A scale_factor > 1.0 will increase confidence.
-
-    Args:
-        model: MagnetWhisper model instance
-        scale_factor: Factor to multiply weights and biases by (e.g., 0.5 for less confidence)
-
-    Returns:
-        int: Number of boundary predictors scaled
-    """
-    import torch.nn as nn
-
-    predictors = model.model.encoder.boundary_predictors
-
-    num_scaled = 0
-    with torch.no_grad():
-        for i, predictor in enumerate(predictors):
-            if isinstance(predictor, nn.Identity):
-                continue  # Skip if no boundary predictor
-
-            # Iterate through all layers in the MLP
-            layer_count = 0
-            for layer in predictor.boundary_mlp:
-                if isinstance(layer, nn.Linear):
-                    # Scale weights and biases
-                    layer.weight.mul_(scale_factor)
-                    if layer.bias is not None:
-                        layer.bias.mul_(scale_factor)
-                    layer_count += 1
-
-            print(
-                f"Scaled boundary predictor {i}: {layer_count} Linear layers with factor {scale_factor}")
-            num_scaled += 1
-
-    print(f"Total boundary predictors scaled: {num_scaled}")
-    return num_scaled
-
-
-def evaluate_model_batched(model, eval_dataset, processor, batch_size=128, num_samples=None, eval_temp=0.1):
+def evaluate_model_batched(model, eval_dataset, processor, batch_size=128):
     """
     Evaluate model on a dataset with batched inference.
 
@@ -126,18 +116,8 @@ def evaluate_model_batched(model, eval_dataset, processor, batch_size=128, num_s
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    # Save current temperature and set low temperature for eval
-    old_temp = model.boundary_temperature
-    _set_boundary_temperature(model, eval_temp)
-
     model.eval()
-
-    # Sample subset if requested
-    if num_samples is not None:
-        eval_subset = eval_dataset.select(
-            range(min(num_samples, len(eval_dataset))))
-    else:
-        eval_subset = eval_dataset
+    eval_subset = eval_dataset
 
     # Create dataloader
     def collate_fn(batch):
@@ -170,7 +150,7 @@ def evaluate_model_batched(model, eval_dataset, processor, batch_size=128, num_s
             attention_mask = batch["attention_mask"].to("cuda")
 
             # Generate predictions
-            with torch.cuda.amp.autocast(enabled=AMP_ENABLED, dtype=AMP_DTYPE):
+            with torch.amp.autocast(enabled=AMP_ENABLED, dtype=AMP_DTYPE, device_type="cuda"):
                 predicted_ids = model.generate(
                     input_features,
                     attention_mask=attention_mask,
@@ -183,8 +163,6 @@ def evaluate_model_batched(model, eval_dataset, processor, batch_size=128, num_s
             # Decode references
             references = []
             for label_ids in batch["labels"]:
-                # Convert to tensor and decode
-                label_tensor = torch.tensor(label_ids)
                 reference = processor.decode(
                     label_ids, skip_special_tokens=True)
                 references.append(reference)
@@ -214,10 +192,6 @@ def evaluate_model_batched(model, eval_dataset, processor, batch_size=128, num_s
         "eval/num_samples": len(all_predictions),
     }
 
-    # Restore original temperature
-    if old_temp is not None:
-        _set_boundary_temperature(model, old_temp)
-
     model.train()
     return metrics
 
@@ -239,7 +213,6 @@ def main():
             "normalize_advantages": NORMALIZE_ADVANTAGES,
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
-            "boundary_temp": BOUNDARY_TEMP,
             "entropy_bonus_weight": ENTROPY_BONUS_WEIGHT,
         }
     )
@@ -247,6 +220,9 @@ def main():
     # Load pre-trained model
     print(f"\nLoading model...")
     # model = MagnetWhisper.from_pretrained("./models/old-save")
+    # model.load_magnet([(3, 0.08)], "BoundaryPredictor1")
+
+    # Load a brand-new model
     model = WhisperForConditionalGeneration.from_pretrained(
         "openai/whisper-small",
         token="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"
@@ -254,7 +230,7 @@ def main():
     model.__class__ = MagnetWhisper
     boundary_priors = [(3, 0.08)]
     model.load_magnet(boundary_priors, "BoundaryPredictor1")
-    # model.model.encoder.boundary_predictors[2].temperature = 0
+
     model.to("cuda")
 
     # Optional torch.compile for faster training (opt-in)
@@ -266,12 +242,6 @@ def main():
             print(
                 f"torch.compile failed, continuing without it: {compile_exc}")
 
-    # Scale boundary predictor confidence to make them less confident
-    # print("\nScaling boundary predictor confidence...")
-    # scale_boundary_predictor_confidence(model, 0.3)
-
-    # Set boundary predictor temperature (target_progress always 1.0 for RL)
-    _set_boundary_temperature(model, BOUNDARY_TEMP)
     model.set_boundary_target_progress(1.0)
 
     # Configure generation
@@ -371,7 +341,6 @@ def main():
                 trainer.model,
                 dataset["validation.clean"],
                 processor,
-                num_samples=None,
             )
             log_evaluation(eval_metrics, epoch_idx=epoch,
                            step_idx=global_step, model_ref=trainer.model)
@@ -413,7 +382,7 @@ def main():
         # Evaluate on the full validation set at the end of each epoch
         print(f"\nEvaluating after epoch {epoch + 1}...")
         eval_metrics = evaluate_model_batched(
-            model, dataset["validation.clean"], processor, num_samples=None
+            model, dataset["validation.clean"], processor
         )
         log_evaluation(
             eval_metrics,
@@ -439,8 +408,7 @@ def main():
     test_metrics = evaluate_model_batched(
         model,
         dataset["test.clean"],
-        processor,
-        num_samples=None
+        processor
     )
     # Convert back to ratio for display
     test_wer = test_metrics["eval/wer"] / 100

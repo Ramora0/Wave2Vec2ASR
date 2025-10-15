@@ -308,7 +308,8 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
         # Store boundary confidence for diagnostics
         # Move to CPU immediately - only used for logging
-        self._boundary_confidence = boundary_confidence.cpu() if boundary_confidence is not None else None
+        self._boundary_confidence = boundary_confidence.cpu(
+        ) if boundary_confidence is not None else None
 
         # Store entropy for RL entropy bonus
         # Move to CPU immediately - only used for reward computation
@@ -330,7 +331,8 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 # Reshape to (batch_size, seq_length) and mean over sequence
                 batch_size = lm_logits.shape[0]
                 seq_length = lm_logits.shape[1]
-                asr_loss = asr_loss.view(batch_size, seq_length).mean(dim=1)  # (B,)
+                asr_loss = asr_loss.view(
+                    batch_size, seq_length).mean(dim=1)  # (B,)
                 # Add boundary loss (scalar) to each sample
                 loss = asr_loss + boundary_loss
             else:
@@ -616,7 +618,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
 
-        expected_seq_length = self.config.max_source_positions *
+        expected_seq_length = self.config.max_source_positions * \
             self.conv1.stride[0] * self.conv2.stride[0]
         if input_features.shape[-1] != expected_seq_length:
             raise ValueError(
@@ -673,8 +675,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 if dropout_probability < self.layerdrop:
                     to_drop = True
 
+            layer_attentions = None
             if to_drop:
-                layer_outputs = (None, None)
+                predictor_input = hidden_states
             else:
                 if self.gradient_checkpointing and self.training:
                     layer_outputs = self._gradient_checkpointing_func(
@@ -692,113 +695,115 @@ class MagnetWhisperEncoder(WhisperEncoder):
                             head_mask[idx] if head_mask is not None else None),
                         output_attentions=output_attentions,
                     )
+                predictor_input = layer_outputs[0]
+                if output_attentions:
+                    layer_attentions = layer_outputs[1]
 
-                predictor_module = self.boundary_predictors[idx]
-                if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-                    predictor_input = layer_outputs[0]
-                    target_for_predictor = None
-                    if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2)):
-                        if target_matrix is not None and target_pointer < target_matrix.size(0):
-                            target_for_predictor = target_matrix[target_pointer]
-                            target_pointer += 1
+            predictor_module = self.boundary_predictors[idx]
+            if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                target_for_predictor = None
+                if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2)):
+                    if target_matrix is not None and target_pointer < target_matrix.size(0):
+                        target_for_predictor = target_matrix[target_pointer]
+                        target_pointer += 1
 
-                        if target_for_predictor is not None:
-                            if attention_mask_1d is not None:
-                                per_item_totals = attention_mask_1d.sum(
-                                    dim=1).to(target_for_predictor.dtype)
-                            else:
-                                per_item_totals = predictor_input.new_full(
-                                    (predictor_input.size(0),),
-                                    predictor_input.size(1),
-                                ).to(target_for_predictor.dtype)
-
-                            safe_totals = per_item_totals.clamp(min=1.0)
-                            target_counts = target_for_predictor.to(
-                                per_item_totals.dtype)
-                            safe_targets = torch.where(
-                                target_counts > 0,
-                                target_counts,
-                                safe_totals,
-                            )
-
-                            compression_target = safe_totals / safe_targets
-                            compression_target = compression_target.clamp(
-                                min=1.0)
-
-                            progress_value = getattr(
-                                self, "boundary_target_progress", 1.0)
-                            progress_tensor = torch.tensor(
-                                float(progress_value),
-                                device=safe_totals.device,
-                                dtype=safe_totals.dtype,
-                            ).clamp(0.0, 1.0)
-
-                            compression_schedule = torch.lerp(
-                                torch.ones_like(compression_target),
-                                compression_target,
-                                progress_tensor,
-                            )
-                            target_for_predictor = safe_totals / compression_schedule
-
-                            target_for_predictor = torch.minimum(
-                                target_for_predictor, per_item_totals)
-                            target_for_predictor = torch.clamp(
-                                target_for_predictor, min=0.0)
-
-                        result = predictor_module(
-                            predictor_input,
-                            attention_mask_1d,
-                            target_boundary_counts=target_for_predictor,
-                            rl=boundary_rl,
-                            return_confidence=return_boundary_confidence,
-                            return_entropy=return_entropy,
-                        )
-                    else:
-                        result = predictor_module(
-                            predictor_input,
-                            attention_mask_1d,
-                            rl=boundary_rl,
-                            return_confidence=return_boundary_confidence,
-                            return_entropy=return_entropy,
-                        )
-                    if len(result) == 8:
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
-                    elif len(result) == 7:
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence = result
-                        layer_entropy = None
-                    else:
-                        final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob = result
-                        layer_confidence = None
-                        layer_entropy = None
-
-                    if layer_log_prob is not None:
-                        if total_log_probs is None:
-                            total_log_probs = layer_log_prob
+                    if target_for_predictor is not None:
+                        if attention_mask_1d is not None:
+                            per_item_totals = attention_mask_1d.sum(
+                                dim=1).to(target_for_predictor.dtype)
                         else:
-                            total_log_probs = total_log_probs + layer_log_prob
-                    if layer_confidence is not None:
-                        total_confidence = layer_confidence if total_confidence is None else total_confidence + layer_confidence
-                        confidence_layers += 1
-                    if layer_entropy is not None:
-                        total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
-                        entropy_layers += 1
-                    attention_mask_1d = shortened_attention_mask_1d
-                    attention_mask_4d = self._convert_attention_mask_to_2d(
-                        shortened_attention_mask_1d)
-                    self.total_boundaries += num_boundaries
-                    self.total_positions += total_positions
-                    if total_positions > 0:
-                        self.compression_ratios[idx] = num_boundaries /
-                            total_positions
-                    else:
-                        self.compression_ratios[idx] = 0.0
-                    boundary_loss += current_b_loss
-                    layer_outputs = (final_hs_for_layer,) + layer_outputs[1:]
+                            per_item_totals = predictor_input.new_full(
+                                (predictor_input.size(0),),
+                                predictor_input.size(1),
+                            ).to(target_for_predictor.dtype)
 
-                hidden_states = layer_outputs[0]
+                        safe_totals = per_item_totals.clamp(min=1.0)
+                        target_counts = target_for_predictor.to(
+                            per_item_totals.dtype)
+                        safe_targets = torch.where(
+                            target_counts > 0,
+                            target_counts,
+                            safe_totals,
+                        )
+
+                        compression_target = safe_totals / safe_targets
+                        compression_target = compression_target.clamp(
+                            min=1.0)
+
+                        progress_value = getattr(
+                            self, "boundary_target_progress", 1.0)
+                        progress_tensor = torch.tensor(
+                            float(progress_value),
+                            device=safe_totals.device,
+                            dtype=safe_totals.dtype,
+                        ).clamp(0.0, 1.0)
+
+                        compression_schedule = torch.lerp(
+                            torch.ones_like(compression_target),
+                            compression_target,
+                            progress_tensor,
+                        )
+                        target_for_predictor = safe_totals / compression_schedule
+
+                        target_for_predictor = torch.minimum(
+                            target_for_predictor, per_item_totals)
+                        target_for_predictor = torch.clamp(
+                            target_for_predictor, min=0.0)
+
+                    result = predictor_module(
+                        predictor_input,
+                        attention_mask_1d,
+                        target_boundary_counts=target_for_predictor,
+                        rl=boundary_rl,
+                        return_confidence=return_boundary_confidence,
+                        return_entropy=return_entropy,
+                    )
+                else:
+                    result = predictor_module(
+                        predictor_input,
+                        attention_mask_1d,
+                        rl=boundary_rl,
+                        return_confidence=return_boundary_confidence,
+                        return_entropy=return_entropy,
+                    )
+                if len(result) == 8:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
+                elif len(result) == 7:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence = result
+                    layer_entropy = None
+                else:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob = result
+                    layer_confidence = None
+                    layer_entropy = None
+
+                if layer_log_prob is not None:
+                    if total_log_probs is None:
+                        total_log_probs = layer_log_prob
+                    else:
+                        total_log_probs = total_log_probs + layer_log_prob
+                if layer_confidence is not None:
+                    total_confidence = layer_confidence if total_confidence is None else total_confidence + layer_confidence
+                    confidence_layers += 1
+                if layer_entropy is not None:
+                    total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
+                    entropy_layers += 1
+                attention_mask_1d = shortened_attention_mask_1d
+                attention_mask_4d = self._convert_attention_mask_to_2d(
+                    shortened_attention_mask_1d)
+                self.total_boundaries += num_boundaries
+                self.total_positions += total_positions
+                if total_positions > 0:
+                    self.compression_ratios[idx] = num_boundaries / \
+                        total_positions
+                else:
+                    self.compression_ratios[idx] = 0.0
+                boundary_loss += current_b_loss
+                hidden_states = final_hs_for_layer
+            else:
+                hidden_states = predictor_input
 
             if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+                all_attentions = all_attentions + (layer_attentions,)
 
         hidden_states = self.layer_norm(hidden_states)
         if output_hidden_states:

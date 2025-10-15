@@ -79,7 +79,7 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "testing"
+MODEL_NAME = "12x"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
