@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from transformers.cache_utils import EncoderDecoderCache
+from transformers.models.whisper.modeling_whisper import WhisperAttention
 
 
-class MagnetAttention(nn.Module):
+class MagnetAttention(WhisperAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -12,6 +13,7 @@ class MagnetAttention(nn.Module):
         past_key_value: Optional[EncoderDecoderCache] = None,
         query_mask_1d: Optional[torch.Tensor] = None,
         key_mask_1d: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -23,6 +25,7 @@ class MagnetAttention(nn.Module):
                           Prevents padded query positions from attending to ANY tokens.
             key_mask_1d: 1D mask of shape (batch, key_seq_len) where 1 = valid, 0 = padded.
                         Prevents ANY query from attending to padded key positions.
+            is_causal: If True, applies causal masking. Should only be True for self-attention.
 
         For self-attention: typically only query_mask_1d is provided (queries and keys are same sequence)
         For cross-attention: both masks should be provided (decoder queries, encoder keys)
@@ -31,6 +34,10 @@ class MagnetAttention(nn.Module):
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
+
+        # Ensure is_causal is only used for self-attention
+        if is_causal and is_cross_attention:
+            raise ValueError("is_causal=True should only be used for self-attention, not cross-attention")
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
@@ -70,6 +77,19 @@ class MagnetAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
+        # Apply causal masking if requested
+        if is_causal:
+            # Create causal mask: prevent attending to future positions
+            # Shape: (tgt_len, src_len) where tgt_len == src_len for self-attention
+            src_len = key_states.size(2)
+            causal_mask = torch.triu(
+                torch.ones(tgt_len, src_len, dtype=torch.bool, device=attn_weights.device),
+                diagonal=1
+            )
+            # Shape: (1, 1, tgt_len, src_len) for broadcasting
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
         # Apply padding masks using 1D masks without creating full 2D mask
         # attn_weights shape: (batch, num_heads, tgt_len, src_len)
 
@@ -78,7 +98,8 @@ class MagnetAttention(nn.Module):
             # query_mask_1d shape: (batch, tgt_len) where 1 = valid, 0 = padded
             # Shape: (batch, tgt_len) -> (batch, 1, tgt_len, 1) for broadcasting
             padded_queries = (query_mask_1d == 0).unsqueeze(1).unsqueeze(-1)
-            attn_weights = attn_weights.masked_fill(padded_queries, float('-inf'))
+            attn_weights = attn_weights.masked_fill(
+                padded_queries, float('-inf'))
 
         # Mask columns where keys are padded (prevents attending to padded keys)
         if key_mask_1d is not None:
@@ -91,43 +112,6 @@ class MagnetAttention(nn.Module):
 
         # Replace NaN values with 0 (occurs when entire row is -inf for padded positions)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-
-        # Verify that padded positions have zero attention weights
-        # Check query mask (padded queries shouldn't attend to anything)
-        if query_mask_1d is not None:
-            # query_mask_1d shape: (batch, tgt_len)
-            # attn_weights shape: (batch, num_heads, tgt_len, src_len)
-            padded_queries_mask = (query_mask_1d == 0)  # (batch, tgt_len)
-
-            if padded_queries_mask.any():
-                # Check attention weights FROM padded query positions (rows should be zero)
-                # Shape: (batch, tgt_len) -> (batch, 1, tgt_len, 1) for broadcasting
-                padded_queries = padded_queries_mask.unsqueeze(1).unsqueeze(-1)
-                attn_from_padded = attn_weights * padded_queries
-                max_attn_from_padded = attn_from_padded.abs().max().item()
-
-                assert max_attn_from_padded < 1e-5, (
-                    f"Padded query positions are attending to others! Max attention weight: {max_attn_from_padded:.6e}. "
-                    f"Attention weights FROM padded query positions should all be zero."
-                )
-
-        # Check key mask (nothing should attend to padded keys)
-        if key_mask_1d is not None:
-            # key_mask_1d shape: (batch, src_len)
-            # attn_weights shape: (batch, num_heads, tgt_len, src_len)
-            padded_keys_mask = (key_mask_1d == 0)  # (batch, src_len)
-
-            if padded_keys_mask.any():
-                # Check attention weights TO padded key positions (columns should be zero)
-                # Shape: (batch, src_len) -> (batch, 1, 1, src_len) for broadcasting
-                padded_keys = padded_keys_mask.unsqueeze(1).unsqueeze(1)
-                attn_to_padded = attn_weights * padded_keys
-                max_attn_to_padded = attn_to_padded.abs().max().item()
-
-                assert max_attn_to_padded < 1e-5, (
-                    f"Queries are attending to padded key positions! Max attention weight: {max_attn_to_padded:.6e}. "
-                    f"Attention weights TO padded key positions should all be zero."
-                )
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):

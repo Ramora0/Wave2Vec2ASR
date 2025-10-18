@@ -44,11 +44,13 @@ class MagnetDecoderLayer(nn.Module):
         # Self Attention
         # For self-attention, only block padded queries from attending
         # Don't block attending TO padded positions (key_mask_1d=None)
+        # Apply causal masking to prevent attending to future positions
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             past_key_value=past_key_value,
             query_mask_1d=decoder_attention_mask_1d,  # Block padded decoder queries
             key_mask_1d=None,  # Allow attending TO padded positions in self-attention
+            is_causal=True,  # Apply causal masking for autoregressive decoding
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
             cache_position=cache_position,
@@ -64,6 +66,7 @@ class MagnetDecoderLayer(nn.Module):
             hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
             # For cross-attention, block padded decoder queries and padded encoder keys
+            # No causal masking needed (decoder can attend to all encoder positions)
             hidden_states, cross_attn_weights, cross_attn_present_key_value = self.encoder_attn(
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,

@@ -35,9 +35,9 @@ model.__class__ = MagnetWhisper
 BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
 BOUNDARY_TARGET_PROGRESS = 1.0
-FREEZE_NON_BOUNDARY_STEPS = 250
+# FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_priors = [(3, 0.08)]
+boundary_priors = [(0, 0.08)]
 model.load_magnet(boundary_priors, "BoundaryPredictor2")
 
 
@@ -79,7 +79,7 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "hnet-12x"
+MODEL_NAME = "testing"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -251,36 +251,6 @@ class FreezeNonBoundaryCallback(TrainerCallback):
 # trainer.add_callback(FreezeNonBoundaryCallback(FREEZE_NON_BOUNDARY_STEPS))
 
 
-class GradientScheduler(TrainerCallback):
-    """Schedule the gradient contribution from downsample operation."""
-
-    def __init__(self, start_alpha=0.0, end_alpha=0.33):
-        self.start_alpha = start_alpha
-        self.end_alpha = end_alpha
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        total_steps = state.max_steps if state and state.max_steps else None
-        if not total_steps or total_steps <= 0:
-            return
-
-        # Linear schedule from start_alpha to end_alpha
-        progress = min(1.0, state.global_step / total_steps)
-        current_alpha = self.start_alpha + \
-            (self.end_alpha - self.start_alpha) * progress
-
-        # Set alpha for all boundary predictors
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        for predictor in predictors:
-            if hasattr(predictor, "set_gradient_schedule_alpha"):
-                predictor.set_gradient_schedule_alpha(current_alpha)
-
-
-# trainer.add_callback(GradientScheduler(start_alpha=0.0, end_alpha=0.1))
-
-
 class CompressionScheduler(TrainerCallback):
     """
     Schedule the compression rate during training.
@@ -329,12 +299,6 @@ class CompressionScheduler(TrainerCallback):
                 predictor.set_compression_schedule(compression_value)
 
 
-# Enable compression scheduling (uncomment to use):
-# Linear schedule (gradually increase compression from 0% to 100%):
-# trainer.add_callback(CompressionScheduler(start_value=0.0, end_value=1.0))
-
-# Warmup schedule: reach full compression at 1/3 through training, then stay there
-# Compression schedule uses discrete steps rather than a smooth ramp.
 COMPRESSION_SCHEDULE_STEPS = 12
 
 
@@ -347,101 +311,6 @@ def compression_schedule(progress):
 
 trainer.add_callback(CompressionScheduler(
     schedule_fn=compression_schedule))
-#
-# Alternative scheduling functions:
-#
-# Cosine schedule (smooth S-curve):
-# import math
-# def cosine_schedule(progress):
-#     return 0.5 * (1 - math.cos(math.pi * progress))
-# trainer.add_callback(CompressionScheduler(schedule_fn=cosine_schedule))
-#
-# Step schedule (sudden jump at 50%):
-# def step_schedule(progress):
-#     return 0.0 if progress < 0.5 else 1.0
-# trainer.add_callback(CompressionScheduler(schedule_fn=step_schedule))
-#
-# Exponential schedule (fast at first, then slow):
-# def exponential_schedule(progress):
-#     return 1.0 - math.exp(-5 * progress)
-# trainer.add_callback(CompressionScheduler(schedule_fn=exponential_schedule))
-#
-# Warmup then constant (reach full compression early):
-# def warmup_schedule(progress, warmup=0.2):
-#     if progress < warmup:
-#         return progress / warmup
-#     return 1.0
-# trainer.add_callback(CompressionScheduler(schedule_fn=warmup_schedule))
-
-
-class BoundaryScheduler(TrainerCallback):
-    """Kept for reference; scheduling is disabled by commenting out the callback."""
-
-    def __init__(self, start_temp, end_temp, start_progress, end_progress):
-        self.start_temp = start_temp
-        self.end_temp = end_temp
-        self.start_progress = start_progress
-        self.end_progress = end_progress
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        # Original scheduling logic retained for future experiments:
-        # if model is None:
-        #     return
-        # total_steps = state.max_steps if state and state.max_steps else None
-        # if not total_steps or total_steps <= 0:
-        #     return
-        # progress = min(1.0, state.global_step / total_steps)
-        # current_temp = self.start_temp + (self.end_temp - self.start_temp) * progress
-        # current_progress = self.start_progress + (self.end_progress - self.start_progress) * progress
-        # _set_boundary_temperature(model, current_temp)
-        # _set_boundary_target_progress(model, current_progress)
-        return
-
-
-# Example usage (disabled for now):
-# trainer.add_callback(
-#     BoundaryScheduler(
-#         start_temp=BOUNDARY_TEMP_START,
-#         end_temp=BOUNDARY_TEMP_END,
-#         start_progress=BOUNDARY_TARGET_PROGRESS_START,
-#         end_progress=BOUNDARY_TARGET_PROGRESS_END,
-#     )
-# )
-
-
-# class DownsampleGradScheduler(TrainerCallback):
-#     def __init__(self, warmup_steps: int):
-#         self.warmup_steps = warmup_steps
-#         self._enabled = warmup_steps <= 0
-#
-#     def _set_flag(self, model, enabled: bool):
-#         if model is None:
-#             return
-#         if hasattr(model, "set_downsample_gradients_enabled"):
-#             model.set_downsample_gradients_enabled(enabled)
-#
-#     def on_train_begin(self, args, state, control, model=None, **kwargs):
-#         if self.warmup_steps <= 0:
-#             self._enabled = True
-#             self._set_flag(model, True)
-#         else:
-#             self._enabled = False
-#             self._set_flag(model, False)
-#
-#     def on_step_begin(self, args, state, control, model=None, **kwargs):
-#         if model is None or self._enabled:
-#             return
-#         if state.global_step >= self.warmup_steps:
-#             self._set_flag(model, True)
-#             self._enabled = True
-#
-#     def on_train_end(self, args, state, control, model=None, **kwargs):
-#         if not self._enabled:
-#             self._set_flag(model, True)
-#             self._enabled = True
-
-
-# trainer.add_callback(DownsampleGradScheduler(DOWNSAMPLE_NO_GRAD_STEPS))
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):

@@ -372,11 +372,11 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 self._boundary_loss_total += boundary_loss.detach().float().mean().item()
             self._boundary_loss_steps += 1
 
-        if not return_dict:
-            # Note: This path should not be used in normal operation
-            # We always use return_dict=True with dataclass outputs
-            raise NotImplementedError(
-                "return_dict=False is not supported for MagnetWhisper")
+        # if not return_dict:
+        #     # Note: This path should not be used in normal operation
+        #     # We always use return_dict=True with dataclass outputs
+        #     raise NotImplementedError(
+        #         "return_dict=False is not supported for MagnetWhisper")
 
         return Seq2SeqLMOutput(
             loss=loss,
@@ -678,7 +678,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 len(self.layers)
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
-        boundary_loss = None
+        boundary_loss = 0
         total_log_probs = None
         total_confidence = None
         confidence_layers = 0
@@ -702,110 +702,110 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 encoder_states = encoder_states + (hidden_states,)
 
             # Run boundary predictor BEFORE the layer
-            # predictor_module = self.boundary_predictors[idx]
-            # if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-            #     predictor_input = hidden_states  # Use hidden_states as input for predictor
-            #     target_for_predictor = None
-            #     if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2)):
-            #         if target_matrix is not None and target_pointer < target_matrix.size(0):
-            #             target_for_predictor = target_matrix[target_pointer]
-            #             target_pointer += 1
+            predictor_module = self.boundary_predictors[idx]
+            if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+                predictor_input = hidden_states  # Use hidden_states as input for predictor
+                target_for_predictor = None
+                if isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2)):
+                    if target_matrix is not None and target_pointer < target_matrix.size(0):
+                        target_for_predictor = target_matrix[target_pointer]
+                        target_pointer += 1
 
-            #         if target_for_predictor is not None:
-            #             if attention_mask_1d is not None:
-            #                 per_item_totals = attention_mask_1d.sum(
-            #                     dim=1).to(target_for_predictor.dtype)
-            #             else:
-            #                 per_item_totals = predictor_input.new_full(
-            #                     (predictor_input.size(0),),
-            #                     predictor_input.size(1),
-            #                 ).to(target_for_predictor.dtype)
+                    if target_for_predictor is not None:
+                        if attention_mask_1d is not None:
+                            per_item_totals = attention_mask_1d.sum(
+                                dim=1).to(target_for_predictor.dtype)
+                        else:
+                            per_item_totals = predictor_input.new_full(
+                                (predictor_input.size(0),),
+                                predictor_input.size(1),
+                            ).to(target_for_predictor.dtype)
 
-            #             safe_totals = per_item_totals.clamp(min=1.0)
-            #             target_counts = target_for_predictor.to(
-            #                 per_item_totals.dtype)
-            #             safe_targets = torch.where(
-            #                 target_counts > 0,
-            #                 target_counts,
-            #                 safe_totals,
-            #             )
+                        safe_totals = per_item_totals.clamp(min=1.0)
+                        target_counts = target_for_predictor.to(
+                            per_item_totals.dtype)
+                        safe_targets = torch.where(
+                            target_counts > 0,
+                            target_counts,
+                            safe_totals,
+                        )
 
-            #             compression_target = safe_totals / safe_targets
-            #             compression_target = compression_target.clamp(
-            #                 min=1.0)
+                        compression_target = safe_totals / safe_targets
+                        compression_target = compression_target.clamp(
+                            min=1.0)
 
-            #             progress_value = getattr(
-            #                 self, "boundary_target_progress", 1.0)
-            #             progress_tensor = torch.tensor(
-            #                 float(progress_value),
-            #                 device=safe_totals.device,
-            #                 dtype=safe_totals.dtype,
-            #             ).clamp(0.0, 1.0)
+                        progress_value = getattr(
+                            self, "boundary_target_progress", 1.0)
+                        progress_tensor = torch.tensor(
+                            float(progress_value),
+                            device=safe_totals.device,
+                            dtype=safe_totals.dtype,
+                        ).clamp(0.0, 1.0)
 
-            #             compression_schedule = torch.lerp(
-            #                 torch.ones_like(compression_target),
-            #                 compression_target,
-            #                 progress_tensor,
-            #             )
-            #             target_for_predictor = safe_totals / compression_schedule
+                        compression_schedule = torch.lerp(
+                            torch.ones_like(compression_target),
+                            compression_target,
+                            progress_tensor,
+                        )
+                        target_for_predictor = safe_totals / compression_schedule
 
-            #             target_for_predictor = torch.minimum(
-            #                 target_for_predictor, per_item_totals)
-            #             target_for_predictor = torch.clamp(
-            #                 target_for_predictor, min=0.0)
+                        target_for_predictor = torch.minimum(
+                            target_for_predictor, per_item_totals)
+                        target_for_predictor = torch.clamp(
+                            target_for_predictor, min=0.0)
 
-            #         result = predictor_module(
-            #             predictor_input,
-            #             attention_mask_1d,
-            #             target_boundary_counts=target_for_predictor,
-            #             rl=boundary_rl,
-            #             return_confidence=return_boundary_confidence,
-            #             return_entropy=return_entropy,
-            #         )
-            #     else:
-            #         result = predictor_module(
-            #             predictor_input,
-            #             attention_mask_1d,
-            #             rl=boundary_rl,
-            #             return_confidence=return_boundary_confidence,
-            #             return_entropy=return_entropy,
-            #         )
-            #     if len(result) == 8:
-            #         final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
-            #     elif len(result) == 7:
-            #         final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence = result
-            #         layer_entropy = None
-            #     else:
-            #         final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob = result
-            #         layer_confidence = None
-            #         layer_entropy = None
+                    result = predictor_module(
+                        predictor_input,
+                        attention_mask_1d,
+                        target_boundary_counts=target_for_predictor,
+                        rl=boundary_rl,
+                        return_confidence=return_boundary_confidence,
+                        return_entropy=return_entropy,
+                    )
+                else:
+                    result = predictor_module(
+                        predictor_input,
+                        attention_mask_1d,
+                        rl=boundary_rl,
+                        return_confidence=return_boundary_confidence,
+                        return_entropy=return_entropy,
+                    )
+                if len(result) == 8:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
+                elif len(result) == 7:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence = result
+                    layer_entropy = None
+                else:
+                    final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob = result
+                    layer_confidence = None
+                    layer_entropy = None
 
-            #     if layer_log_prob is not None:
-            #         if total_log_probs is None:
-            #             total_log_probs = layer_log_prob
-            #         else:
-            #             total_log_probs = total_log_probs + layer_log_prob
-            #     if layer_confidence is not None:
-            #         total_confidence = layer_confidence if total_confidence is None else total_confidence + layer_confidence
-            #         confidence_layers += 1
-            #     if layer_entropy is not None:
-            #         total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
-            #         entropy_layers += 1
+                if layer_log_prob is not None:
+                    if total_log_probs is None:
+                        total_log_probs = layer_log_prob
+                    else:
+                        total_log_probs = total_log_probs + layer_log_prob
+                if layer_confidence is not None:
+                    total_confidence = layer_confidence if total_confidence is None else total_confidence + layer_confidence
+                    confidence_layers += 1
+                if layer_entropy is not None:
+                    total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
+                    entropy_layers += 1
 
-            #     # The output of the predictor becomes the input for the encoder layer
-            #     hidden_states = final_hs_for_layer
-            #     attention_mask_1d = shortened_attention_mask_1d
-            #     attention_mask_4d = self._convert_attention_mask_to_2d(
-            #         shortened_attention_mask_1d)
+                # The output of the predictor becomes the input for the encoder layer
+                hidden_states = final_hs_for_layer
+                attention_mask_1d = shortened_attention_mask_1d
+                # attention_mask_4d = self._convert_attention_mask_to_2d(
+                #     shortened_attention_mask_1d)
 
-            #     self.total_boundaries += num_boundaries
-            #     self.total_positions += total_positions
-            #     if total_positions > 0:
-            #         self.compression_ratios[idx] = num_boundaries / \
-            #             total_positions
-            #     else:
-            #         self.compression_ratios[idx] = 0.0
-            #     boundary_loss += current_b_loss
+                self.total_boundaries += num_boundaries
+                self.total_positions += total_positions
+                if total_positions > 0:
+                    self.compression_ratios[idx] = num_boundaries / \
+                        total_positions
+                else:
+                    self.compression_ratios[idx] = 0.0
+                boundary_loss += current_b_loss
 
             to_drop = False
             if self.training:
@@ -833,7 +833,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                         output_attentions=output_attentions,
                     )
                 hidden_states = layer_outputs[0]
-                # hidden_states = hidden_states * attention_mask_1d.unsqueeze(-1)
 
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
@@ -854,7 +853,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
             last_hidden_state=hidden_states,
             hidden_states=encoder_states,
             attentions=all_attentions,
-            # boundary_loss=boundary_loss,
+            boundary_loss=boundary_loss,
             compression_ratios=getattr(self, 'compression_ratios', {}),
             encoder_attention_mask=attention_mask_1d,
             # boundary_log_probs=total_log_probs,
