@@ -34,7 +34,7 @@ NUM_SAMPLES = 4  # Number of boundary samples per audio (K) - tuned for A100
 CLIP_EPS = 0.2  # PPO clipping epsilon
 LEARNING_RATE = 1e-5  # Learning rate for boundary predictors
 # Learning rate for Whisper model (set to None to only train boundary predictors)
-WHISPER_LEARNING_RATE = 2e-6
+WHISPER_LEARNING_RATE = None
 NORMALIZE_ADVANTAGES = True  # Whether to normalize advantages
 ENTROPY_BONUS_WEIGHT = 0  # Weight for entropy bonus to encourage exploration
 
@@ -100,7 +100,7 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 #     return num_scaled
 
 
-def evaluate_model_batched(model, eval_dataset, processor, batch_size=128):
+def evaluate_model_batched(model, eval_dataset, processor, batch_size=2):
     """
     Evaluate model on a dataset with batched inference.
 
@@ -186,11 +186,11 @@ def evaluate_model_batched(model, eval_dataset, processor, batch_size=128):
     )
 
     # Get compression ratio
-    compression_ratio = model.get_and_reset_compression_ratio()
+    # compression_ratio = model.get_and_reset_compression_ratio()
 
     metrics = {
         "eval/wer": wer * 100,
-        "eval/compression_ratio": compression_ratio,
+        # "eval/compression_ratio": compression_ratio,
         "eval/num_samples": len(all_predictions),
     }
 
@@ -207,18 +207,18 @@ def main():
     os.environ["WANDB_PROJECT"] = "glimpse-rl"
 
     # Initialize wandb
-    wandb.init(
-        config={
-            "num_samples": NUM_SAMPLES,
-            "clip_eps": CLIP_EPS,
-            "learning_rate": LEARNING_RATE,
-            "whisper_learning_rate": WHISPER_LEARNING_RATE,
-            "normalize_advantages": NORMALIZE_ADVANTAGES,
-            "num_epochs": NUM_EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "entropy_bonus_weight": ENTROPY_BONUS_WEIGHT,
-        }
-    )
+    # wandb.init(
+    #     config={
+    #         "num_samples": NUM_SAMPLES,
+    #         "clip_eps": CLIP_EPS,
+    #         "learning_rate": LEARNING_RATE,
+    #         "whisper_learning_rate": WHISPER_LEARNING_RATE,
+    #         "normalize_advantages": NORMALIZE_ADVANTAGES,
+    #         "num_epochs": NUM_EPOCHS,
+    #         "batch_size": BATCH_SIZE,
+    #         "entropy_bonus_weight": ENTROPY_BONUS_WEIGHT,
+    #     }
+    # )
 
     # Load pre-trained model
     print(f"\nLoading model...")
@@ -231,21 +231,19 @@ def main():
         token="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"
     )
     model.__class__ = MagnetWhisper
-    boundary_priors = [(1, 1)]
-    model.load_magnet(boundary_priors, "BoundaryPredictor1")
+    model.load_magnet([(1, 1)], "BoundaryPredictor1")
 
     model.to("cuda")
 
     # Optional torch.compile for faster training (opt-in)
-    if os.environ.get("USE_TORCH_COMPILE", "0") == "1":
-        try:
-            model = torch.compile(model)
-            print("Model compiled with torch.compile()")
-        except Exception as compile_exc:
-            print(
-                f"torch.compile failed, continuing without it: {compile_exc}")
+    try:
+        model = torch.compile(model)
+        print("Model compiled with torch.compile()")
+    except Exception as compile_exc:
+        print(
+            f"torch.compile failed, continuing without it: {compile_exc}")
 
-    model.set_boundary_target_progress(1.0)
+    # model.set_boundary_target_progress(1.0)
 
     # Configure generation
     model.generation_config.language = "english"
@@ -281,8 +279,41 @@ def main():
         pin_memory=True,
     )
 
+    def log_evaluation(eval_metrics, epoch_idx, step_idx, model_ref):
+        """Pretty-print and log evaluation metrics; save best checkpoints."""
+        nonlocal best_wer
+
+        print(f"  WER: {eval_metrics['eval/wer']:.2f}%")
+        # print(f"  Compression: {eval_metrics['eval/compression_ratio']:.3f}")
+        print(f"  Samples: {eval_metrics['eval/num_samples']}")
+
+        wandb.log({
+            **eval_metrics,
+            "epoch": epoch_idx,
+        }, step=step_idx)
+
+        if eval_metrics['eval/wer'] < best_wer:
+            best_wer = eval_metrics['eval/wer']
+            best_model_path = MODEL_DIR / "best"
+            print(
+                f"🎉 New best WER: {best_wer:.2f}% - Saving to {best_model_path}"
+            )
+            model_ref.save_pretrained(best_model_path)
+
     print(f"Train samples: {len(dataset['train'])}")
     print(f"Eval samples: {len(dataset['validation.clean'])}")
+
+    # Initial evaluation before training
+    print("\nRunning initial evaluation before training starts...")
+    initial_eval_metrics = evaluate_model_batched(
+        model, dataset["validation.clean"], processor
+    )
+    log_evaluation(
+        initial_eval_metrics,
+        epoch_idx=0,
+        step_idx=0,
+        model_ref=model,
+    )
 
     # Initialize GRPO trainer
     print("\nInitializing GRPO trainer...")
@@ -303,27 +334,6 @@ def main():
 
     # Tracking best validation performance across callbacks and epoch evals
     best_wer = float('inf')
-
-    def log_evaluation(eval_metrics, epoch_idx, step_idx, model_ref):
-        """Pretty-print and log evaluation metrics; save best checkpoints."""
-        nonlocal best_wer
-
-        print(f"  WER: {eval_metrics['eval/wer']:.2f}%")
-        print(f"  Compression: {eval_metrics['eval/compression_ratio']:.3f}")
-        print(f"  Samples: {eval_metrics['eval/num_samples']}")
-
-        wandb.log({
-            **eval_metrics,
-            "epoch": epoch_idx,
-        }, step=step_idx)
-
-        if eval_metrics['eval/wer'] < best_wer:
-            best_wer = eval_metrics['eval/wer']
-            best_model_path = MODEL_DIR / "best"
-            print(
-                f"🎉 New best WER: {best_wer:.2f}% - Saving to {best_model_path}"
-            )
-            model_ref.save_pretrained(best_model_path)
 
     def step_callback(event, trainer, epoch, step, global_step, metrics):
         """Run periodic evaluation and checkpointing during training."""

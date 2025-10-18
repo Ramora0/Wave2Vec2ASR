@@ -68,76 +68,6 @@ def max_pool_attention_mask(attention_mask, stride=2):
     return pooled_mask
 
 
-from typing import Any, Dict, Iterable
-
-import torch
-import torch.nn.functional as F
-
-
-def _normalize_text(text: str) -> str:
-    return text.strip().lower()
-
-
-def tokenize_batch_texts(texts: Iterable[str], tokenizer) -> Any:
-    normalized = [_normalize_text(text) for text in texts]
-    return tokenizer(normalized, padding="longest", truncation=True)
-
-
-def recover_text_from_feature(
-    feature: Dict[str, Any],
-    labels_row: torch.Tensor,
-    attention_row: torch.Tensor,
-    tokenizer,
-    decoder_start_token_id: int,
-) -> str:
-    text = feature.get("text") if isinstance(feature, dict) else None
-
-    if isinstance(text, (list, tuple)):
-        text = " ".join(map(str, text))
-    elif text is not None:
-        text = str(text)
-
-    if text is not None and text.strip():
-        return text.strip()
-
-    mask = attention_row == 1
-    valid_ids = labels_row[mask].tolist()
-
-    if valid_ids and valid_ids[0] == decoder_start_token_id:
-        valid_ids = valid_ids[1:]
-
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is not None:
-        valid_ids = [tok for tok in valid_ids if tok != pad_id]
-
-    decoded = tokenizer.decode(valid_ids, skip_special_tokens=True)
-    return decoded.strip()
-
-
-def max_pool_attention_mask(attention_mask, stride=2):
-    """
-    Max-pool attention mask with the given stride to match encoder hidden state dimensions.
-
-    Args:
-        attention_mask (torch.Tensor): Tensor of shape (batch_size, seq_length) with 1s and 0s
-        stride (int): Pooling stride, default 2
-
-    Returns:
-        torch.Tensor: Max-pooled attention mask of shape (batch_size, seq_length // stride)
-    """
-    if attention_mask is None:
-        return None
-
-    # Reshape to (batch_size, -1, stride) and apply max pooling
-    batch_size, seq_length = attention_mask.shape
-
-    # Reshape and apply max pooling
-    pooled_mask = attention_mask.view(
-        batch_size, -1, stride).any(dim=-1).float()
-
-    return pooled_mask
-
-
 def final(foo, attention_mask=None):
     """
         Input:
@@ -209,10 +139,12 @@ def downsample(boundaries, hidden, attention_mask=None):
     else:
         bar = final(foo=foo, attention_mask=attention_mask)  # B x L x S
 
-        # Cast bar to the same dtype as hidden to ensure einsum preserves dtype
-        bar = bar.to(dtype=input_dtype)
+        # Perform einsum in float32 for precision, then cast back to original dtype
+        shortened_hidden = torch.einsum(
+            'lbd,bls->sbd', hidden.float(), bar.float())
 
-        shortened_hidden = torch.einsum('lbd,bls->sbd', hidden, bar)
+        # Ensure output maintains the same dtype as input (important for FP16)
+        shortened_hidden = shortened_hidden.to(dtype=input_dtype)
 
         return shortened_hidden
 

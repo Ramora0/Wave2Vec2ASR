@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts
-from smooth_downsample import downsample_with_smoothed_grad
+from utils import downsample
 
 
 class BoundaryPredictor2(nn.Module):
@@ -73,6 +73,7 @@ class BoundaryPredictor2(nn.Module):
         return_unreduced_boundary_loss=False,
         return_confidence=False,
         return_entropy=False,
+        rl=False,
     ):
         normalized_hidden = F.normalize(hidden, dim=-1)
         batch_size = hidden.size(0)
@@ -81,7 +82,12 @@ class BoundaryPredictor2(nn.Module):
 
         cos_sim = torch.einsum("bld,bld->bl", q_hidden, k_hidden)
         probs = torch.clamp((1 - cos_sim) * 0.5, min=0.0, max=1.0)
-        probs = F.pad(probs, (1, 0), value=1.0)
+        probs = F.pad(probs, (0, 1), value=0.0)
+
+        # torch.set_printoptions(threshold=float('inf'))
+        # print(probs[0][0:torch.cumsum(
+        #     attention_mask[0], dim=0)[-1].long()])
+        # torch.set_printoptions(threshold=10)
 
         bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
             temperature=self.temp,
@@ -109,16 +115,9 @@ class BoundaryPredictor2(nn.Module):
             hard_samples - soft_boundaries.detach() + soft_boundaries
         )
 
-        # Apply attention mask to hidden before downsampling
-        if attention_mask is not None:
-            hidden_mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
-            masked_hidden = hidden * hidden_mask
-        else:
-            masked_hidden = hidden
-
         # Call downsample with smoothed gradients - expects (B, T) and (T, B, C), returns (S, B, C)
-        pooled = downsample_with_smoothed_grad(
-            hard_boundaries, masked_hidden.transpose(0, 1)
+        pooled = downsample(
+            hard_boundaries, hidden.transpose(0, 1), attention_mask=attention_mask
         )
 
         # Transpose to B x S x D
@@ -162,11 +161,11 @@ class BoundaryPredictor2(nn.Module):
         loss = self.calc_loss(num_boundaries_tensor,
                               total_positions_tensor)
 
-        if target_boundary_counts is not None:
-            if return_unreduced_boundary_loss:
-                self.last_loss = per_sample_loss.mean()
-            else:
-                self.last_loss = loss
+        # if target_boundary_counts is not None:
+        #     if return_unreduced_boundary_loss:
+        #         self.last_loss = per_sample_loss.mean()
+        #     else:
+        #         self.last_loss = loss
 
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()

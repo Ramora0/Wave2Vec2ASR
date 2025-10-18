@@ -154,6 +154,13 @@ class BoundaryPredictor1(nn.Module):
         logits = self.boundary_mlp(hidden).squeeze(-1)
         probs = torch.sigmoid(logits)
 
+        # torch.set_printoptions(threshold=float('inf'))
+        # print(probs[0])
+        # print(probs[0] > 0.5)
+        # print((probs[0] > 0.5)[0:torch.cumsum(
+        #     attention_mask[0], dim=0)[-1].long()])
+        # torch.set_printoptions(threshold=10)
+
         if rl:
             # RL mode: sample hard boundaries directly
             # if not self.training:
@@ -213,14 +220,77 @@ class BoundaryPredictor1(nn.Module):
                     soft_boundaries = torch.maximum(
                         soft_boundaries, last_real_mask)
 
-        pooled_new = downsample(
+        assert torch.all(
+            hard_boundaries == attention_mask), "hard_boundaries must equal attention_mask in RL mode"
+
+        pooled = downsample(
             hard_boundaries,
             hidden.transpose(0, 1),
             attention_mask=attention_mask
         )
 
-        pooled = pooled_new
         pooled = pooled.transpose(0, 1)
+
+        # DEBUG: Check if all-1 boundaries preserve hidden states
+        orig_hidden = hidden  # B x L x D
+        new_pooled = pooled   # B x L' x D
+
+        # Trim orig_hidden to match pooled size for comparison
+        if orig_hidden.shape[1] > new_pooled.shape[1]:
+            # Trim to the size of pooled (boundary indices should be preserved in order)
+            trimmed_hidden = orig_hidden[:, :new_pooled.shape[1], :]
+        else:
+            trimmed_hidden = orig_hidden
+
+        # Create a masked version of trimmed_hidden for a fair comparison
+        if attention_mask is not None:
+            trimmed_attention_mask = attention_mask[:, :new_pooled.shape[1]]
+            masked_hidden = trimmed_hidden * \
+                trimmed_attention_mask.unsqueeze(-1)
+        else:
+            masked_hidden = trimmed_hidden
+
+        if trimmed_hidden.shape == new_pooled.shape:
+            # Find the first time that pooled is 0 and hidden isn't
+            mismatch_mask = (new_pooled == 0) & (masked_hidden != 0)
+            mismatch_indices = mismatch_mask.nonzero(as_tuple=False)
+
+            if mismatch_indices.numel() > 0:
+                first_mismatch = mismatch_indices[0]
+                batch_idx, seq_idx, feat_idx = first_mismatch
+
+                print(
+                    f"Found mismatch: pooled is 0 where masked hidden is not, at index: batch={batch_idx}, seq={seq_idx}, feat={feat_idx}")
+
+                # Print neighbors
+                start = max(0, seq_idx - 2)
+                end = min(trimmed_hidden.shape[1], seq_idx + 3)
+
+                print(
+                    f"\n--- Neighborhood around mismatch (seq_idx={seq_idx}) ---")
+                if attention_mask is not None:
+                    print("Attention mask:")
+                    print(attention_mask[batch_idx, start:end])
+                print("Original vectors (masked_hidden):")
+                print(masked_hidden[batch_idx, start:end])
+                print("Pooled vectors (new_pooled):")
+                print(new_pooled[batch_idx, start:end])
+                print("Difference:")
+                print(
+                    (masked_hidden - new_pooled)[batch_idx, start:end])
+                print("-----------------------------------------------------")
+
+            elif not torch.allclose(masked_hidden, new_pooled, atol=1e-5):
+                diff = (masked_hidden - new_pooled).abs()
+                max_diff_val = diff.max()
+                print(
+                    f"VALUE MISMATCH (but not the 'pooled is 0' kind): max diff = {max_diff_val}")
+                print(
+                    f"Shapes: orig={masked_hidden.shape}, pooled={new_pooled.shape}")
+
+        else:
+            print(
+                f"SHAPE STILL MISMATCHED after trim: {trimmed_hidden.shape} vs {new_pooled.shape}")
 
         shortened_attention_mask = None
 
@@ -300,11 +370,13 @@ class BoundaryPredictor1(nn.Module):
             entropy = entropy_map.sum(dim=1)
 
         return (
-            pooled,
+            # masked_hidden,
+            hidden,
             loss,
             num_boundaries,
             total_positions,
-            shortened_attention_mask,
+            # shortened_attention_mask,
+            attention_mask,
             log_prob,
             confidence,
             entropy,

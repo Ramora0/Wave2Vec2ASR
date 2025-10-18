@@ -95,7 +95,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
-        return_dict=None,
         cache_position=None,
     ):
         r"""
@@ -157,8 +156,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
             output_hidden_states (`bool`, *optional*):
                 Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
                 for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
                 cache in the correct position and to infer the complete sequence length.
@@ -170,7 +167,6 @@ class MagnetWhisperDecoder(WhisperDecoder):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
@@ -313,12 +309,7 @@ class MagnetWhisperDecoder(WhisperDecoder):
             next_cache = past_key_values.self_attention_cache
         if return_legacy_cache:
             next_cache = past_key_values.to_legacy_cache()
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions]
-                if v is not None
-            )
+
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
