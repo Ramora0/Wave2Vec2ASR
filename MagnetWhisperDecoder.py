@@ -7,9 +7,17 @@ from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.integrations.flex_attention import make_flex_block_causal_mask
+from MagnetAttention import MagnetAttention
+from MagnetDecoderLayer import MagnetDecoderLayer
 
 
 class MagnetWhisperDecoder(WhisperDecoder):
+    def load_magnet(self):
+        """Convert decoder layers to use MagnetAttention for cross-attention padding support."""
+        for layer in self.layers:
+            layer.__class__ = MagnetDecoderLayer
+            layer.self_attn.__class__ = MagnetAttention
+            layer.encoder_attn.__class__ = MagnetAttention
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
     def _update_causal_mask(
         self,

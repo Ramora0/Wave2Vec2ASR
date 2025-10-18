@@ -100,7 +100,7 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 #     return num_scaled
 
 
-def evaluate_model_batched(model, eval_dataset, processor, batch_size=2):
+def evaluate_model_batched(model, eval_dataset, processor, batch_size=32):
     """
     Evaluate model on a dataset with batched inference.
 
