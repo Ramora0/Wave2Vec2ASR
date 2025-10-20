@@ -20,12 +20,21 @@ class BoundaryPredictor2(nn.Module):
         # Store target prior for scheduling (prior will be scheduled from 1.0 to target_prior)
         self.target_prior = prior
 
+        # Boundary loss weight: 0 = loss has no effect, 1 = full loss effect
+        self.boundary_loss_weight = 0.0  # Start with no boundary loss
+
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
 
         with torch.no_grad():
+            # Initialize to produce low cosine similarity (high boundary probability)
+            # q_proj = I, k_proj = -I gives cos_sim = -1.0 → prob = 1.0 (all boundaries)
+            # You can scale k_proj by a factor < 1.0 to get fewer boundaries
+            # e.g., k_proj = -0.5 * I gives cos_sim = -0.5 → prob = 0.75
             self.q_proj_layer.weight.copy_(torch.eye(input_dim))
-            self.k_proj_layer.weight.copy_(torch.eye(input_dim))
+            # Start with moderate boundaries - 0.2 gives ~60% boundary prob
+            # This allows some compression while still being permissive initially
+            self.k_proj_layer.weight.copy_(-0.5 * torch.eye(input_dim))
 
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
@@ -40,6 +49,14 @@ class BoundaryPredictor2(nn.Module):
         1.0 = max compression (only target_boundary_counts boundaries)
         """
         self.compression_schedule = float(schedule_value)
+
+    def set_boundary_loss_weight(self, weight):
+        """
+        Set the boundary loss weight (0.0 to 1.0).
+        0.0 = boundary loss has no effect on training
+        1.0 = boundary loss has full effect
+        """
+        self.boundary_loss_weight = float(weight)
 
     def get_scheduled_prior(self):
         """
@@ -219,7 +236,8 @@ class BoundaryPredictor2(nn.Module):
 
     def calc_loss(self, num_boundaries, total_positions):
         scheduled_prior = self.get_scheduled_prior()
-        return binomial_loss(num_boundaries, total_positions, scheduled_prior)
+        loss = binomial_loss(num_boundaries, total_positions, scheduled_prior)
+        return loss * self.boundary_loss_weight
 
     def calc_loss_target_counts(
         self,

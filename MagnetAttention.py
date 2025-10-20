@@ -31,13 +31,18 @@ class MagnetAttention(WhisperAttention):
         For cross-attention: both masks should be provided (decoder queries, encoder keys)
         """
 
+        # is_causal = False
+
+        # query_mask_1d = None
+
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
 
         # Ensure is_causal is only used for self-attention
         if is_causal and is_cross_attention:
-            raise ValueError("is_causal=True should only be used for self-attention, not cross-attention")
+            raise ValueError(
+                "is_causal=True should only be used for self-attention, not cross-attention")
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
@@ -83,7 +88,8 @@ class MagnetAttention(WhisperAttention):
             # Shape: (tgt_len, src_len) where tgt_len == src_len for self-attention
             src_len = key_states.size(2)
             causal_mask = torch.triu(
-                torch.ones(tgt_len, src_len, dtype=torch.bool, device=attn_weights.device),
+                torch.ones(tgt_len, src_len, dtype=torch.bool,
+                           device=attn_weights.device),
                 diagonal=1
             )
             # Shape: (1, 1, tgt_len, src_len) for broadcasting

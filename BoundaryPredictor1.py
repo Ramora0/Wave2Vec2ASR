@@ -250,47 +250,47 @@ class BoundaryPredictor1(nn.Module):
         else:
             masked_hidden = trimmed_hidden
 
-        if trimmed_hidden.shape == new_pooled.shape:
-            # Find the first time that pooled is 0 and hidden isn't
-            mismatch_mask = (new_pooled == 0) & (masked_hidden != 0)
-            mismatch_indices = mismatch_mask.nonzero(as_tuple=False)
+        # if trimmed_hidden.shape == new_pooled.shape:
+        #     # Find the first time that pooled is 0 and hidden isn't
+        #     mismatch_mask = (new_pooled == 0) & (masked_hidden != 0)
+        #     mismatch_indices = mismatch_mask.nonzero(as_tuple=False)
 
-            if mismatch_indices.numel() > 0:
-                first_mismatch = mismatch_indices[0]
-                batch_idx, seq_idx, feat_idx = first_mismatch
+        #     if mismatch_indices.numel() > 0:
+        #         first_mismatch = mismatch_indices[0]
+        #         batch_idx, seq_idx, feat_idx = first_mismatch
 
-                print(
-                    f"Found mismatch: pooled is 0 where masked hidden is not, at index: batch={batch_idx}, seq={seq_idx}, feat={feat_idx}")
+        #         print(
+        #             f"Found mismatch: pooled is 0 where masked hidden is not, at index: batch={batch_idx}, seq={seq_idx}, feat={feat_idx}")
 
-                # Print neighbors
-                start = max(0, seq_idx - 2)
-                end = min(trimmed_hidden.shape[1], seq_idx + 3)
+        #         # Print neighbors
+        #         start = max(0, seq_idx - 2)
+        #         end = min(trimmed_hidden.shape[1], seq_idx + 3)
 
-                print(
-                    f"\n--- Neighborhood around mismatch (seq_idx={seq_idx}) ---")
-                if attention_mask is not None:
-                    print("Attention mask:")
-                    print(attention_mask[batch_idx, start:end])
-                print("Original vectors (masked_hidden):")
-                print(masked_hidden[batch_idx, start:end])
-                print("Pooled vectors (new_pooled):")
-                print(new_pooled[batch_idx, start:end])
-                print("Difference:")
-                print(
-                    (masked_hidden - new_pooled)[batch_idx, start:end])
-                print("-----------------------------------------------------")
+        #         print(
+        #             f"\n--- Neighborhood around mismatch (seq_idx={seq_idx}) ---")
+        #         if attention_mask is not None:
+        #             print("Attention mask:")
+        #             print(attention_mask[batch_idx, start:end])
+        #         print("Original vectors (masked_hidden):")
+        #         print(masked_hidden[batch_idx, start:end])
+        #         print("Pooled vectors (new_pooled):")
+        #         print(new_pooled[batch_idx, start:end])
+        #         print("Difference:")
+        #         print(
+        #             (masked_hidden - new_pooled)[batch_idx, start:end])
+        #         print("-----------------------------------------------------")
 
-            elif not torch.allclose(masked_hidden, new_pooled, atol=1e-5):
-                diff = (masked_hidden - new_pooled).abs()
-                max_diff_val = diff.max()
-                print(
-                    f"VALUE MISMATCH (but not the 'pooled is 0' kind): max diff = {max_diff_val}")
-                print(
-                    f"Shapes: orig={masked_hidden.shape}, pooled={new_pooled.shape}")
+        #     elif not torch.allclose(masked_hidden, new_pooled, atol=1e-5):
+        #         diff = (masked_hidden - new_pooled).abs()
+        #         max_diff_val = diff.max()
+        #         print(
+        #             f"VALUE MISMATCH (but not the 'pooled is 0' kind): max diff = {max_diff_val}")
+        #         print(
+        #             f"Shapes: orig={masked_hidden.shape}, pooled={new_pooled.shape}")
 
-        else:
-            print(
-                f"SHAPE STILL MISMATCHED after trim: {trimmed_hidden.shape} vs {new_pooled.shape}")
+        # else:
+        #     print(
+        #         f"SHAPE STILL MISMATCHED after trim: {trimmed_hidden.shape} vs {new_pooled.shape}")
 
         shortened_attention_mask = None
 

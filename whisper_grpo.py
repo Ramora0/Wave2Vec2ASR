@@ -100,7 +100,7 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 #     return num_scaled
 
 
-def evaluate_model_batched(model, eval_dataset, processor, batch_size=64):
+def evaluate_model_batched(model, eval_dataset, processor, batch_size=128):
     """
     Evaluate model on a dataset with batched inference.
 
@@ -230,8 +230,11 @@ def main():
         "openai/whisper-small",
         token="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"
     )
+    # model = WhisperForConditionalGeneration.from_pretrained(
+    #     "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
+
     model.__class__ = MagnetWhisper
-    model.load_magnet([(1, 1)], "BoundaryPredictor1")
+    model.load_magnet([], "BoundaryPredictor1")
 
     model.to("cuda")
 

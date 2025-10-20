@@ -678,7 +678,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 len(self.layers)
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
-        boundary_loss = 0
+        boundary_loss = None
         total_log_probs = None
         total_confidence = None
         confidence_layers = 0
@@ -838,7 +838,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 all_attentions = all_attentions + (layer_outputs[1],)
 
         hidden_states = self.layer_norm(hidden_states)
-        hidden_states = hidden_states * attention_mask_1d.unsqueeze(-1)
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 

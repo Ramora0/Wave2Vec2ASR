@@ -8,7 +8,6 @@ class MagnetDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         decoder_attention_mask_1d: Optional[torch.Tensor] = None,
@@ -22,8 +21,6 @@ class MagnetDecoderLayer(nn.Module):
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`): attention mask of size
-                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             encoder_hidden_states (`torch.FloatTensor`):
                 cross attention input to the layer of shape `(batch, seq_len, embed_dim)`
             encoder_attention_mask (`torch.Tensor`): encoder attention mask - 1D (batch, encoder_seq_len)
@@ -71,7 +68,8 @@ class MagnetDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 query_mask_1d=decoder_attention_mask_1d,  # Block padded decoder queries
-                key_mask_1d=encoder_attention_mask,  # Block attending to padded encoder keys
+                # key_mask_1d=encoder_attention_mask,  # DISABLED ENCODER MASK
+                key_mask_1d=None,  # Block attending to padded encoder keys
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,

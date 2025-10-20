@@ -23,12 +23,14 @@ print("hi")
 # model = MagnetWhisper.from_pretrained("./models/old-save")
 
 # # Load the model
+# model = WhisperForConditionalGeneration.from_pretrained(
+#     "openai/whisper-small",
+#     # torch_dtype=torch.float16,
+#     token="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"
+#     # attn_implementation="flash_attention_2"
+# )
 model = WhisperForConditionalGeneration.from_pretrained(
-    "openai/whisper-small",
-    # torch_dtype=torch.float16,
-    token="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"
-    # attn_implementation="flash_attention_2"
-)
+    "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
 
 # # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
@@ -88,14 +90,14 @@ training_args = Seq2SeqTrainingArguments(
     output_dir=str(MODEL_DIR),
 
     per_device_train_batch_size=32,
-    per_device_eval_batch_size=128,
+    per_device_eval_batch_size=64,
 
     fp16=True,
     fp16_full_eval=True,
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=2e-5,
+    learning_rate=1e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,
@@ -104,8 +106,8 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     save_steps=16000,
     save_total_limit=2,
-    eval_steps=2000,
-    logging_steps=50,
+    eval_steps=4000,
+    logging_steps=100,
     report_to="wandb",
     greater_is_better=False,
     weight_decay=1e-4,
@@ -190,13 +192,18 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_target_progress is not None:
             log_payload["train/boundary_target_progress"] = boundary_target_progress
 
-        # Log scheduled_prior from boundary predictors
+        # Log scheduled_prior and boundary_loss_weight from boundary predictors
         predictors = getattr(model.model.encoder, "boundary_predictors", [])
         if predictors:
             # Log the scheduled prior value
             if hasattr(predictors[0], "get_scheduled_prior"):
                 scheduled_prior = predictors[0].get_scheduled_prior()
                 log_payload["train/scheduled_prior"] = scheduled_prior
+
+            # Log the boundary loss weight
+            if hasattr(predictors[0], "boundary_loss_weight"):
+                loss_weight = predictors[0].boundary_loss_weight
+                log_payload["train/boundary_loss_weight"] = loss_weight
 
         # downsample_grad_enabled = getattr(
         #     model, "downsample_gradients_enabled", None)
@@ -309,8 +316,51 @@ def compression_schedule(progress):
     return 1
 
 
-trainer.add_callback(CompressionScheduler(
-    schedule_fn=compression_schedule))
+# trainer.add_callback(CompressionScheduler(
+#     schedule_fn=compression_schedule))
+
+
+class BoundaryLossWeightScheduler(TrainerCallback):
+    """
+    Linearly schedule the boundary loss weight from 0 to 1 over training.
+
+    This allows the model to initially train without boundary loss constraints,
+    then gradually introduce the boundary loss penalty as training progresses.
+    """
+
+    def __init__(self, start_weight=0.0, end_weight=1.0):
+        """
+        Args:
+            start_weight: Initial boundary loss weight (default: 0.0)
+            end_weight: Final boundary loss weight (default: 1.0)
+        """
+        self.start_weight = start_weight
+        self.end_weight = end_weight
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
+
+        # Calculate training progress (0.0 to 1.0)
+        progress = min(1.0, state.global_step / total_steps)
+
+        # Linear interpolation from start_weight to end_weight
+        weight = self.start_weight + \
+            (self.end_weight - self.start_weight) * progress
+
+        # Set boundary loss weight for all boundary predictors
+        predictors = getattr(model.model.encoder, "boundary_predictors", [])
+        for predictor in predictors:
+            if hasattr(predictor, "set_boundary_loss_weight"):
+                predictor.set_boundary_loss_weight(weight)
+
+
+trainer.add_callback(BoundaryLossWeightScheduler(
+    start_weight=1.0, end_weight=1.0))
 
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):
