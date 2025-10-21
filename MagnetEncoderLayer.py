@@ -34,8 +34,7 @@ class MagnetEncoderLayer(nn.Module):
         ) if attention_mask_1d is not None else None
         hidden_states, attn_weights, _ = self.self_attn(
             hidden_states=hidden_states,
-            # query_mask_1d=attention_mask_1d,  # DISABLED ENCODER MASK
-            query_mask_1d=None,  # Only block padded queries from attending
+            query_mask_1d=attention_mask_1d,  # DISABLED ENCODER MASK
             key_mask_1d=None,  # Allow attending TO padded positions in self-attention
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,

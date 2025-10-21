@@ -127,7 +127,7 @@ def downsample(boundaries, hidden, attention_mask=None):
         Output:
             shortened_hidden: S x B x D
     """
-    boundaries = boundaries.detach()
+    # boundaries = boundaries.detach()
     # Preserve the input dtype
     input_dtype = hidden.dtype
 

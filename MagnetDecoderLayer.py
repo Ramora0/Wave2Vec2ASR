@@ -70,8 +70,7 @@ class MagnetDecoderLayer(WhisperDecoderLayer):
                 hidden_states=hidden_states,
                 key_value_states=encoder_hidden_states,
                 query_mask_1d=decoder_attention_mask_1d,  # Block padded decoder queries
-                # key_mask_1d=encoder_attention_mask,  # DISABLED ENCODER MASK
-                key_mask_1d=None,  # Block attending to padded encoder keys
+                key_mask_1d=encoder_attention_mask,  # DISABLED ENCODER MASK
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,

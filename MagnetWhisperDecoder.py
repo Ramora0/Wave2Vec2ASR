@@ -97,6 +97,7 @@ class MagnetWhisperDecoder(WhisperDecoder):
         """
         # print(
         #     f"DECODER INPUT: type(past_key_values) = {type(past_key_values)}")
+        # print(f"Cache position: {cache_position}")
 
         # if not hasattr(past_key_values.cross_attention_cache, 'key_cache'):
         #     past_key_values.cross_attention_cache.key_cache = []

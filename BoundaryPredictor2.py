@@ -26,15 +26,15 @@ class BoundaryPredictor2(nn.Module):
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
 
+        self.similarity_bias = nn.Parameter(torch.tensor(-0.126))
+
         with torch.no_grad():
-            # Initialize to produce low cosine similarity (high boundary probability)
-            # q_proj = I, k_proj = -I gives cos_sim = -1.0 → prob = 1.0 (all boundaries)
-            # You can scale k_proj by a factor < 1.0 to get fewer boundaries
-            # e.g., k_proj = -0.5 * I gives cos_sim = -0.5 → prob = 0.75
+            # Initialize with scaled identity matrices to control sensitivity
+            # When vectors are very similar: cos_sim ≈ 1.0 → prob ≈ 0.0 (no boundary)
+            # When vectors are very different: cos_sim ≈ -1.0 → prob ≈ 1.0 (boundary)
+            # This gives maximum sensitivity to changes in the hidden representations
             self.q_proj_layer.weight.copy_(torch.eye(input_dim))
-            # Start with moderate boundaries - 0.2 gives ~60% boundary prob
-            # This allows some compression while still being permissive initially
-            self.k_proj_layer.weight.copy_(-0.5 * torch.eye(input_dim))
+            self.k_proj_layer.weight.copy_(torch.eye(input_dim))
 
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
@@ -98,7 +98,8 @@ class BoundaryPredictor2(nn.Module):
         k_hidden = self.k_proj_layer(normalized_hidden[:, 1:])
 
         cos_sim = torch.einsum("bld,bld->bl", q_hidden, k_hidden)
-        probs = torch.clamp((1 - cos_sim) * 0.5, min=0.0, max=1.0)
+        probs = torch.clamp(
+            (1 - (cos_sim + self.similarity_bias)) * 0.5, min=0.0, max=1.0)
         probs = F.pad(probs, (0, 1), value=0.0)
 
         # torch.set_printoptions(threshold=float('inf'))
@@ -132,7 +133,6 @@ class BoundaryPredictor2(nn.Module):
             hard_samples - soft_boundaries.detach() + soft_boundaries
         )
 
-        # Call downsample with smoothed gradients - expects (B, T) and (T, B, C), returns (S, B, C)
         pooled = downsample(
             hard_boundaries, hidden.transpose(0, 1), attention_mask=attention_mask
         )
@@ -167,16 +167,16 @@ class BoundaryPredictor2(nn.Module):
             )
 
         # if target_boundary_counts is not None:
-        #     per_sample_loss = self.calc_loss_target_counts(
-        #         hard_boundaries,
-        #         attention_mask,
-        #         target_boundary_counts,
-        #         reduce=False,
-        #     )
-        #     loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
+        per_sample_loss = self.calc_loss_target_counts(
+            hard_boundaries,
+            attention_mask,
+            target_boundary_counts,
+            reduce=False,
+        )
+        loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
         # else:
-        loss = self.calc_loss(num_boundaries_tensor,
-                              total_positions_tensor)
+        # loss = self.calc_loss(num_boundaries_tensor,
+        #                       total_positions_tensor)
 
         # if target_boundary_counts is not None:
         #     if return_unreduced_boundary_loss:

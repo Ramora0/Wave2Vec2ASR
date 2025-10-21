@@ -31,7 +31,7 @@ class MagnetAttention(WhisperAttention):
         For self-attention: typically only query_mask_1d is provided (queries and keys are same sequence)
         For cross-attention: both masks should be provided (decoder queries, encoder keys)
         """
-        past_key_value = None
+        # past_key_value = None
 
         # print(
         #     f"ATTENTION INPUT: type(past_key_value) = {type(past_key_value)}")
@@ -96,13 +96,28 @@ class MagnetAttention(WhisperAttention):
         # Apply causal masking if requested
         if is_causal:
             # Create causal mask: prevent attending to future positions
-            # Shape: (tgt_len, src_len) where tgt_len == src_len for self-attention
             src_len = key_states.size(2)
-            causal_mask = torch.triu(
-                torch.ones(tgt_len, src_len, dtype=torch.bool,
-                           device=attn_weights.device),
-                diagonal=1
-            )
+
+            # Determine absolute positions for queries
+            if cache_position is not None:
+                # During generation: cache_position contains absolute positions of current queries
+                # Shape: (tgt_len,) -> (tgt_len, 1)
+                query_positions = cache_position.unsqueeze(-1)
+            else:
+                # During training: queries are at positions 0, 1, 2, ..., tgt_len-1
+                query_positions = torch.arange(
+                    tgt_len, device=attn_weights.device, dtype=torch.long
+                ).unsqueeze(-1)
+
+            # Key positions are always 0, 1, 2, ..., src_len-1 (accounting for cache)
+            key_positions = torch.arange(
+                src_len, device=attn_weights.device, dtype=torch.long
+            ).unsqueeze(0)
+
+            # Causal mask: query at position i can only attend to keys at positions <= i
+            # True where we should mask (key_pos > query_pos)
+            # Shape: (tgt_len, src_len)
+            causal_mask = key_positions > query_positions
             # Shape: (1, 1, tgt_len, src_len) for broadcasting
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
