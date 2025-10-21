@@ -95,7 +95,18 @@ class MagnetWhisperDecoder(WhisperDecoder):
                 Indices depicting the position of the input sequence tokens in the sequence. It is used to update the
                 cache in the correct position and to infer the complete sequence length.
         """
-        # print(super()._update_causal_mask)
+        # print(
+        #     f"DECODER INPUT: type(past_key_values) = {type(past_key_values)}")
+
+        # if not hasattr(past_key_values.cross_attention_cache, 'key_cache'):
+        #     past_key_values.cross_attention_cache.key_cache = []
+        #     past_key_values.cross_attention_cache.value_cache = []
+
+        # if not hasattr(past_key_values.self_attention_cache, 'key_cache'):
+        #     past_key_values.self_attention_cache.key_cache = []
+        #     past_key_values.self_attention_cache.value_cache = []
+
+        # print(f"Dynamic cache: {dir(past_key_values.cross_attention_cache)}")
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -119,17 +130,12 @@ class MagnetWhisperDecoder(WhisperDecoder):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        return_legacy_cache = False
-        return_self_attention_cache = False
-        if use_cache or past_key_values is not None:
-            if isinstance(past_key_values, Cache) and not isinstance(past_key_values, EncoderDecoderCache):
-                return_self_attention_cache = True
-                past_key_values = EncoderDecoderCache(
-                    past_key_values, DynamicCache())
-            elif not isinstance(past_key_values, EncoderDecoderCache):
-                return_legacy_cache = True
-                past_key_values = EncoderDecoderCache.from_legacy_cache(
-                    past_key_values)
+        if use_cache and past_key_values is not None and not isinstance(past_key_values, EncoderDecoderCache):
+            raise TypeError(
+                f"past_key_values must be of type EncoderDecoderCache, but is {type(past_key_values)}")
+
+        # print(
+        #     f"DECODER PROCESSED: type(past_key_values) = {type(past_key_values)}")
 
         past_key_values_length = 0
         if cache_position is not None:
@@ -235,10 +241,8 @@ class MagnetWhisperDecoder(WhisperDecoder):
             all_hidden_states += (hidden_states,)
 
         next_cache = past_key_values if use_cache else None
-        if return_self_attention_cache:
-            next_cache = past_key_values.self_attention_cache
-        if return_legacy_cache:
-            next_cache = past_key_values.to_legacy_cache()
+        # if return_legacy_cache:
+        #     next_cache = past_key_values.to_legacy_cache()
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,

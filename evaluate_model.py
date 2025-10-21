@@ -24,7 +24,7 @@ AMP_DTYPE = torch.float16 if USE_FP16 else torch.float32
 AMP_ENABLED = USE_FP16 and torch.cuda.is_available()
 
 # Evaluation settings
-BATCH_SIZE = 128  # Batch size for evaluation
+BATCH_SIZE = 64  # Batch size for evaluation
 EVAL_DATASET = "validation.clean"  # Options: "validation.clean", "test.clean"
 
 
@@ -231,7 +231,7 @@ def compare_encoder_hidden_states(vanilla_model, magnet_model, test_input, atten
     return are_identical, vanilla_hidden
 
 
-def compare_decoder_outputs(vanilla_model, magnet_model, encoder_hidden_states):
+def compare_decoder_outputs(vanilla_model, magnet_model, encoder_hidden_states, encoder_attention_mask=None):
     """
     Compare decoder outputs between vanilla Whisper and MagnetWhisper.
 
@@ -256,6 +256,7 @@ def compare_decoder_outputs(vanilla_model, magnet_model, encoder_hidden_states):
         vanilla_decoder_outputs = vanilla_model.model.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
         )
         vanilla_hidden = vanilla_decoder_outputs.last_hidden_state
 
@@ -263,6 +264,7 @@ def compare_decoder_outputs(vanilla_model, magnet_model, encoder_hidden_states):
         magnet_decoder_outputs = magnet_model.model.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
         )
         magnet_hidden = magnet_decoder_outputs.last_hidden_state
 
@@ -316,22 +318,22 @@ def main():
         model.generation_config.task = "transcribe"
         model.generation_config.forced_decoder_ids = None
 
-    print(
-        f"\nVanilla model parameters: {sum(p.numel() for p in vanilla_model.parameters()) / 1e6:.1f}M")
+    # print(
+    #     f"\nVanilla model parameters: {sum(p.numel() for p in vanilla_model.parameters()) / 1e6:.1f}M")
     print(
         f"MagnetWhisper parameters: {sum(p.numel() for p in magnet_model.parameters()) / 1e6:.1f}M")
 
     # ============= Load Data =============
     print(f"\nLoading LibriSpeech data...")
     data_module = create_librispeech_data_module(
-        vanilla_model.config.decoder_start_token_id
+        magnet_model.config.decoder_start_token_id
     )
     dataset = data_module.dataset
     processor = data_module.processor
 
     # ============= Test on a Single Sample =============
     print("\n" + "=" * 60)
-    print("Testing Encoder Hidden States on Sample Input")
+    print("Testing Encoder/Decoder Parity on Sample Input")
     print("=" * 60)
 
     # Get a test sample
@@ -352,15 +354,43 @@ def main():
     )
 
     # ============= Compare Decoder Outputs =============
-    if are_encoders_identical:
-        print("\n" + "=" * 60)
-        print("Testing Decoder Outputs on Sample Input")
-        print("=" * 60)
-        compare_decoder_outputs(
-            vanilla_model,
-            magnet_model,
-            vanilla_encoder_hidden_states
-        )
+    print("\n" + "-" * 60)
+    print("Checking decoder outputs match (single step)")
+    print("-" * 60)
+    dec_equal = compare_decoder_outputs(
+        vanilla_model,
+        magnet_model,
+        vanilla_encoder_hidden_states,
+        encoder_attention_mask=test_mask,
+    )
+
+    # ============= Short Generation Parity =============
+    print("\n" + "-" * 60)
+    print("Checking short generation parity (couple steps)")
+    print("-" * 60)
+    gen_kwargs = dict(
+        attention_mask=test_mask,
+        max_new_tokens=3,
+        num_beams=1,
+        do_sample=False,
+        eos_token_id=vanilla_model.config.eos_token_id,
+        pad_token_id=vanilla_model.config.pad_token_id,
+    )
+    with torch.no_grad():
+        vanilla_gen = vanilla_model.generate(test_input, **gen_kwargs)
+        magnet_gen = magnet_model.generate(test_input, **gen_kwargs)
+
+    # Compare generated token IDs
+    if vanilla_gen.shape == magnet_gen.shape and torch.equal(vanilla_gen, magnet_gen):
+        print("✓ Short generation token IDs are IDENTICAL")
+    else:
+        print("✗ Short generation token IDs are DIFFERENT")
+        print(f"Vanilla IDs: {vanilla_gen.tolist()}")
+        print(f"Magnet  IDs: {magnet_gen.tolist()}")
+
+    # If either encoder or decoder mismatched, warn clearly
+    if not are_encoders_identical or not dec_equal:
+        print("! WARNING: Encoder/Decoder parity check failed. Proceed with caution.")
 
     # ============= Unload Vanilla Model to Save Memory =============
     print("\n" + "=" * 60)
@@ -372,31 +402,25 @@ def main():
     print("✓ Vanilla model unloaded")
 
     # ============= Full Evaluation =============
-    if are_encoders_identical:
-        print("\n" + "=" * 60)
-        print("Encoder states match! Running full WER evaluation...")
-        print("=" * 60)
+    print("\n" + "=" * 60)
+    print("Encoder states match! Running full WER evaluation...")
+    print("=" * 60)
 
-        print(f"\nEvaluating MagnetWhisper...")
-        magnet_metrics = evaluate_model_batched(
-            magnet_model,
-            dataset[EVAL_DATASET],
-            processor,
-            batch_size=BATCH_SIZE
-        )
+    print(f"\nEvaluating MagnetWhisper...")
+    magnet_metrics = evaluate_model_batched(
+        magnet_model,
+        dataset[EVAL_DATASET],
+        processor,
+        batch_size=BATCH_SIZE
+    )
 
-        # ============= Report Results =============
-        print("\n" + "=" * 60)
-        print("EVALUATION RESULTS")
-        print("=" * 60)
-        print(f"MagnetWhisper WER:       {magnet_metrics['wer']:.2f}%")
-        print(f"Samples evaluated:       {magnet_metrics['num_samples']}")
-        print("=" * 60)
-    else:
-        print("\n" + "=" * 60)
-        print("WARNING: Encoder states differ!")
-        print("Skipping full evaluation - fix encoder first.")
-        print("=" * 60)
+    # ============= Report Results =============
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+    print(f"MagnetWhisper WER:       {magnet_metrics['wer']:.2f}%")
+    print(f"Samples evaluated:       {magnet_metrics['num_samples']}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

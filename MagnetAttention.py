@@ -3,6 +3,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from transformers.cache_utils import EncoderDecoderCache
 from transformers.models.whisper.modeling_whisper import WhisperAttention
+import inspect
 
 
 class MagnetAttention(WhisperAttention):
@@ -30,10 +31,10 @@ class MagnetAttention(WhisperAttention):
         For self-attention: typically only query_mask_1d is provided (queries and keys are same sequence)
         For cross-attention: both masks should be provided (decoder queries, encoder keys)
         """
+        past_key_value = None
 
-        # is_causal = False
-
-        # query_mask_1d = None
+        # print(
+        #     f"ATTENTION INPUT: type(past_key_value) = {type(past_key_value)}")
 
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
@@ -60,11 +61,21 @@ class MagnetAttention(WhisperAttention):
             else:
                 past_key_value = past_key_value.self_attention_cache
 
+            # print(
+            #     f"ATTENTION INNER CACHE: type(inner_cache) = {type(past_key_value)}")
+
         # use key_value_states if cross attention
         current_states = key_value_states if key_value_states is not None else hidden_states
+        # print(
+        #     f"ATTENTION PROCESSING: is_cross_attention={is_cross_attention}, is_updated={is_updated if past_key_value else None}")
         if is_cross_attention and past_key_value and is_updated:
+            # if not hasattr(past_key_value, 'key_cache'):
+            #     raise TypeError(
+            #         f"past_key_value is of type {type(past_key_value)} and does not have key_cache attribute. Attributes: {dir(past_key_value)}")
             # reuse k,v, cross_attentions
-            key_states, value_states = past_key_value[self.layer_idx]
+            layer_cache = past_key_value.layers[self.layer_idx]
+            key_states = layer_cache.keys
+            value_states = layer_cache.values
         else:
             key_states = self.k_proj(current_states).view(
                 bsz, -1, self.num_heads, self.head_dim)

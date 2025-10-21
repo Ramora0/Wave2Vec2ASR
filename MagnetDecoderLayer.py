@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 from typing import Optional
 from transformers.cache_utils import EncoderDecoderCache
+from transformers.models.whisper.modeling_whisper import WhisperDecoderLayer
 
 
-class MagnetDecoderLayer(nn.Module):
+class MagnetDecoderLayer(WhisperDecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -18,6 +19,7 @@ class MagnetDecoderLayer(nn.Module):
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
+        # print(f"LAYER INPUT: type(past_key_value) = {type(past_key_value)}")
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -79,7 +81,8 @@ class MagnetDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
 
             # add cross-attn to positions 1 of present_key_value tuple
-            present_key_value = (present_key_value, cross_attn_present_key_value)
+            present_key_value = (
+                present_key_value, cross_attn_present_key_value)
 
         # Fully Connected
         residual = hidden_states
