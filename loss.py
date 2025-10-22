@@ -61,6 +61,85 @@ def binomial_loss_from_target_counts(num_boundaries, total_positions, target_cou
     return loss / clamped_totals
 
 
+def binomial_loss_from_target_counts_flexible(
+    boundaries,
+    attention_mask,
+    target_counts,
+    eps=1e-6
+):
+    """
+    Binomial loss that works with both soft and hard boundaries.
+
+    Args:
+        boundaries: Either soft boundaries (continuous values 0-1) or hard boundaries (discrete 0/1)
+                   Shape: (batch_size, seq_len)
+        attention_mask: Mask indicating valid positions. Shape: (batch_size, seq_len)
+        target_counts: Target number of boundaries per sequence. Shape: (batch_size,)
+        eps: Small value to prevent numerical issues
+
+    Returns:
+        torch.Tensor: Per-sample loss values. Shape: (batch_size,)
+    """
+    if not isinstance(boundaries, torch.Tensor):
+        raise ValueError("boundaries must be a tensor")
+
+    device = boundaries.device
+    boundaries = boundaries.to(dtype=torch.float32)
+    target_counts = _to_device_tensor(
+        target_counts, device, dtype=torch.float32)
+
+    # Calculate expected number of boundaries per sample
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(dtype=torch.float32)
+        # Sum boundaries only over valid positions
+        expected_boundaries = (boundaries * attention_mask).sum(dim=1)
+        # Count total valid positions per sample
+        total_positions = attention_mask.sum(dim=1)
+    else:
+        # No masking - use all positions
+        expected_boundaries = boundaries.sum(dim=1)
+        total_positions = torch.full(
+            (boundaries.size(0),),
+            boundaries.size(1),
+            device=device,
+            dtype=torch.float32
+        )
+
+    # Clamp to avoid numerical issues
+    clamped_totals = total_positions.clamp(min=1.0)
+    clamped_targets = torch.minimum(target_counts, clamped_totals)
+    target_probs = (clamped_targets /
+                    clamped_totals).clamp(min=eps, max=1 - eps)
+
+    # For soft boundaries, we compute the expected negative log-likelihood
+    # under the binomial distribution using the continuous relaxation
+
+    # The binomial log-likelihood for count k out of n trials with probability p is:
+    # log P(k|n,p) = log(n choose k) + k*log(p) + (n-k)*log(1-p)
+    #
+    # For soft boundaries, we replace the discrete count k with the expected count
+    # and compute the expected log-likelihood. The binomial coefficient term is constant
+    # for a given n and target, so we can ignore it for optimization purposes.
+
+    # Expected log-likelihood terms:
+    # E[k * log(p)] = expected_boundaries * log(target_probs)
+    # E[(n-k) * log(1-p)] = (total_positions - expected_boundaries) * log(1 - target_probs)
+
+    log_target_probs = torch.log(target_probs.clamp(min=eps))
+    log_one_minus_target_probs = torch.log((1 - target_probs).clamp(min=eps))
+
+    # Expected negative log-likelihood (we want to minimize this)
+    loss = -(
+        expected_boundaries * log_target_probs +
+        (clamped_totals - expected_boundaries) * log_one_minus_target_probs
+    )
+
+    # Normalize by total positions for scale consistency
+    loss = loss / clamped_totals
+
+    return loss
+
+
 def hinge_loss(num_boundaries, total_positions, prior_mean, prior_std, s_bound=3.0):
     """
     Compute hinge loss for boundary predictions centered at prior_mean.

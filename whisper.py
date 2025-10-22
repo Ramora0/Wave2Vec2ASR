@@ -81,7 +81,7 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "testing"
+MODEL_NAME = "hnet-0-test"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,7 +89,7 @@ training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=32,
+    per_device_train_batch_size=64,
     per_device_eval_batch_size=64,
 
     fp16=True,
@@ -97,7 +97,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=1e-5,
+    learning_rate=5e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=3,
@@ -106,7 +106,7 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     save_steps=16000,
     save_total_limit=2,
-    eval_steps=4000,
+    eval_steps=2000,
     logging_steps=100,
     report_to="wandb",
     greater_is_better=False,

@@ -1,7 +1,45 @@
+import math
 from typing import Any, Dict, Iterable
 
 import torch
 import torch.nn.functional as F
+
+
+def remove_positional_embeddings(hidden_states: torch.Tensor, embed_positions: torch.nn.Embedding) -> torch.Tensor:
+    """
+    Remove positional embeddings from hidden states by zeroing them out using vector math.
+
+    Args:
+        hidden_states (torch.Tensor): Tensor of shape (batch_size, seq_len, hidden_dim)
+        embed_positions (torch.nn.Embedding): Positional embedding layer
+    Returns:
+        torch.Tensor: Hidden states with positional embeddings zeroed out
+    """
+    seq_len = hidden_states.size(1)
+    device = hidden_states.device
+
+    # Generate positional embeddings for the sequence length
+    pos_indices = torch.arange(seq_len, device=device).unsqueeze(
+        0)  # Shape: (1, seq_len)
+    pos_emb = embed_positions(pos_indices)  # Shape: (1, seq_len, hidden_dim)
+
+    # Zero out positional embeddings using vector math
+    # Create a mask that identifies positional embedding components and zero them out
+    # Normalize positional embeddings
+    pos_emb_normalized = F.normalize(pos_emb, p=2, dim=-1)
+    hidden_normalized = F.normalize(
+        hidden_states, p=2, dim=-1)  # Normalize hidden states
+
+    # Compute dot product to find alignment with positional embeddings
+    # Shape: (batch_size, seq_len, 1)
+    alignment = torch.sum(hidden_normalized *
+                          pos_emb_normalized, dim=-1, keepdim=True)
+
+    # Create orthogonal component by removing the positional embedding direction
+    hidden_states_no_pos = hidden_states - alignment * pos_emb_normalized * \
+        torch.norm(hidden_states, p=2, dim=-1, keepdim=True)
+
+    return hidden_states_no_pos
 
 
 def _normalize_text(text: str) -> str:
@@ -127,7 +165,7 @@ def downsample(boundaries, hidden, attention_mask=None):
         Output:
             shortened_hidden: S x B x D
     """
-    # boundaries = boundaries.detach()
+    boundaries = boundaries.detach()
     # Preserve the input dtype
     input_dtype = hidden.dtype
 
@@ -288,3 +326,29 @@ def cross_attention_downsample(boundaries, hidden, cross_attn_query, cross_attn_
         pooled = hidden
 
     return pooled
+
+
+def get_sinusoidal_positional_embeddings(x):
+    """
+    Generates sinusoidal positional embeddings.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
+
+    Returns:
+        torch.Tensor: Positional embeddings of shape (1, seq_len, d_model)
+    """
+    seq_len = x.shape[1]
+    d_model = x.shape[2]
+    device = x.device
+
+    position = torch.arange(seq_len, dtype=torch.float,
+                            device=device).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, d_model, 2).float()
+                         * -(math.log(10000.0) / d_model)).to(device)
+
+    pos_emb = torch.zeros(seq_len, d_model, device=device)
+    pos_emb[:, 0::2] = torch.sin(position * div_term)
+    pos_emb[:, 1::2] = torch.cos(position * div_term)
+
+    return pos_emb.unsqueeze(0)

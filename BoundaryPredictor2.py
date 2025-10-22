@@ -3,16 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from loss import binomial_loss, binomial_loss_from_target_counts
+from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible
 from utils import downsample
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, max_positions=1500):
         super().__init__()
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
+        self.embed_positions = nn.Embedding(max_positions, input_dim)
 
         # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
         self.compression_schedule = 1.0  # Start at max compression by default
@@ -81,6 +82,12 @@ class BoundaryPredictor2(nn.Module):
         scheduled_prior = target / (target + schedule * (1.0 - target))
         return scheduled_prior
 
+    def _add_positional_embeddings(self, x):
+        seq_len = x.shape[1]
+        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        pos_embeds = self.embed_positions(position_ids)
+        return x + pos_embeds
+
     def forward(
         self,
         hidden,
@@ -140,6 +147,8 @@ class BoundaryPredictor2(nn.Module):
         # Transpose to B x S x D
         pooled = pooled.transpose(0, 1)
 
+        pooled = self._add_positional_embeddings(pooled)
+
         shortened_attention_mask = None
         if attention_mask is not None:
             keep_mask = hard_boundaries == 1
@@ -166,18 +175,37 @@ class BoundaryPredictor2(nn.Module):
                 dtype=torch.float,
             )
 
-        # if target_boundary_counts is not None:
-        per_sample_loss = self.calc_loss_target_counts(
-            hard_boundaries,
-            attention_mask,
-            target_boundary_counts,
-            reduce=False,
-        )
-        loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
-        # else:
-        # loss = self.calc_loss(num_boundaries_tensor,
-        #                       total_positions_tensor)
+        # The following commented-out block seems to be a remnant of a previous implementation
+        # or an alternative approach. It's not directly related to the current loss calculation.
+        if self.training:
+            # if target_boundary_counts is not None:
+            per_sample_loss = 10. * self.calc_loss_target_counts(
+                hard_boundaries,
+                attention_mask,
+                target_boundary_counts,
+                reduce=False,
+            )
+            #     per_sample_loss = self.calc_loss_target_counts_flexible(
+            #         soft_boundaries,
+            #         attention_mask,
+            #         target_boundary_counts,
+            #         reduce=False,
+            #     )
+            # else:
+            # This is the current loss calculation path when target_boundary_counts is None
+            # per_sample_loss = 10 * self.calc_example_loss(
+            #     hard_boundaries,
+            #     attention_mask,
+            #     reduce=False
+            # )
+            loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
+        else:
+            # Don't calculate loss during evaluation
+            loss = torch.tensor(0.0, device=hidden.device)
+            if return_unreduced_boundary_loss:
+                loss = loss.repeat(batch_size)
 
+        # This block also seems related to the commented-out section above and might be vestigial.
         # if target_boundary_counts is not None:
         #     if return_unreduced_boundary_loss:
         #         self.last_loss = per_sample_loss.mean()
@@ -238,6 +266,70 @@ class BoundaryPredictor2(nn.Module):
         scheduled_prior = self.get_scheduled_prior()
         loss = binomial_loss(num_boundaries, total_positions, scheduled_prior)
         return loss * self.boundary_loss_weight
+
+    def calc_example_loss(self, hard_boundaries, attention_mask, reduce=True):
+        """Calculates binomial loss per example using the scheduled prior."""
+        per_item_boundaries = hard_boundaries.sum(dim=1)
+        if attention_mask is not None:
+            per_item_totals = attention_mask.sum(dim=1)
+        else:
+            per_item_totals = torch.full_like(
+                per_item_boundaries, hard_boundaries.size(1), dtype=torch.float)
+
+        scheduled_prior = self.get_scheduled_prior()
+
+        # Re-implementing binomial_loss logic here to control reduction
+        device = per_item_boundaries.device
+        prior_tensor = torch.tensor(
+            scheduled_prior, device=device, dtype=torch.float32)
+
+        total_positions_tensor = per_item_totals.to(
+            device=device, dtype=torch.float32)
+        num_boundaries_tensor = per_item_boundaries.to(
+            device=device, dtype=torch.float32)
+
+        binomial_dist = torch.distributions.binomial.Binomial(
+            total_positions_tensor,
+            probs=prior_tensor
+        )
+
+        loss_values = -binomial_dist.log_prob(num_boundaries_tensor)
+        normalized_loss = loss_values / total_positions_tensor.clamp(min=1.0)
+
+        per_example_loss = normalized_loss * self.boundary_loss_weight
+
+        if reduce:
+            return per_example_loss.mean()
+        return per_example_loss
+
+    def calc_loss_target_counts_flexible(
+        self,
+        boundaries,
+        attention_mask,
+        target_boundary_counts,
+        reduce=True,
+    ):
+        """
+        Calculate loss using either soft or hard boundaries.
+
+        Args:
+            boundaries: Either soft boundaries (continuous 0-1) or hard boundaries (discrete 0/1)
+            attention_mask: Mask for valid positions
+            target_boundary_counts: Target number of boundaries per sequence
+            reduce: Whether to reduce the loss to a scalar
+
+        Returns:
+            Loss tensor (scalar if reduce=True, per-sample if reduce=False)
+        """
+        loss_values = binomial_loss_from_target_counts_flexible(
+            boundaries,
+            attention_mask,
+            target_boundary_counts,
+        )
+
+        if reduce:
+            return loss_values.mean()
+        return loss_values
 
     def calc_loss_target_counts(
         self,

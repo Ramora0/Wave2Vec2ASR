@@ -10,7 +10,7 @@ from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
 from MagnetAttention import MagnetAttention
 from MagnetEncoderLayer import MagnetEncoderLayer
-from utils import max_pool_attention_mask
+from utils import max_pool_attention_mask, remove_positional_embeddings
 
 
 @dataclass
@@ -83,6 +83,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
         return_boundary_confidence,
         return_entropy,
     ):
+        # hidden_states = remove_positional_embeddings(
+        #     hidden_states, self.embed_positions)
+
         predictor_module = self.boundary_predictors[idx]
         if not isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
             return hidden_states, attention_mask_1d, 0.0, None, None, None, target_pointer
@@ -174,7 +177,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 total_positions
         else:
             self.compression_ratios[idx] = 0.0
-        
+
         return hidden_states, attention_mask_1d, current_b_loss, layer_log_prob, layer_confidence, layer_entropy, target_pointer
 
     def forward(
@@ -220,8 +223,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
-        embed_pos = self.embed_positions.weight
-        hidden_states = inputs_embeds + embed_pos
+        # embed_pos = self.embed_positions.weight
+        # hidden_states = inputs_embeds + embed_pos
+        hidden_states = inputs_embeds
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
 
