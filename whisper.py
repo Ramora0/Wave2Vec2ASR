@@ -362,6 +362,34 @@ class BoundaryLossWeightScheduler(TrainerCallback):
 trainer.add_callback(BoundaryLossWeightScheduler(
     start_weight=1.0, end_weight=1.0))
 
+
+class TemperatureScheduler(TrainerCallback):
+    """
+    Linearly schedule the temperature from a start to an end value over training.
+    """
+
+    def __init__(self, start_temp=1.0, end_temp=0.0):
+        self.start_temp = start_temp
+        self.end_temp = end_temp
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
+
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
+
+        progress = min(1.0, state.global_step / total_steps)
+        temperature = self.start_temp + \
+            (self.end_temp - self.start_temp) * progress
+
+        _set_boundary_temperature(model, temperature)
+
+
+# trainer.add_callback(TemperatureScheduler(start_temp=1.0, end_temp=0.0))
+
+
 # class EvaluateFirstStepCallback(TrainerCallback):
 #     def on_step_begin(self, args, state, control, **kwargs):
 #         if state.global_step == 1:

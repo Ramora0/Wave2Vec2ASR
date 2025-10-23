@@ -40,17 +40,21 @@ def explore_placements(probs, confidence=5.0):
 
 
 class BoundaryPredictor1(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True, window_size=8):
         """
         input_dim: dimensionality of per-token vectors (D)
         hidden_dim: hidden size of the MLP
         tau: Gumbel-Sigmoid temperature
+        window_size: number of neighboring positions to look at on each side
+                     (with exponential feature reduction: position n uses 1/2^n features)
         """
         super().__init__()
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
         self.gradient_schedule_alpha = 0.0  # Start with no gradients from downsample
+        self.window_size = window_size
+        self.input_dim = input_dim
 
         # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
         self.compression_schedule = 1.0  # Start at max compression by default
@@ -58,11 +62,16 @@ class BoundaryPredictor1(nn.Module):
         # Store target prior for scheduling (prior will be scheduled from 1.0 to target_prior)
         self.target_prior = prior
 
+        # Calculate MLP input dimension based on window size
+        # For each neighbor n positions away (1 to window_size), use 1/2^n of features
+        # Total: D + 2 * sum(D / 2^n for n in 1 to W)
+        mlp_input_dim = self._compute_mlp_input_dim(input_dim, window_size)
+
         hidden = hidden_dim
         self.dropout = nn.Dropout(p=0.1)
-        # MLP now receives: [left_half, current_full, right_half] = 2*input_dim
+        # MLP receives concatenated context with exponential feature reduction
         self.boundary_mlp = nn.Sequential(
-            nn.Linear(2 * input_dim, hidden),
+            nn.Linear(mlp_input_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1)
         )
@@ -70,6 +79,21 @@ class BoundaryPredictor1(nn.Module):
         if init_for_12:
             with torch.no_grad():
                 self.boundary_mlp[-1].bias.fill_(-2.5)
+
+    def _compute_mlp_input_dim(self, input_dim, window_size):
+        """
+        Compute the total input dimension for the MLP based on window size.
+
+        For window_size W:
+        - Current vector: D features
+        - Each neighbor n positions away: D / 2^n features
+        - Total: D + 2 * sum(D / 2^n for n in 1 to W)
+        """
+        total_dim = input_dim  # Current vector
+        for n in range(1, window_size + 1):
+            neighbor_features = input_dim // (2 ** n)
+            total_dim += 2 * neighbor_features  # left and right
+        return total_dim
 
     def forward(
         self,
@@ -80,30 +104,48 @@ class BoundaryPredictor1(nn.Module):
         return_confidence=False,
         return_entropy=False,
     ):
-        # Create input with neighboring context: [left_first_half, current_full, right_second_half]
+        # Create input with neighboring context using exponential feature reduction
         d_hidden = self.dropout(hidden)
         D = hidden.size(-1)
-        half_D = D // 2
 
-        # Get left neighbor's first half (shift right, pad first position with zeros)
-        left_half = F.pad(d_hidden[:, :-1, :half_D], (0, 0, 1, 0))
+        # Collect context features from neighbors
+        context_parts = []
 
-        # Get right neighbor's second half (shift left, pad last position with zeros)
-        right_half = F.pad(d_hidden[:, 1:, half_D:], (0, 0, 0, 1))
+        # Add left neighbors (from furthest to nearest)
+        for n in range(self.window_size, 0, -1):
+            num_features = D // (2 ** n)
+            # Get first num_features from neighbor n positions to the left
+            left_neighbor = F.pad(
+                d_hidden[:, :-n, :num_features], (0, 0, n, 0))
+            context_parts.append(left_neighbor)
+
+        # Add current vector (all features)
+        context_parts.append(d_hidden)
+
+        # Add right neighbors (from nearest to furthest)
+        for n in range(1, self.window_size + 1):
+            num_features = D // (2 ** n)
+            # Get last num_features from neighbor n positions to the right
+            right_neighbor = F.pad(
+                d_hidden[:, n:, -num_features:], (0, 0, 0, n))
+            context_parts.append(right_neighbor)
 
         # Inverted neighbor masking during training to prevent overfitting
         # Scale features so E[feature] matches test time (like inverted dropout)
         if self.training:
             mask_prob = 0.3
-            mask = (torch.rand(left_half.shape[0], left_half.shape[1], 1,
-                               device=left_half.device) > mask_prob).float()
-            # Scale up when NOT masked so expected value stays constant
-            left_half = left_half * mask / (1 - mask_prob)
-            right_half = right_half * mask / (1 - mask_prob)
+            # Generate one mask for all neighbors
+            mask = (torch.rand(d_hidden.shape[0], d_hidden.shape[1], 1,
+                               device=d_hidden.device) > mask_prob).float()
+            # Apply masking to all neighbor features (not current vector)
+            for i in range(len(context_parts)):
+                if i != self.window_size:  # Skip current vector
+                    # Scale up when NOT masked so expected value stays constant
+                    context_parts[i] = context_parts[i] * \
+                        mask / (1 - mask_prob)
 
-        # Concatenate: [left_half, current_full, right_half]
-        hidden_with_context = torch.cat(
-            [left_half, d_hidden, right_half], dim=-1)
+        # Concatenate all context parts
+        hidden_with_context = torch.cat(context_parts, dim=-1)
 
         logits = self.boundary_mlp(hidden_with_context).squeeze(-1)
 

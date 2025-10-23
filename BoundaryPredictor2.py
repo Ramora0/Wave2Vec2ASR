@@ -23,6 +23,18 @@ class BoundaryPredictor2(nn.Module):
         # Boundary loss weight: 0 = loss has no effect, 1 = full loss effect
         self.boundary_loss_weight = 0.0  # Start with no boundary loss
 
+        # MLP layers before projections
+        self.q_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+        self.k_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
 
@@ -98,10 +110,13 @@ class BoundaryPredictor2(nn.Module):
         return_entropy=False,
         rl=False,
     ):
-        normalized_hidden = F.normalize(self.dropout(hidden), dim=-1)
         batch_size = hidden.size(0)
-        q_hidden = self.q_proj_layer(normalized_hidden[:, :-1])
-        k_hidden = self.k_proj_layer(normalized_hidden[:, 1:])
+
+        # Apply MLP transformation with normalization before and after
+        q_hidden = self.q_proj_layer(F.normalize(
+            self.q_mlp(F.normalize(self.dropout(hidden[:, :-1]), dim=-1)), dim=-1))
+        k_hidden = self.k_proj_layer(F.normalize(
+            self.k_mlp(F.normalize(self.dropout(hidden[:, 1:]), dim=-1)), dim=-1))
 
         cos_sim = torch.einsum("bld,bld->bl", q_hidden, k_hidden)
         probs = torch.clamp(
