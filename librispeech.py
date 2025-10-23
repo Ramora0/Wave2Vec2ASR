@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import string
 from typing import Any, Callable, Dict, List, Union
 
 import torch
@@ -32,6 +33,19 @@ def count_syllables(text: str) -> float:
     ]
     return float(len(syllable_tokens))
 
+def count_phonemes(text: str) -> float:
+    normalized = text.strip().lower()
+    if not normalized:
+        return 0.0
+
+    phoneme_sequence = G2P_CONVERTER(normalized)
+    phoneme_tokens = [
+        token
+        for token in phoneme_sequence
+        if token.strip() and token not in string.punctuation
+    ]
+    return float(len(phoneme_tokens))
+
 
 class DataCollatorSpeechSeq2SeqWithPadding:
     def __init__(self, processor: WhisperProcessor, decoder_start_token_id: int):
@@ -62,7 +76,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         batch["labels"] = labels
 
         if features:
-            syllable_counts: List[float] = []
+            phoneme_counts: List[float] = []
 
             for idx, feature in enumerate(features):
                 text = recover_text_from_feature(
@@ -72,11 +86,11 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                     self.processor.tokenizer,
                     self.decoder_start_token_id,
                 )
-                syllable_counts.append(count_syllables(text))
+                phoneme_counts.append(count_phonemes(text))
 
-            syllable_tensor = torch.tensor(
-                syllable_counts, dtype=torch.float32)
-            batch["target_boundary_counts"] = syllable_tensor.unsqueeze(0)
+            phoneme_tensor = torch.tensor(
+                phoneme_counts, dtype=torch.float32)
+            batch["target_boundary_counts"] = phoneme_tensor.unsqueeze(0)
 
         return batch
 

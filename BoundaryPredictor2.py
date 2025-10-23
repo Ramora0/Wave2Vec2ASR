@@ -39,6 +39,8 @@ class BoundaryPredictor2(nn.Module):
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
 
+        self.dropout = nn.Dropout(p=0.1)
+
     def set_prior(self, prior):
         self.prior = prior
 
@@ -96,7 +98,7 @@ class BoundaryPredictor2(nn.Module):
         return_entropy=False,
         rl=False,
     ):
-        normalized_hidden = F.normalize(hidden, dim=-1)
+        normalized_hidden = F.normalize(self.dropout(hidden), dim=-1)
         batch_size = hidden.size(0)
         q_hidden = self.q_proj_layer(normalized_hidden[:, :-1])
         k_hidden = self.k_proj_layer(normalized_hidden[:, 1:])

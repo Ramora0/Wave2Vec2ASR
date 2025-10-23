@@ -60,8 +60,9 @@ class BoundaryPredictor1(nn.Module):
 
         hidden = hidden_dim
         self.dropout = nn.Dropout(p=0.1)
+        # MLP now receives: [left_half, current_full, right_half] = 2*input_dim
         self.boundary_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+            nn.Linear(2 * input_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1)
         )
@@ -79,8 +80,33 @@ class BoundaryPredictor1(nn.Module):
         return_confidence=False,
         return_entropy=False,
     ):
-        hidden_for_mlp = self.dropout(hidden)
-        logits = self.boundary_mlp(hidden_for_mlp).squeeze(-1)
+        # Create input with neighboring context: [left_first_half, current_full, right_second_half]
+        d_hidden = self.dropout(hidden)
+        D = hidden.size(-1)
+        half_D = D // 2
+
+        # Get left neighbor's first half (shift right, pad first position with zeros)
+        left_half = F.pad(d_hidden[:, :-1, :half_D], (0, 0, 1, 0))
+
+        # Get right neighbor's second half (shift left, pad last position with zeros)
+        right_half = F.pad(d_hidden[:, 1:, half_D:], (0, 0, 0, 1))
+
+        # Inverted neighbor masking during training to prevent overfitting
+        # Scale features so E[feature] matches test time (like inverted dropout)
+        if self.training:
+            mask_prob = 0.3
+            mask = (torch.rand(left_half.shape[0], left_half.shape[1], 1,
+                               device=left_half.device) > mask_prob).float()
+            # Scale up when NOT masked so expected value stays constant
+            left_half = left_half * mask / (1 - mask_prob)
+            right_half = right_half * mask / (1 - mask_prob)
+
+        # Concatenate: [left_half, current_full, right_half]
+        hidden_with_context = torch.cat(
+            [left_half, d_hidden, right_half], dim=-1)
+
+        logits = self.boundary_mlp(hidden_with_context).squeeze(-1)
+
         probs = torch.sigmoid(logits)
 
         if rl:
