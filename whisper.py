@@ -40,7 +40,7 @@ BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(0, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -81,7 +81,7 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "hnet-0-test"
+MODEL_NAME = "testing"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 

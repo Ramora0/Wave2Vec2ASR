@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -69,13 +70,15 @@ class MagnetAttention(WhisperAttention):
         # print(
         #     f"ATTENTION PROCESSING: is_cross_attention={is_cross_attention}, is_updated={is_updated if past_key_value else None}")
         if is_cross_attention and past_key_value and is_updated:
-            # if not hasattr(past_key_value, 'key_cache'):
-            #     raise TypeError(
-            #         f"past_key_value is of type {type(past_key_value)} and does not have key_cache attribute. Attributes: {dir(past_key_value)}")
-            # reuse k,v, cross_attentions
-            layer_cache = past_key_value.layers[self.layer_idx]
-            key_states = layer_cache.keys
-            value_states = layer_cache.values
+            if hasattr(past_key_value, 'layers'):
+                layer_cache = past_key_value.layers[self.layer_idx]
+                key_states = layer_cache.keys
+                value_states = layer_cache.values
+            else:
+                # key_states, value_states = past_key_value.get_layer_states(
+                #     self.layer_idx)
+                key_states = past_key_value.key_cache[self.layer_idx]
+                value_states = past_key_value.value_cache[self.layer_idx]
         else:
             key_states = self.k_proj(current_states).view(
                 bsz, -1, self.num_heads, self.head_dim)

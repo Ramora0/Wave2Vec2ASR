@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible
-from utils import downsample
+from utils import downsample, get_sinusoidal_positional_embeddings
 
 
 class BoundaryPredictor2(nn.Module):
@@ -13,7 +13,6 @@ class BoundaryPredictor2(nn.Module):
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.embed_positions = nn.Embedding(max_positions, input_dim)
 
         # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
         self.compression_schedule = 1.0  # Start at max compression by default
@@ -83,9 +82,7 @@ class BoundaryPredictor2(nn.Module):
         return scheduled_prior
 
     def _add_positional_embeddings(self, x):
-        seq_len = x.shape[1]
-        position_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
-        pos_embeds = self.embed_positions(position_ids)
+        pos_embeds = get_sinusoidal_positional_embeddings(x)
         return x + pos_embeds
 
     def forward(
@@ -110,17 +107,33 @@ class BoundaryPredictor2(nn.Module):
         probs = F.pad(probs, (0, 1), value=0.0)
 
         # torch.set_printoptions(threshold=float('inf'))
-        # print(probs[0][0:torch.cumsum(
-        #     attention_mask[0], dim=0)[-1].long()])
+        # # Format probabilities to 2 decimal places and sample 3 additional values
+        # valid_probs = probs[0][0:torch.cumsum(
+        #     attention_mask[0], dim=0)[-1].long()]
+        # formatted_output = []
+        # for prob in valid_probs:
+        #     # Sample 3 values from Bernoulli distribution with temperature 1
+        #     temp_bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+        #         temperature=1.0, probs=prob
+        #     )
+        #     samples = (temp_bernoulli.rsample((3,)) > 0.5).float()
+        #     formatted_output.append(
+        #         f"{prob.item():.2f} [{samples[0].item():.0f}, {samples[1].item():.0f}, {samples[2].item():.0f}]")
+        # print(" | ".join(formatted_output))
         # torch.set_printoptions(threshold=10)
 
-        bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            temperature=self.temp,
-            probs=probs,
-        )
-
-        soft_boundaries = bernoulli.rsample()
-        hard_samples = (soft_boundaries > self.threshold).float()
+        # During training, sample through Bernoulli; during eval, directly threshold
+        if self.training:
+            bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+                temperature=self.temp,
+                probs=probs,
+            )
+            soft_boundaries = bernoulli.rsample()
+            hard_samples = (soft_boundaries > self.threshold).float()
+        else:
+            # During evaluation, threshold probabilities directly without sampling
+            soft_boundaries = probs
+            hard_samples = (probs > self.threshold).float()
 
         if attention_mask is not None:
             soft_boundaries = soft_boundaries * attention_mask

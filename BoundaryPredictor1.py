@@ -8,7 +8,7 @@ from tqdm import tqdm
 from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
 from old_downsample import downsample as old_downsample
 from smooth_downsample import downsample_with_smoothed_grad
-from utils import downsample
+from utils import downsample, get_sinusoidal_positional_embeddings
 # from utils import weighted_downsample  # Optional weighted pooling prototype
 
 # Blend constant: 0.0 = old downsample, 1.0 = new downsample
@@ -59,6 +59,7 @@ class BoundaryPredictor1(nn.Module):
         self.target_prior = prior
 
         hidden = hidden_dim
+        self.dropout = nn.Dropout(p=0.1)
         self.boundary_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.ReLU(inplace=True),
@@ -67,80 +68,7 @@ class BoundaryPredictor1(nn.Module):
 
         if init_for_12:
             with torch.no_grad():
-                self.boundary_mlp[-1].bias.fill_(2.5)
-
-    def set_prior(self, prior):
-        self.prior = prior
-
-    def set_gradient_schedule_alpha(self, alpha):
-        """Set the alpha value for gradient scheduling (0.0 to 0.33)"""
-        self.gradient_schedule_alpha = float(alpha)
-
-    def set_compression_schedule(self, schedule_value):
-        """
-        Set the compression schedule value (0.0 to 1.0).
-        0.0 = no compression (every token is a boundary)
-        1.0 = max compression (only target_boundary_counts boundaries)
-        """
-        self.compression_schedule = float(schedule_value)
-
-    def get_scheduled_prior(self):
-        """
-        Compute the effective prior based on compression schedule using inverse linear interpolation.
-
-        The prior is scheduled such that 1/prior increases linearly from 1.0 to 1/target_prior:
-        - When compression_schedule = 0.0: prior = 1.0 (no compression)
-        - When compression_schedule = 1.0: prior = target_prior (full compression)
-
-        Returns:
-            Effective prior value interpolated based on compression_schedule
-        """
-        # Inverse linear interpolation: 1/prior scales linearly
-        # prior = target_prior / (target_prior + schedule * (1 - target_prior))
-        schedule = self.compression_schedule
-        target = self.target_prior
-
-        # Handle edge case where target_prior = 1.0
-        if abs(target - 1.0) < 1e-8:
-            return 1.0
-
-        scheduled_prior = target / (target + schedule * (1.0 - target))
-        return scheduled_prior
-
-    def get_scheduled_target_counts(self, target_boundary_counts, attention_mask=None):
-        """
-        Compute the effective target boundary counts based on compression schedule.
-        Interpolates between max boundaries (sequence length) and target_boundary_counts.
-
-        Args:
-            target_boundary_counts: Original target counts (B,) or scalar
-            attention_mask: (B, L) attention mask to determine actual sequence lengths
-
-        Returns:
-            Effective target counts interpolated based on compression_schedule
-        """
-        if target_boundary_counts is None:
-            return None
-
-        # Determine max boundaries per sample
-        if attention_mask is not None:
-            # Max boundaries = sequence length for each sample
-            max_boundaries = attention_mask.sum(
-                dim=1).to(dtype=torch.float32)  # (B,)
-        else:
-            # If no mask, assume all positions are valid
-            # We need the sequence length - this will be batch size dependent
-            # For now, use a large number or infer from context
-            max_boundaries = target_boundary_counts * \
-                12.0  # Placeholder, will be overridden
-
-        # Interpolate: schedule=0 -> max_boundaries, schedule=1 -> target_boundary_counts
-        # effective = target + (max - target) * (1 - schedule)
-        effective_counts = target_boundary_counts + \
-            (max_boundaries - target_boundary_counts) * \
-            (1.0 - self.compression_schedule)
-
-        return effective_counts
+                self.boundary_mlp[-1].bias.fill_(-2.5)
 
     def forward(
         self,
@@ -151,15 +79,9 @@ class BoundaryPredictor1(nn.Module):
         return_confidence=False,
         return_entropy=False,
     ):
-        logits = self.boundary_mlp(hidden).squeeze(-1)
+        hidden_for_mlp = self.dropout(hidden)
+        logits = self.boundary_mlp(hidden_for_mlp).squeeze(-1)
         probs = torch.sigmoid(logits)
-
-        # torch.set_printoptions(threshold=float('inf'))
-        # print(probs[0])
-        # print(probs[0] > 0.5)
-        # print((probs[0] > 0.5)[0:torch.cumsum(
-        #     attention_mask[0], dim=0)[-1].long()])
-        # torch.set_printoptions(threshold=10)
 
         if rl:
             # RL mode: sample hard boundaries directly
@@ -179,26 +101,21 @@ class BoundaryPredictor1(nn.Module):
             soft_boundaries = None  # Not used in RL mode
         else:
             # Supervised mode
-            # if self.training:
-            # Use RelaxedBernoulli for differentiable boundaries (STE) during training
-            # bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            #     temperature=self.temp,
-            #     probs=probs,
-            # )
-            # soft_boundaries = bernoulli.rsample()
-            # hard_samples = (soft_boundaries > self.threshold).float()
-
-            soft_boundaries = probs
-            hard_samples = (soft_boundaries > self.threshold).float()
+            if self.training:
+                # Use RelaxedBernoulli for differentiable boundaries (STE) during training
+                bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+                    temperature=self.temp,
+                    probs=probs,
+                )
+                soft_boundaries = bernoulli.rsample()
+                hard_samples = (soft_boundaries > self.threshold).float()
+            else:
+                # During evaluation, threshold probabilities directly
+                soft_boundaries = probs
+                hard_samples = (probs > 0.5).float()
 
             hard_boundaries = hard_samples + \
                 (soft_boundaries - soft_boundaries.detach())
-            # else:
-            #     # Use standard Bernoulli during evaluation
-            #     bernoulli = torch.distributions.Bernoulli(probs=probs)
-            #     hard_samples = bernoulli.sample()
-            #     hard_boundaries = hard_samples
-            #     soft_boundaries = None
 
         if attention_mask is not None:
             hard_boundaries = hard_boundaries * attention_mask
@@ -220,9 +137,6 @@ class BoundaryPredictor1(nn.Module):
                     soft_boundaries = torch.maximum(
                         soft_boundaries, last_real_mask)
 
-        assert torch.all(
-            hard_boundaries == attention_mask), "hard_boundaries must equal attention_mask in RL mode"
-
         pooled = downsample(
             hard_boundaries,
             hidden.transpose(0, 1),
@@ -231,66 +145,7 @@ class BoundaryPredictor1(nn.Module):
 
         pooled = pooled.transpose(0, 1)
 
-        # DEBUG: Check if all-1 boundaries preserve hidden states
-        orig_hidden = hidden  # B x L x D
-        new_pooled = pooled   # B x L' x D
-
-        # Trim orig_hidden to match pooled size for comparison
-        if orig_hidden.shape[1] > new_pooled.shape[1]:
-            # Trim to the size of pooled (boundary indices should be preserved in order)
-            trimmed_hidden = orig_hidden[:, :new_pooled.shape[1], :]
-        else:
-            trimmed_hidden = orig_hidden
-
-        # Create a masked version of trimmed_hidden for a fair comparison
-        if attention_mask is not None:
-            trimmed_attention_mask = attention_mask[:, :new_pooled.shape[1]]
-            masked_hidden = trimmed_hidden * \
-                trimmed_attention_mask.unsqueeze(-1)
-        else:
-            masked_hidden = trimmed_hidden
-
-        # if trimmed_hidden.shape == new_pooled.shape:
-        #     # Find the first time that pooled is 0 and hidden isn't
-        #     mismatch_mask = (new_pooled == 0) & (masked_hidden != 0)
-        #     mismatch_indices = mismatch_mask.nonzero(as_tuple=False)
-
-        #     if mismatch_indices.numel() > 0:
-        #         first_mismatch = mismatch_indices[0]
-        #         batch_idx, seq_idx, feat_idx = first_mismatch
-
-        #         print(
-        #             f"Found mismatch: pooled is 0 where masked hidden is not, at index: batch={batch_idx}, seq={seq_idx}, feat={feat_idx}")
-
-        #         # Print neighbors
-        #         start = max(0, seq_idx - 2)
-        #         end = min(trimmed_hidden.shape[1], seq_idx + 3)
-
-        #         print(
-        #             f"\n--- Neighborhood around mismatch (seq_idx={seq_idx}) ---")
-        #         if attention_mask is not None:
-        #             print("Attention mask:")
-        #             print(attention_mask[batch_idx, start:end])
-        #         print("Original vectors (masked_hidden):")
-        #         print(masked_hidden[batch_idx, start:end])
-        #         print("Pooled vectors (new_pooled):")
-        #         print(new_pooled[batch_idx, start:end])
-        #         print("Difference:")
-        #         print(
-        #             (masked_hidden - new_pooled)[batch_idx, start:end])
-        #         print("-----------------------------------------------------")
-
-        #     elif not torch.allclose(masked_hidden, new_pooled, atol=1e-5):
-        #         diff = (masked_hidden - new_pooled).abs()
-        #         max_diff_val = diff.max()
-        #         print(
-        #             f"VALUE MISMATCH (but not the 'pooled is 0' kind): max diff = {max_diff_val}")
-        #         print(
-        #             f"Shapes: orig={masked_hidden.shape}, pooled={new_pooled.shape}")
-
-        # else:
-        #     print(
-        #         f"SHAPE STILL MISMATCHED after trim: {trimmed_hidden.shape} vs {new_pooled.shape}")
+        pooled = self._add_positional_embeddings(pooled)
 
         shortened_attention_mask = None
 
@@ -338,8 +193,11 @@ class BoundaryPredictor1(nn.Module):
                 hard_samples, probs, attention_mask)  # (B,)
         else:
             # Normal training: return scalar loss
-            loss = self.calc_loss(num_boundaries_tensor,
-                                  total_positions_tensor)
+            # loss = self.calc_loss(num_boundaries_tensor,
+            loss = 10 * self.calc_loss_target_counts_per_item(
+                hard_boundaries, attention_mask, effective_target_counts)
+            # loss = 10 * self.calc_example_loss(
+            #     hard_boundaries, attention_mask)
             self.last_loss = loss
 
         num_boundaries = num_boundaries_tensor.item()
@@ -370,17 +228,92 @@ class BoundaryPredictor1(nn.Module):
             entropy = entropy_map.sum(dim=1)
 
         return (
-            # masked_hidden,
-            hidden,
+            pooled,
             loss,
             num_boundaries,
             total_positions,
-            # shortened_attention_mask,
-            attention_mask,
+            shortened_attention_mask,
             log_prob,
             confidence,
             entropy,
         )
+
+    def get_scheduled_target_counts(self, target_boundary_counts, attention_mask=None):
+        """
+        Compute the effective target boundary counts based on compression schedule.
+        Interpolates between max boundaries (sequence length) and target_boundary_counts.
+
+        Args:
+            target_boundary_counts: Original target counts (B,) or scalar
+            attention_mask: (B, L) attention mask to determine actual sequence lengths
+
+        Returns:
+            Effective target counts interpolated based on compression_schedule
+        """
+        if target_boundary_counts is None:
+            return None
+
+        # Determine max boundaries per sample
+        if attention_mask is not None:
+            # Max boundaries = sequence length for each sample
+            max_boundaries = attention_mask.sum(
+                dim=1).to(dtype=torch.float32)  # (B,)
+        else:
+            # If no mask, assume all positions are valid
+            # We need the sequence length - this will be batch size dependent
+            # For now, use a large number or infer from context
+            max_boundaries = target_boundary_counts * \
+                12.0  # Placeholder, will be overridden
+
+        # Interpolate: schedule=0 -> max_boundaries, schedule=1 -> target_boundary_counts
+        # effective = target + (max - target) * (1 - schedule)
+        effective_counts = target_boundary_counts + \
+            (max_boundaries - target_boundary_counts) * \
+            (1.0 - self.compression_schedule)
+
+        return effective_counts
+
+    def set_prior(self, prior):
+        self.prior = prior
+
+    def set_gradient_schedule_alpha(self, alpha):
+        """Set the alpha value for gradient scheduling (0.0 to 0.33)"""
+        self.gradient_schedule_alpha = float(alpha)
+
+    def set_compression_schedule(self, schedule_value):
+        """
+        Set the compression schedule value (0.0 to 1.0).
+        0.0 = no compression (every token is a boundary)
+        1.0 = max compression (only target_boundary_counts boundaries)
+        """
+        self.compression_schedule = float(schedule_value)
+
+    def get_scheduled_prior(self):
+        """
+        Compute the effective prior based on compression schedule using inverse linear interpolation.
+
+        The prior is scheduled such that 1/prior increases linearly from 1.0 to 1/target_prior:
+        - When compression_schedule = 0.0: prior = 1.0 (no compression)
+        - When compression_schedule = 1.0: prior = target_prior (full compression)
+
+        Returns:
+            Effective prior value interpolated based on compression_schedule
+        """
+        # Inverse linear interpolation: 1/prior scales linearly
+        # prior = target_prior / (target_prior + schedule * (1 - target_prior))
+        schedule = self.compression_schedule
+        target = self.target_prior
+
+        # Handle edge case where target_prior = 1.0
+        if abs(target - 1.0) < 1e-8:
+            return 1.0
+
+        scheduled_prior = target / (target + schedule * (1.0 - target))
+        return scheduled_prior
+
+    def _add_positional_embeddings(self, x):
+        pos_embeds = get_sinusoidal_positional_embeddings(x)
+        return x + pos_embeds
 
     def calc_loss(self, num_boundaries, total_positions):
         scheduled_prior = self.get_scheduled_prior()

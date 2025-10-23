@@ -277,7 +277,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 target_pointer,
                 boundary_rl,
                 return_boundary_confidence,
-                return_entropy,
+                return_entropy
             )
 
             if layer_log_prob is not None:

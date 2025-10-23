@@ -9,95 +9,89 @@ import torch
 import torch.nn.utils.rnn  # noqa: F401  # ensure pad_sequence is available
 import torchaudio
 
+from BoundaryPredictor2 import BoundaryPredictor2
 from MagnetWhisper import MagnetWhisper
 from BoundaryPredictor1 import BoundaryPredictor1
 from utils import downsample
 from transformers import WhisperProcessor
 
 
-def _rewrite_boundary_forward(predictor: BoundaryPredictor1) -> None:
+def _rewrite_boundary_forward(predictor: BoundaryPredictor2) -> None:
     """Patch predictor.forward so it retains the last hard boundary mask."""
+
+    # Store original forward method
+    original_forward = predictor.forward
 
     def _forward(
         self,
         hidden,
         attention_mask: Optional[torch.Tensor] = None,
         target_boundary_counts: Optional[torch.Tensor] = None,
+        return_log_probs: bool = False,
+        return_unreduced_boundary_loss: bool = False,
+        return_confidence: bool = False,
+        return_entropy: bool = False,
+        rl: bool = False,
     ):
-        logits = self.boundary_mlp(hidden).squeeze(-1)
-        probs = torch.sigmoid(logits)
-
-        bernoulli = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
-            temperature=self.temp,
-            probs=probs,
+        # Call the original forward method with all parameters
+        result = original_forward(
+            hidden=hidden,
+            attention_mask=attention_mask,
+            target_boundary_counts=target_boundary_counts,
+            return_log_probs=return_log_probs,
+            return_unreduced_boundary_loss=return_unreduced_boundary_loss,
+            return_confidence=return_confidence,
+            return_entropy=return_entropy,
+            rl=rl,
         )
 
-        soft_boundaries = bernoulli.rsample()
+        # Extract the components we need
+        pooled = result[0]
+        loss = result[1]
+        num_boundaries = result[2]
+        total_positions = result[3]
+        shortened_attention_mask = result[4]
 
-        hard_boundaries = (soft_boundaries > self.threshold).float()
-        hard_boundaries = (
-            hard_boundaries - soft_boundaries.detach() + soft_boundaries
-        )
+        # We need to reconstruct the hard boundaries from the forward pass
+        # Since BoundaryPredictor2 doesn't expose them directly, we need to recompute
+        with torch.no_grad():
+            normalized_hidden = torch.nn.functional.normalize(hidden, dim=-1)
+            q_hidden = self.q_proj_layer(normalized_hidden[:, :-1])
+            k_hidden = self.k_proj_layer(normalized_hidden[:, 1:])
 
-        if attention_mask is not None:
-            hard_boundaries = hard_boundaries * attention_mask
+            cos_sim = torch.einsum("bld,bld->bl", q_hidden, k_hidden)
+            probs = torch.clamp(
+                (1 - (cos_sim + self.similarity_bias)) * 0.5, min=0.0, max=1.0)
+            probs = torch.nn.functional.pad(probs, (0, 1), value=0.0)
 
-            pad_mask = attention_mask == 0
-            if pad_mask.any():
-                first_pad_mask = pad_mask & (
-                    pad_mask.long().cumsum(dim=1) == 1)
-                last_real_mask = torch.roll(first_pad_mask, shifts=-1, dims=1)
-                last_real_mask[:, -1] = False
-                hard_boundaries = torch.maximum(
-                    hard_boundaries, last_real_mask.float()
-                )
+            # Generate hard boundaries using the same logic
+            hard_boundaries = (probs > self.threshold).float()
 
-        pooled = downsample(hard_boundaries, hidden)
-        pooled = pooled.transpose(0, 1)
+            if attention_mask is not None:
+                hard_boundaries = hard_boundaries * attention_mask
 
-        shortened_attention_mask = None
-        if attention_mask is not None:
-            keep_mask = hard_boundaries == 1
-            batch_size = attention_mask.shape[0]
-            shortened_masks = []
+                pad_mask = attention_mask == 0
+                if pad_mask.any():
+                    first_pad_mask = pad_mask & (
+                        pad_mask.long().cumsum(dim=1) == 1)
+                    last_real_mask = torch.roll(
+                        first_pad_mask, shifts=-1, dims=1)
+                    last_real_mask[:, -1] = False
+                    boundary_mask = last_real_mask.float()
+                    hard_boundaries = torch.maximum(
+                        hard_boundaries, boundary_mask)
 
-            for b in range(batch_size):
-                keep_indices = keep_mask[b].nonzero(as_tuple=True)[0]
-                original_mask = attention_mask[b]
-                shortened_mask = original_mask[keep_indices]
-                shortened_masks.append(shortened_mask)
-
-            shortened_attention_mask = torch.nn.utils.rnn.pad_sequence(
-                shortened_masks, batch_first=True, padding_value=0.0)
-
-        num_boundaries_tensor = hard_boundaries.sum()
-        if attention_mask is not None:
-            total_positions_tensor = attention_mask.sum()
-        else:
-            total_positions_tensor = torch.tensor(
-                hard_boundaries.numel(), device=hard_boundaries.device, dtype=torch.float)
-
-        if target_boundary_counts is not None:
-            loss = self.calc_loss_target_counts(
-                hard_boundaries,
-                attention_mask,
-                target_boundary_counts,
-            )
-        else:
-            loss = num_boundaries_tensor.new_tensor(0.0)
-
-        self.last_loss = loss
-
+        # Store for visualization
         self.last_hard_boundaries = hard_boundaries.detach().cpu()
         self.last_attention_mask = attention_mask.detach(
         ).cpu() if attention_mask is not None else None
+        self.last_loss = loss
+        self.last_probs = probs.detach().cpu()
 
-        num_boundaries = num_boundaries_tensor.item()
-        total_positions = total_positions_tensor.item()
+        # Return the full BoundaryPredictor2 format that MagnetWhisperEncoder expects
+        return result
 
-        return pooled, loss, num_boundaries, total_positions, shortened_attention_mask
-
-    predictor.forward = _forward.__get__(predictor, BoundaryPredictor1)
+    predictor.forward = _forward.__get__(predictor, BoundaryPredictor2)
 
 
 def _load_audio(path: Path, target_sr: int) -> Tuple[torch.Tensor, int]:
@@ -165,7 +159,7 @@ def _compute_boundary_times(boundary_mask: torch.Tensor,
 
 def visualize_boundaries() -> None:
     audio_path = Path("./data/validation-1.mp3")
-    model_path = Path("./models/magnet-phonemes")
+    model_path = Path("./models/checkpoint-10990")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_path: Optional[Path] = audio_path.with_name(
         audio_path.stem + "_boundaries.txt")
@@ -194,9 +188,9 @@ def visualize_boundaries() -> None:
     model.eval()
     model.to(device)
 
-    predictor: Optional[BoundaryPredictor1] = None
+    predictor: Optional[BoundaryPredictor2] = None
     for module in model.model.encoder.boundary_predictors:
-        if isinstance(module, BoundaryPredictor1):
+        if isinstance(module, BoundaryPredictor2):
             predictor = module
             break
 
@@ -206,6 +200,7 @@ def visualize_boundaries() -> None:
     _rewrite_boundary_forward(predictor)
 
     with torch.no_grad():
+        print(f"Calling encoder {model.model.encoder.__class__}")
         model.model.encoder(
             input_features=input_features.to(device),
             attention_mask=attention_mask.to(device),
@@ -213,6 +208,7 @@ def visualize_boundaries() -> None:
         )
 
     with torch.no_grad():
+        print(f"Calling decoder {model.model.decoder.__class__}")
         generated_ids = model.generate(
             inputs=input_features.to(device),
             attention_mask=attention_mask.to(device),
@@ -225,6 +221,47 @@ def visualize_boundaries() -> None:
     boundary_mask = predictor.last_hard_boundaries.squeeze(0)
     attention_mask_recorded = predictor.last_attention_mask.squeeze(
         0) if predictor.last_attention_mask is not None else None
+    boundary_probs = predictor.last_probs.squeeze(0)
+
+    # Print all boundary probabilities and positions
+    print("\n=== BOUNDARY ANALYSIS ===")
+
+    if attention_mask_recorded is not None:
+        valid_mask = attention_mask_recorded > 0.5
+        valid_positions = torch.nonzero(valid_mask, as_tuple=True)[0]
+        total_valid_positions = int(valid_mask.sum().item())
+
+        print(f"Total valid positions: {total_valid_positions}")
+        print(f"Total sequence length: {len(boundary_mask)}")
+
+        valid_probs = boundary_probs[valid_mask]
+        valid_boundaries = boundary_mask[valid_mask]
+        num_boundaries = int(valid_boundaries.sum().item())
+
+        print(f"Number of boundaries: {num_boundaries}")
+        print(
+            f"Compression rate: {num_boundaries / total_valid_positions:.4f}")
+
+        print("\nAll valid positions with probabilities:")
+        for i, (pos, prob, is_boundary) in enumerate(zip(valid_positions, valid_probs, valid_boundaries)):
+            boundary_marker = " [BOUNDARY]" if is_boundary > 0.5 else ""
+            print(
+                f"Position {pos.item():4d}: prob={prob.item():.6f}{boundary_marker}")
+
+    else:
+        total_positions = len(boundary_mask)
+        num_boundaries = int(boundary_mask.sum().item())
+
+        print(f"Total positions: {total_positions}")
+        print(f"Number of boundaries: {num_boundaries}")
+        print(f"Compression rate: {num_boundaries / total_positions:.4f}")
+
+        print("\nAll positions with probabilities:")
+        for i, (prob, is_boundary) in enumerate(zip(boundary_probs, boundary_mask)):
+            boundary_marker = " [BOUNDARY]" if is_boundary > 0.5 else ""
+            print(f"Position {i:4d}: prob={prob.item():.6f}{boundary_marker}")
+
+    print("=== END BOUNDARY ANALYSIS ===\n")
 
     boundary_times = _compute_boundary_times(
         boundary_mask, attention_mask_recorded, audio_duration)

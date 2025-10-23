@@ -13,6 +13,9 @@ from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
 from MagnetWhisperDecoder import MagnetWhisperDecoder
 from MagnetWhisperEncoder import MagnetWhisperEncoder
+from MagnetEncoderLayer import MagnetEncoderLayer
+from MagnetDecoderLayer import MagnetDecoderLayer
+from MagnetAttention import MagnetAttention
 
 
 @dataclass
@@ -70,26 +73,34 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         # Initialize the magnet component
         model.__class__ = cls
 
+        # Convert model to MagnetWhisperModel and encoder to MagnetWhisperEncoder
+        model.model.__class__ = MagnetWhisperModel
+        model.model.encoder.__class__ = MagnetWhisperEncoder
+        model.model.decoder.__class__ = MagnetWhisperDecoder
+
+        # Convert encoder layers to use MagnetAttention (without affecting boundary predictors)
+        for layer in model.model.encoder.layers:
+            layer.__class__ = MagnetEncoderLayer
+            layer.self_attn.__class__ = MagnetAttention
+
+        # Convert decoder layers to use MagnetAttention
+        for layer in model.model.decoder.layers:
+            layer.__class__ = MagnetDecoderLayer
+            layer.self_attn.__class__ = MagnetAttention
+            layer.encoder_attn.__class__ = MagnetAttention
+
+        # Create new ModuleList based on saved types
+        model.model.encoder.boundary_predictors = nn.ModuleList(
+            [nn.Identity() for _ in range(12)]
+        )
+        model.model.encoder.compression_ratios = {}
+        # Initialize boundary and position counters in encoder
+        model.model.encoder.total_boundaries = 0
+        model.model.encoder.total_positions = 0
+        model.model.encoder.boundary_target_progress = 1.0
+
         # If we have layer_types information, reconstruct boundary_predictors based on saved types
         if layer_types:
-            # Convert model to MagnetWhisperModel and encoder to MagnetWhisperEncoder
-            model.model.__class__ = MagnetWhisperModel
-            model.model.encoder.__class__ = MagnetWhisperEncoder
-            model.model.decoder.__class__ = MagnetWhisperDecoder
-
-            # Convert decoder layers to use MagnetAttention
-            model.model.decoder.load_magnet()
-
-            # Create new ModuleList based on saved types
-            model.model.encoder.boundary_predictors = nn.ModuleList(
-                [nn.Identity() for _ in range(12)]
-            )
-            model.model.encoder.compression_ratios = {}
-            # Initialize boundary and position counters in encoder
-            model.model.encoder.total_boundaries = 0
-            model.model.encoder.total_positions = 0
-            model.model.encoder.boundary_target_progress = 1.0
-
             # Reconstruct each predictor based on saved type information
             layer_types_dict = dict(layer_types)
             layer_priors_dict = dict(layer_priors)
