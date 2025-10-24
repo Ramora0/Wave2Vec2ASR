@@ -40,7 +40,7 @@ def explore_placements(probs, confidence=5.0):
 
 
 class BoundaryPredictor1(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True, window_size=8):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True, window_size=0):
         """
         input_dim: dimensionality of per-token vectors (D)
         hidden_dim: hidden size of the MLP

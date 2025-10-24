@@ -110,7 +110,7 @@ training_args = Seq2SeqTrainingArguments(
     logging_steps=100,
     report_to="wandb",
     greater_is_better=False,
-    weight_decay=1e-4,
+    weight_decay=0,
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
@@ -127,33 +127,28 @@ class MagnetSeq2SeqTrainer(Seq2SeqTrainer):
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args)
 
-        # NOTE: differential learning rates are disabled for now. The original
-        # implementation is kept below for convenience:
-        #
-        # boundary_params = []
-        # other_params = []
-        # for name, param in self.model.named_parameters():
-        #     if not param.requires_grad:
-        #         continue
-        #     if "boundary_predictors" in name:
-        #         boundary_params.append(param)
-        #     else:
-        #         other_params.append(param)
-        # base_lr = self.args.learning_rate
-        # param_groups = []
-        # if other_params:
-        #     param_groups.append({"params": other_params, "lr": base_lr * 2.0})
-        # if boundary_params:
-        #     param_groups.append({"params": boundary_params, "lr": base_lr / 2.0})
-        # if not param_groups:
-        #     param_groups = [{"params": self.model.parameters()}]
+        boundary_params = []
+        other_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "boundary_predictors" in name:
+                boundary_params.append(param)
+            else:
+                other_params.append(param)
 
-        params = [param for _, param in self.model.named_parameters()
-                  if param.requires_grad]
-        if not params:
-            params = list(self.model.parameters())
+        # The weight_decay argument in Seq2SeqTrainingArguments is a global setting.
+        # To apply it only to boundary_params, we create two parameter groups.
+        weight_decay = self.args.weight_decay
+        param_groups = [
+            {"params": other_params, "weight_decay": 0.0},
+            {"params": boundary_params, "weight_decay": weight_decay},
+        ]
 
-        param_groups = [{"params": params, "lr": self.args.learning_rate}]
+        # The weight_decay is now specified in the param_groups, so remove it from the optimizer_kwargs
+        # to avoid conflicts if it's present.
+        if 'weight_decay' in optimizer_kwargs:
+            del optimizer_kwargs['weight_decay']
 
         self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
 
@@ -387,7 +382,7 @@ class TemperatureScheduler(TrainerCallback):
         _set_boundary_temperature(model, temperature)
 
 
-# trainer.add_callback(TemperatureScheduler(start_temp=1.0, end_temp=0.0))
+# trainer.add_callback(TemperatureScheduler(start_temp=0.1, end_temp=0.0))
 
 
 # class EvaluateFirstStepCallback(TrainerCallback):
