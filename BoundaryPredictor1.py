@@ -2,13 +2,12 @@ import torch.nn.utils.rnn
 import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
 
-from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts
-from old_downsample import downsample as old_downsample
-from smooth_downsample import downsample_with_smoothed_grad
+from loss import binomial_loss, hinge_loss, binomial_loss_from_target_counts, repulsion_loss
 from utils import downsample, get_sinusoidal_positional_embeddings
+# from mambapy.mamba import Mamba, MambaConfig
+# from mamba_ssm import Mamba
 # from utils import weighted_downsample  # Optional weighted pooling prototype
 
 # Blend constant: 0.0 = old downsample, 1.0 = new downsample
@@ -40,38 +39,36 @@ def explore_placements(probs, confidence=5.0):
 
 
 class BoundaryPredictor1(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True, window_size=0):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, init_for_12=True):
         """
         input_dim: dimensionality of per-token vectors (D)
         hidden_dim: hidden size of the MLP
         tau: Gumbel-Sigmoid temperature
-        window_size: number of neighboring positions to look at on each side
-                     (with exponential feature reduction: position n uses 1/2^n features)
         """
         super().__init__()
         self.temp = temp
         self.prior = prior
         self.threshold = threshold
-        self.gradient_schedule_alpha = 0.0  # Start with no gradients from downsample
-        self.window_size = window_size
         self.input_dim = input_dim
 
+        # config = MambaConfig(d_model=input_dim, n_layers=1,
+        #                      d_state=8, expand_factor=1)
+        # self.mamba = Mamba(config)
+        # self.mamba = Mamba(d_model=input_dim, d_state=8,
+        #                    expand=1, d_conv=16).to("cuda")
+        # self.mamba_ln = nn.LayerNorm(input_dim)
+
         # Compression scheduling: 0 = every token is a boundary, 1 = only target_boundary_counts boundaries
-        self.compression_schedule = 1.0  # Start at max compression by default
+        self.compression_schedule = 0.0  # Start at no compression by default
 
         # Store target prior for scheduling (prior will be scheduled from 1.0 to target_prior)
         self.target_prior = prior
 
-        # Calculate MLP input dimension based on window size
-        # For each neighbor n positions away (1 to window_size), use 1/2^n of features
-        # Total: D + 2 * sum(D / 2^n for n in 1 to W)
-        mlp_input_dim = self._compute_mlp_input_dim(input_dim, window_size)
-
         hidden = hidden_dim
         self.dropout = nn.Dropout(p=0.1)
-        # MLP receives concatenated context with exponential feature reduction
+        # MLP receives per-token features
         self.boundary_mlp = nn.Sequential(
-            nn.Linear(mlp_input_dim, hidden),
+            nn.Linear(input_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1)
         )
@@ -79,21 +76,6 @@ class BoundaryPredictor1(nn.Module):
         if init_for_12:
             with torch.no_grad():
                 self.boundary_mlp[-1].bias.fill_(-2.5)
-
-    def _compute_mlp_input_dim(self, input_dim, window_size):
-        """
-        Compute the total input dimension for the MLP based on window size.
-
-        For window_size W:
-        - Current vector: D features
-        - Each neighbor n positions away: D / 2^n features
-        - Total: D + 2 * sum(D / 2^n for n in 1 to W)
-        """
-        total_dim = input_dim  # Current vector
-        for n in range(1, window_size + 1):
-            neighbor_features = input_dim // (2 ** n)
-            total_dim += 2 * neighbor_features  # left and right
-        return total_dim
 
     def forward(
         self,
@@ -104,50 +86,11 @@ class BoundaryPredictor1(nn.Module):
         return_confidence=False,
         return_entropy=False,
     ):
-        # Create input with neighboring context using exponential feature reduction
+        # hidden = hidden + self.mamba(self.mamba_ln(hidden))
+
         d_hidden = self.dropout(hidden)
-        D = hidden.size(-1)
 
-        # Collect context features from neighbors
-        context_parts = []
-
-        # Add left neighbors (from furthest to nearest)
-        for n in range(self.window_size, 0, -1):
-            num_features = D // (2 ** n)
-            # Get first num_features from neighbor n positions to the left
-            left_neighbor = F.pad(
-                d_hidden[:, :-n, :num_features], (0, 0, n, 0))
-            context_parts.append(left_neighbor)
-
-        # Add current vector (all features)
-        context_parts.append(d_hidden)
-
-        # Add right neighbors (from nearest to furthest)
-        for n in range(1, self.window_size + 1):
-            num_features = D // (2 ** n)
-            # Get last num_features from neighbor n positions to the right
-            right_neighbor = F.pad(
-                d_hidden[:, n:, -num_features:], (0, 0, 0, n))
-            context_parts.append(right_neighbor)
-
-        # Inverted neighbor masking during training to prevent overfitting
-        # Scale features so E[feature] matches test time (like inverted dropout)
-        if self.training:
-            mask_prob = 0.3
-            # Generate one mask for all neighbors
-            mask = (torch.rand(d_hidden.shape[0], d_hidden.shape[1], 1,
-                               device=d_hidden.device) > mask_prob).float()
-            # Apply masking to all neighbor features (not current vector)
-            for i in range(len(context_parts)):
-                if i != self.window_size:  # Skip current vector
-                    # Scale up when NOT masked so expected value stays constant
-                    context_parts[i] = context_parts[i] * \
-                        mask / (1 - mask_prob)
-
-        # Concatenate all context parts
-        hidden_with_context = torch.cat(context_parts, dim=-1)
-
-        logits = self.boundary_mlp(hidden_with_context).squeeze(-1)
+        logits = self.boundary_mlp(d_hidden).squeeze(-1)
 
         probs = torch.sigmoid(logits)
 
@@ -246,27 +189,52 @@ class BoundaryPredictor1(nn.Module):
             effective_target_counts = None
 
         log_prob = None
-        if rl:
-            # For RL: return per-sample boundary losses (B,) and log_prob
-            # if effective_target_counts is not None:
-            #     loss = self.calc_loss_target_counts_per_item_unreduced(
-            #         hard_boundaries, attention_mask, effective_target_counts)
-            # else:
-            loss = self.calc_example_loss_unreduced(
-                hard_boundaries, attention_mask)
-            # Cap loss at 1.0 for stable RL training - provides consistent gradient
-            # signal regardless of how far from target, allowing natural curriculum
-            loss = torch.clamp(loss, max=1.0)
-            log_prob = self.compute_log_prob(
-                hard_samples, probs, attention_mask)  # (B,)
+        if self.training:
+            # Calculate repulsion loss for all training modes
+            rep_loss = repulsion_loss(
+                hard_boundaries, attention_mask, kernel_size=5)
+
+            # Calculate adjacent boundary penalty: multiply boundaries by shifted version
+            # This penalizes boundaries that are immediately next to each other
+            shifted_boundaries = torch.roll(hard_boundaries, shifts=1, dims=1)
+            # Zero out the first position after shift to avoid wraparound
+            shifted_boundaries[:, 0] = 0
+            adjacent_penalty = hard_boundaries * shifted_boundaries
+            if attention_mask is not None:
+                # Only count adjacent boundaries in valid positions
+                adjacent_penalty = adjacent_penalty * attention_mask
+            adjacent_loss = adjacent_penalty.sum(dim=1).mean()
+
+            if rl:
+                # For RL: return per-sample boundary losses (B,) and log_prob
+                # if effective_target_counts is not None:
+                #     loss = self.calc_loss_target_counts_per_item_unreduced(
+                #         hard_boundaries, attention_mask, effective_target_counts)
+                # else:
+                binomial = self.calc_example_loss_unreduced(
+                    hard_boundaries, attention_mask)
+                # Cap loss at 1.0 for stable RL training - provides consistent gradient
+                # signal regardless of how far from target, allowing natural curriculum
+                binomial = torch.clamp(binomial, max=1.0)
+                # Add repulsion loss (scalar) to each sample, scaled by 1/10
+                # Add adjacent boundary penalty
+                loss = binomial + rep_loss + adjacent_loss
+                log_prob = self.compute_log_prob(
+                    hard_samples, probs, attention_mask)  # (B,)
+            else:
+                # Normal training: return scalar loss
+                # loss = self.calc_loss(num_boundaries_tensor,
+                binomial = 10 * self.calc_loss_target_counts_per_item(
+                    hard_boundaries, attention_mask, effective_target_counts)
+                # loss = 10 * self.calc_example_loss(
+                #     hard_boundaries, attention_mask)
+                # Add repulsion loss scaled by 1/10 (matches the 10x factor on binomial)
+                # Add adjacent boundary penalty scaled by 10 (matches binomial scaling)
+                loss = binomial  # + rep_loss
+                self.last_loss = loss
         else:
-            # Normal training: return scalar loss
-            # loss = self.calc_loss(num_boundaries_tensor,
-            loss = 10 * self.calc_loss_target_counts_per_item(
-                hard_boundaries, attention_mask, effective_target_counts)
-            # loss = 10 * self.calc_example_loss(
-            #     hard_boundaries, attention_mask)
-            self.last_loss = loss
+            # Don't calculate loss during evaluation
+            loss = torch.tensor(0.0, device=hidden.device)
 
         num_boundaries = num_boundaries_tensor.item()
         total_positions = total_positions_tensor.item()
@@ -295,6 +263,9 @@ class BoundaryPredictor1(nn.Module):
                     attention_mask.to(entropy_map.dtype)
             entropy = entropy_map.sum(dim=1)
 
+        # Compute coefficient of variation for boundary spacing
+        cv = self.compute_boundary_cv(hard_boundaries, attention_mask)
+
         return (
             pooled,
             loss,
@@ -304,19 +275,20 @@ class BoundaryPredictor1(nn.Module):
             log_prob,
             confidence,
             entropy,
+            cv,
         )
 
     def get_scheduled_target_counts(self, target_boundary_counts, attention_mask=None):
         """
-        Compute the effective target boundary counts based on compression schedule.
-        Interpolates between max boundaries (sequence length) and target_boundary_counts.
+        Compute the effective target boundary counts based on a linear compression rate schedule.
+        Interpolates the compression rate from 1x to C_max, where C_max is the target compression rate.
 
         Args:
             target_boundary_counts: Original target counts (B,) or scalar
             attention_mask: (B, L) attention mask to determine actual sequence lengths
 
         Returns:
-            Effective target counts interpolated based on compression_schedule
+            Effective target counts for the current step in the schedule.
         """
         if target_boundary_counts is None:
             return None
@@ -333,11 +305,21 @@ class BoundaryPredictor1(nn.Module):
             max_boundaries = target_boundary_counts * \
                 12.0  # Placeholder, will be overridden
 
-        # Interpolate: schedule=0 -> max_boundaries, schedule=1 -> target_boundary_counts
-        # effective = target + (max - target) * (1 - schedule)
-        effective_counts = target_boundary_counts + \
-            (max_boundaries - target_boundary_counts) * \
-            (1.0 - self.compression_schedule)
+        # Ensure target_boundary_counts is not zero to avoid division by zero.
+        # Add a small epsilon for stability.
+        clamped_target_counts = torch.clamp(
+            target_boundary_counts.float(), min=1e-8)
+
+        # Calculate the maximum compression rate
+        C_max = max_boundaries / clamped_target_counts
+
+        # Linearly interpolate the compression rate from 1x to C_max
+        # C(s) = 1 + (C_max - 1) * s
+        current_C = 1.0 + (C_max - 1.0) * self.compression_schedule
+
+        # Calculate the effective number of boundaries for the current compression rate
+        # E(s) = L / C(s)
+        effective_counts = max_boundaries / current_C
 
         return effective_counts
 
@@ -531,3 +513,42 @@ class BoundaryPredictor1(nn.Module):
         log_probs = log_prob_t.sum(dim=1)  # (B,)
 
         return log_probs
+
+    def compute_boundary_cv(self, hard_boundaries, attention_mask=None):
+        """
+        Compute coefficient of variation of inter-boundary distances.
+
+        Returns:
+            CV ≈ 0: evenly distributed (max spread)
+            CV ≈ 1: random placement (Poisson process)
+            CV > 1: clumped together
+        """
+        batch_cvs = []
+
+        for b in range(hard_boundaries.size(0)):
+            boundaries = hard_boundaries[b]
+            if attention_mask is not None:
+                seq_len = int(attention_mask[b].sum().item())
+                boundaries = boundaries[:seq_len]
+
+            # Get positions of boundaries
+            boundary_positions = boundaries.nonzero(as_tuple=True)[0]
+
+            if len(boundary_positions) < 2:
+                continue  # Need at least 2 boundaries
+
+            # Compute distances between consecutive boundaries
+            distances = boundary_positions[1:] - boundary_positions[:-1]
+            distances = distances.float()
+
+            # Coefficient of variation: std / mean
+            mean_dist = distances.mean()
+            std_dist = distances.std()
+            cv = std_dist / (mean_dist + 1e-8)
+
+            batch_cvs.append(cv.item())
+
+        if len(batch_cvs) == 0:
+            return 0.0
+
+        return sum(batch_cvs) / len(batch_cvs)

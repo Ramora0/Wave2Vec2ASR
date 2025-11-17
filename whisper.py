@@ -1,3 +1,4 @@
+import torch
 from transformers import TrainerCallback
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 from transformers.trainer import Trainer
@@ -34,7 +35,7 @@ model = WhisperForConditionalGeneration.from_pretrained(
 
 # # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
 model.__class__ = MagnetWhisper
-BOUNDARY_TEMP = 1.1  # Final temperature we keep fixed during this run
+BOUNDARY_TEMP = 1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
 BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
@@ -63,6 +64,7 @@ _set_boundary_target_progress(model, BOUNDARY_TARGET_PROGRESS)
 # model.set_downsample_gradients_enabled(False)
 
 model.to("cuda")
+# model = torch.compile(model)
 # Don't manually convert to fp16 - let the trainer's AMP handle it
 # model.half()  # Convert model to fp16
 
@@ -89,7 +91,7 @@ training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=32,
+    per_device_train_batch_size=64,
     per_device_eval_batch_size=64,
 
     fp16=True,
@@ -97,20 +99,20 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=3e-5,
+    learning_rate=5e-5,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=3,
+    num_train_epochs=5,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
     save_steps=16000,
     save_total_limit=2,
-    eval_steps=4000,
+    eval_steps=2000,
     logging_steps=100,
     report_to="wandb",
     greater_is_better=False,
-    weight_decay=0,
+    weight_decay=0.01,
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
@@ -120,37 +122,38 @@ training_args = Seq2SeqTrainingArguments(
 
 
 class MagnetSeq2SeqTrainer(Seq2SeqTrainer):
-    def create_optimizer(self):
-        if self.optimizer is not None:
-            return
+    # def create_optimizer(self):
+    #     if self.optimizer is not None:
+    #         return
 
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
-            self.args)
+    #     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+    #         self.args)
 
-        boundary_params = []
-        other_params = []
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if "boundary_predictors" in name:
-                boundary_params.append(param)
-            else:
-                other_params.append(param)
+    #     boundary_params = []
+    #     other_params = []
+    #     for name, param in self.model.named_parameters():
+    #         if not param.requires_grad:
+    #             continue
+    #         if "boundary_predictors" in name:
+    #             boundary_params.append(param)
+    #         else:
+    #             other_params.append(param)
 
-        # The weight_decay argument in Seq2SeqTrainingArguments is a global setting.
-        # To apply it only to boundary_params, we create two parameter groups.
-        weight_decay = self.args.weight_decay
-        param_groups = [
-            {"params": other_params, "weight_decay": 0.0},
-            {"params": boundary_params, "weight_decay": weight_decay},
-        ]
+    #     # The weight_decay argument in Seq2SeqTrainingArguments is a global setting.
+    #     # To apply it only to boundary_params, we create two parameter groups.
+    #     weight_decay = self.args.weight_decay
+    #     param_groups = [
+    #         {"params": other_params, "weight_decay": 0.0},
+    #         {"params": boundary_params, "weight_decay": weight_decay},
+    #     ]
 
-        # The weight_decay is now specified in the param_groups, so remove it from the optimizer_kwargs
-        # to avoid conflicts if it's present.
-        if 'weight_decay' in optimizer_kwargs:
-            del optimizer_kwargs['weight_decay']
+    #     # The weight_decay is now specified in the param_groups, so remove it from the optimizer_kwargs
+    #     # to avoid conflicts if it's present.
+    #     if 'weight_decay' in optimizer_kwargs:
+    #         del optimizer_kwargs['weight_decay']
 
-        self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+    #     self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+    pass
 
 
 trainer = MagnetSeq2SeqTrainer(
@@ -166,6 +169,10 @@ trainer = MagnetSeq2SeqTrainer(
 
 class CompressionRatioCallback(TrainerCallback):
     """Callback to log compression ratios to wandb during training"""
+
+    def __init__(self):
+        super().__init__()
+        self.train_step = 0
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         compression_ratio = model.get_and_reset_compression_ratio()
@@ -187,6 +194,11 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_target_progress is not None:
             log_payload["train/boundary_target_progress"] = boundary_target_progress
 
+        # Log boundary CV (coefficient of variation for boundary spacing)
+        boundary_cv = getattr(model, "_boundary_cv", None)
+        if boundary_cv is not None:
+            log_payload["train/boundary_cv"] = boundary_cv
+
         # Log scheduled_prior and boundary_loss_weight from boundary predictors
         predictors = getattr(model.model.encoder, "boundary_predictors", [])
         if predictors:
@@ -206,51 +218,26 @@ class CompressionRatioCallback(TrainerCallback):
         #     log_payload["train/downsample_gradients_enabled"] = float(
         #         bool(downsample_grad_enabled))
 
-        wandb.log(log_payload)
+        # Use custom train_step counter to avoid jumps during evaluation
+        wandb.log(log_payload, step=self.train_step)
+        self.train_step += 1
+
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        """Log metrics after evaluation"""
+        if metrics is None:
+            return
+
+        # Log boundary CV from evaluation
+        boundary_cv = getattr(model, "_boundary_cv", None)
+        if boundary_cv is not None:
+            eval_log = {"eval/boundary_cv": boundary_cv}
+            wandb.log(eval_log, step=state.global_step)
+            # Also add to metrics dict that gets printed
+            metrics["boundary_cv"] = boundary_cv
 
 
 # Add compression ratio callback
 trainer.add_callback(CompressionRatioCallback())
-
-
-class FreezeNonBoundaryCallback(TrainerCallback):
-    def __init__(self, freeze_steps: int):
-        self.freeze_steps = freeze_steps
-        self._frozen = False
-        self._unfrozen = False
-
-    @staticmethod
-    def _is_boundary_parameter(name: str) -> bool:
-        return "boundary_predictors" in name
-
-    def _freeze(self, model):
-        for name, param in model.named_parameters():
-            param.requires_grad = self._is_boundary_parameter(name)
-        self._frozen = True
-
-    def _unfreeze(self, model):
-        for _, param in model.named_parameters():
-            param.requires_grad = True
-        self._unfrozen = True
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if model is None or self.freeze_steps <= 0 or self._frozen:
-            return
-        self._freeze(model)
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is None or not self._frozen or self._unfrozen:
-            return
-        if state.global_step >= self.freeze_steps:
-            self._unfreeze(model)
-
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        if model is None or not self._frozen or self._unfrozen:
-            return
-        self._unfreeze(model)
-
-
-# trainer.add_callback(FreezeNonBoundaryCallback(FREEZE_NON_BOUNDARY_STEPS))
 
 
 class CompressionScheduler(TrainerCallback):
@@ -306,13 +293,13 @@ COMPRESSION_SCHEDULE_STEPS = 12
 
 def compression_schedule(progress):
     """Advance compression in discrete steps during warmup, then hold at 1.0"""
-    # steps = 6
+    # steps = 3
     # return int(steps * progress + 1) / steps
     return 1
 
 
-# trainer.add_callback(CompressionScheduler(
-#     schedule_fn=compression_schedule))
+trainer.add_callback(CompressionScheduler(
+    schedule_fn=compression_schedule))
 
 
 class BoundaryLossWeightScheduler(TrainerCallback):
@@ -354,8 +341,8 @@ class BoundaryLossWeightScheduler(TrainerCallback):
                 predictor.set_boundary_loss_weight(weight)
 
 
-trainer.add_callback(BoundaryLossWeightScheduler(
-    start_weight=1.0, end_weight=1.0))
+# trainer.add_callback(BoundaryLossWeightScheduler(
+#     start_weight=1.0, end_weight=1.0))
 
 
 class TemperatureScheduler(TrainerCallback):
@@ -382,7 +369,7 @@ class TemperatureScheduler(TrainerCallback):
         _set_boundary_temperature(model, temperature)
 
 
-# trainer.add_callback(TemperatureScheduler(start_temp=0.1, end_temp=0.0))
+trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
 
 
 # class EvaluateFirstStepCallback(TrainerCallback):

@@ -175,3 +175,61 @@ def hinge_loss(num_boundaries, total_positions, prior_mean, prior_std, s_bound=3
     total_loss = loss_high + loss_low
 
     return total_loss
+
+
+def repulsion_loss(hard_boundaries, attention_mask=None, kernel_size=5):
+    """
+    Repulsion loss that penalizes nearby boundaries using convolution.
+
+    Uses a convolution with kernel_size to detect boundaries that are close together.
+    The loss is 0 if there are no nearby boundaries.
+
+    Args:
+        hard_boundaries: Binary boundary indicators. Shape: (batch_size, seq_len)
+        attention_mask: Optional mask for valid positions. Shape: (batch_size, seq_len)
+        kernel_size: Size of the convolution kernel to detect nearby boundaries (default: 5)
+
+    Returns:
+        torch.Tensor: Scalar loss value (0 if no nearby boundaries)
+    """
+    if not isinstance(hard_boundaries, torch.Tensor):
+        raise ValueError("hard_boundaries must be a tensor")
+
+    # Convert to float32 for conv1d
+    boundaries = hard_boundaries.to(dtype=torch.float32)
+
+    # Create a convolution kernel: all ones except the center
+    # This detects if there are boundaries near the current position
+    kernel = torch.ones(1, 1, kernel_size, device=boundaries.device, dtype=torch.float32)
+    center = kernel_size // 2
+    kernel[0, 0, center] = 0.0  # Exclude the center position itself
+
+    # Add channel dimension for conv1d: (batch_size, 1, seq_len)
+    boundaries_3d = boundaries.unsqueeze(1)
+
+    # Apply convolution with padding to maintain sequence length
+    padding = kernel_size // 2
+    nearby_count = torch.nn.functional.conv1d(
+        boundaries_3d, kernel, padding=padding
+    ).squeeze(1)  # Shape: (batch_size, seq_len)
+
+    # For each boundary position, check if there are nearby boundaries
+    # Multiply by the boundary indicator to only consider positions that are boundaries
+    nearby_violations = nearby_count * boundaries
+
+    # Apply attention mask if provided
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(dtype=torch.float32)
+        nearby_violations = nearby_violations * attention_mask
+        valid_positions = attention_mask.sum()
+    else:
+        valid_positions = boundaries.numel()
+
+    # Sum all violations and normalize
+    total_violations = nearby_violations.sum()
+
+    # Normalize by number of valid positions to make loss scale-invariant
+    # Clamp valid_positions to avoid division by zero
+    loss = total_violations / valid_positions.clamp(min=1.0)
+
+    return loss

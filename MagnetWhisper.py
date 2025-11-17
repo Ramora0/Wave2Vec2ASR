@@ -32,6 +32,7 @@ class MagnetSeq2SeqModelOutput(Seq2SeqModelOutput):
     boundary_log_probs: Optional[torch.FloatTensor] = None
     boundary_confidence: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    boundary_cv: Optional[float] = None
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
@@ -237,6 +238,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         boundary_rl: Optional[bool] = False,
         return_boundary_confidence: Optional[bool] = False,
         return_entropy: Optional[bool] = False,
+        num_items_in_batch: Optional[int] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -306,6 +308,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         boundary_log_probs = getattr(outputs, 'boundary_log_probs', None)
         boundary_confidence = getattr(outputs, 'boundary_confidence', None)
         entropy = getattr(outputs, 'entropy', None)
+        boundary_cv = getattr(outputs, 'boundary_cv', None)
 
         # Store compression ratios for logging
         self._compression_ratios = compression_ratios
@@ -326,6 +329,10 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         # Store entropy for RL entropy bonus
         # Move to CPU immediately - only used for reward computation
         self._entropy = entropy.cpu() if entropy is not None else None
+
+        # Store boundary CV for diagnostics
+        # Already a scalar, no need to move to CPU
+        self._boundary_cv = boundary_cv
 
         lm_logits = self.proj_out(outputs.last_hidden_state)
 
@@ -540,4 +547,5 @@ class MagnetWhisperModel(WhisperModel):
             boundary_confidence=getattr(
                 encoder_outputs, 'boundary_confidence', None),
             entropy=getattr(encoder_outputs, 'entropy', None),
+            boundary_cv=getattr(encoder_outputs, 'boundary_cv', None),
         )

@@ -249,6 +249,9 @@ class GRPOBoundaryTrainer:
             except RuntimeError:
                 avg_entropy = None
 
+        # Extract boundary CV for diagnostics (already a scalar)
+        boundary_cv = getattr(self.model, "_boundary_cv", None)
+
         # Get compression ratio
         compression_ratio = self.model.get_and_reset_compression_ratio()
 
@@ -324,6 +327,7 @@ class GRPOBoundaryTrainer:
         self.model._boundary_loss = None
         self.model._boundary_confidence = None
         self.model._entropy = None
+        self.model._boundary_cv = None
 
         # === Step 4: Log metrics ===
         with torch.no_grad():
@@ -355,6 +359,9 @@ class GRPOBoundaryTrainer:
 
             if avg_entropy is not None:
                 metrics["train/entropy"] = avg_entropy
+
+            if boundary_cv is not None:
+                metrics["train/boundary_cv"] = boundary_cv
 
             # Add boundary predictor settings (similar to whisper.py)
         self.global_step += 1

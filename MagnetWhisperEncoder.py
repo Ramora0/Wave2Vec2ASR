@@ -27,6 +27,7 @@ class MagnetModelOutput(BaseModelOutput):
     boundary_log_probs: Optional[torch.FloatTensor] = None
     boundary_confidence: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    boundary_cv: Optional[float] = None
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
@@ -88,7 +89,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         predictor_module = self.boundary_predictors[idx]
         if not isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
-            return hidden_states, attention_mask_1d, 0.0, None, None, None, target_pointer
+            return hidden_states, attention_mask_1d, 0.0, None, None, None, None, target_pointer
 
         predictor_input = hidden_states
         target_for_predictor = None
@@ -156,15 +157,20 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 return_confidence=return_boundary_confidence,
                 return_entropy=return_entropy,
             )
-        if len(result) == 8:
+        if len(result) == 9:
+            final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy, layer_cv = result
+        elif len(result) == 8:
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
+            layer_cv = None
         elif len(result) == 7:
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence = result
             layer_entropy = None
+            layer_cv = None
         else:
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob = result
             layer_confidence = None
             layer_entropy = None
+            layer_cv = None
 
         # The output of the predictor becomes the input for the encoder layer
         hidden_states = final_hs_for_layer
@@ -178,7 +184,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
         else:
             self.compression_ratios[idx] = 0.0
 
-        return hidden_states, attention_mask_1d, current_b_loss, layer_log_prob, layer_confidence, layer_entropy, target_pointer
+        return hidden_states, attention_mask_1d, current_b_loss, layer_log_prob, layer_confidence, layer_entropy, layer_cv, target_pointer
 
     def forward(
         self,
@@ -243,6 +249,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         confidence_layers = 0
         total_entropy = None
         entropy_layers = 0
+        total_cv = None
+        cv_layers = 0
 
         target_matrix: Optional[torch.Tensor] = None
         if target_boundary_counts is not None:
@@ -260,7 +268,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-            # Run boundary predictor BEFORE the layer
             (
                 hidden_states,
                 attention_mask_1d,
@@ -268,6 +275,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 layer_log_prob,
                 layer_confidence,
                 layer_entropy,
+                layer_cv,
                 target_pointer,
             ) = self._apply_boundary_predictor(
                 idx,
@@ -279,6 +287,26 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 return_boundary_confidence,
                 return_entropy
             )
+            # Run boundary predictor BEFORE the layer
+            # (
+            #     hidden_states,
+            #     attention_mask_1d,
+            #     current_b_loss,
+            #     layer_log_prob,
+            #     layer_confidence,
+            #     layer_entropy,
+            #     layer_cv,
+            #     target_pointer,
+            # ) = self._apply_boundary_predictor(
+            #     idx,
+            #     hidden_states,
+            #     attention_mask_1d,
+            #     target_matrix,
+            #     target_pointer,
+            #     boundary_rl,
+            #     return_boundary_confidence,
+            #     return_entropy
+            # )
 
             if layer_log_prob is not None:
                 if total_log_probs is None:
@@ -291,6 +319,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
             if layer_entropy is not None:
                 total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
                 entropy_layers += 1
+            if layer_cv is not None:
+                total_cv = layer_cv if total_cv is None else total_cv + layer_cv
+                cv_layers += 1
 
             boundary_loss += current_b_loss
 
@@ -334,6 +365,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         entropy = total_entropy if entropy_layers > 0 else None
 
+        avg_cv = None
+        if cv_layers > 0 and total_cv is not None:
+            avg_cv = total_cv / cv_layers
+
         return MagnetModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=encoder_states,
@@ -344,4 +379,5 @@ class MagnetWhisperEncoder(WhisperEncoder):
             boundary_log_probs=total_log_probs,
             boundary_confidence=avg_confidence,
             entropy=entropy,
+            boundary_cv=avg_cv,
         )

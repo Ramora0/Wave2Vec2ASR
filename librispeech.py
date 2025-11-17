@@ -33,6 +33,7 @@ def count_syllables(text: str) -> float:
     ]
     return float(len(syllable_tokens))
 
+
 def count_phonemes(text: str) -> float:
     normalized = text.strip().lower()
     if not normalized:
@@ -86,7 +87,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
                     self.processor.tokenizer,
                     self.decoder_start_token_id,
                 )
-                phoneme_counts.append(count_phonemes(text))
+                # phoneme_counts.append(count_phonemes(text))
+                phoneme_counts.append(count_syllables(text))
 
             phoneme_tensor = torch.tensor(
                 phoneme_counts, dtype=torch.float32)
