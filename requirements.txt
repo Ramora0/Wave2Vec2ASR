@@ -1,0 +1,9 @@
+torch
+transformers
+evaluate
+wandb
+accelerate
+datasets
+soundfile
+tqdm
+g2p_en

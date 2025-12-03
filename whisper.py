@@ -41,7 +41,7 @@ BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(0, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+model.load_magnet(boundary_priors, "BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -175,29 +175,35 @@ class CompressionRatioCallback(TrainerCallback):
         self.train_step = 0
 
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        if logs is None:
+            return
+
         compression_ratio = model.get_and_reset_compression_ratio()
         boundary_loss = model.get_and_reset_boundary_loss()
 
-        log_payload = {
-            "train/compression_ratio": compression_ratio
-        }
+        logs["train/compression_ratio"] = compression_ratio
 
         if boundary_loss is not None:
-            log_payload["train/boundary_loss"] = boundary_loss
+            logs["train/boundary_loss"] = boundary_loss
 
         boundary_temp = getattr(model, "boundary_temperature", None)
         if boundary_temp is not None:
-            log_payload["train/boundary_temperature"] = boundary_temp
+            logs["train/boundary_temperature"] = boundary_temp
 
         boundary_target_progress = getattr(
             model, "boundary_target_progress", None)
         if boundary_target_progress is not None:
-            log_payload["train/boundary_target_progress"] = boundary_target_progress
+            logs["train/boundary_target_progress"] = boundary_target_progress
 
         # Log boundary CV (coefficient of variation for boundary spacing)
         boundary_cv = getattr(model, "_boundary_cv", None)
         if boundary_cv is not None:
-            log_payload["train/boundary_cv"] = boundary_cv
+            logs["train/boundary_cv"] = boundary_cv
+
+        # Log boundary adjacent percentage (% of boundaries with neighbor at distance 1)
+        boundary_adjacent_pct = getattr(model, "_boundary_adjacent_pct", None)
+        if boundary_adjacent_pct is not None:
+            logs["train/boundary_adjacent_pct"] = boundary_adjacent_pct
 
         # Log scheduled_prior and boundary_loss_weight from boundary predictors
         predictors = getattr(model.model.encoder, "boundary_predictors", [])
@@ -205,22 +211,20 @@ class CompressionRatioCallback(TrainerCallback):
             # Log the scheduled prior value
             if hasattr(predictors[0], "get_scheduled_prior"):
                 scheduled_prior = predictors[0].get_scheduled_prior()
-                log_payload["train/scheduled_prior"] = scheduled_prior
+                logs["train/scheduled_prior"] = scheduled_prior
 
             # Log the boundary loss weight
             if hasattr(predictors[0], "boundary_loss_weight"):
                 loss_weight = predictors[0].boundary_loss_weight
-                log_payload["train/boundary_loss_weight"] = loss_weight
+                logs["train/boundary_loss_weight"] = loss_weight
 
         # downsample_grad_enabled = getattr(
         #     model, "downsample_gradients_enabled", None)
         # if downsample_grad_enabled is not None:
-        #     log_payload["train/downsample_gradients_enabled"] = float(
+        #     logs["train/downsample_gradients_enabled"] = float(
         #         bool(downsample_grad_enabled))
 
-        # Use custom train_step counter to avoid jumps during evaluation
-        wandb.log(log_payload, step=self.train_step)
-        self.train_step += 1
+        wandb.log(logs, step=state.global_step)
 
     def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
         """Log metrics after evaluation"""
@@ -234,6 +238,14 @@ class CompressionRatioCallback(TrainerCallback):
             wandb.log(eval_log, step=state.global_step)
             # Also add to metrics dict that gets printed
             metrics["boundary_cv"] = boundary_cv
+
+        # Log boundary adjacent percentage from evaluation
+        boundary_adjacent_pct = getattr(model, "_boundary_adjacent_pct", None)
+        if boundary_adjacent_pct is not None:
+            eval_log = {"eval/boundary_adjacent_pct": boundary_adjacent_pct}
+            wandb.log(eval_log, step=state.global_step)
+            # Also add to metrics dict that gets printed
+            metrics["boundary_adjacent_pct"] = boundary_adjacent_pct
 
 
 # Add compression ratio callback

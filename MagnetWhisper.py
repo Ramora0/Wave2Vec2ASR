@@ -11,6 +11,7 @@ import os
 from BoundaryPredictor1 import BoundaryPredictor1
 from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
+from BoundaryPredictor4 import BoundaryPredictor4
 from MagnetWhisperDecoder import MagnetWhisperDecoder
 from MagnetWhisperEncoder import MagnetWhisperEncoder
 from MagnetEncoderLayer import MagnetEncoderLayer
@@ -33,6 +34,7 @@ class MagnetSeq2SeqModelOutput(Seq2SeqModelOutput):
     boundary_confidence: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
     boundary_cv: Optional[float] = None
+    boundary_adjacent_pct: Optional[float] = None
 
 
 class MagnetWhisper(WhisperForConditionalGeneration):
@@ -133,6 +135,14 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                         1,
                         0.5
                     )
+                elif predictor_type == "BoundaryPredictor4" and idx in layer_priors_dict:
+                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor4(
+                        768,
+                        768,
+                        layer_priors_dict[idx],
+                        1,
+                        0.5
+                    )
         else:
             # Fallback to old method for backward compatibility
             model.load_magnet(layer_priors, "BoundaryPredictor1")
@@ -143,7 +153,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
         # Load state dict only for BoundaryPredictor instances, not Identity layers
         for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
                 predictor_key = str(idx)
                 if predictor_key in boundary_state_dict:
                     boundary_predictor.load_state_dict(
@@ -154,7 +164,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         threshold_dict = dict(layer_thresholds)
 
         for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
                 boundary_predictor.temp = temp_dict[idx]
                 boundary_predictor.threshold = threshold_dict[idx]
 
@@ -172,7 +182,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         # Create a state dict containing only BoundaryPredictor instances
         boundary_state_dict = {}
         for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3)):
+            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
                 boundary_state_dict[str(idx)] = boundary_predictor.state_dict()
 
         torch.save(boundary_state_dict, boundary_states_path)
@@ -203,6 +213,11 @@ class MagnetWhisper(WhisperForConditionalGeneration):
                 layer_temps.append((idx, boundary_predictor.temp))
                 layer_thresholds.append((idx, boundary_predictor.threshold))
                 layer_types.append((idx, "BoundaryPredictor3"))
+            elif isinstance(boundary_predictor, BoundaryPredictor4):
+                layer_priors.append((idx, boundary_predictor.prior))
+                layer_temps.append((idx, boundary_predictor.temp))
+                layer_thresholds.append((idx, boundary_predictor.threshold))
+                layer_types.append((idx, "BoundaryPredictor4"))
             else:
                 layer_types.append((idx, "Identity"))
 
@@ -309,6 +324,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         boundary_confidence = getattr(outputs, 'boundary_confidence', None)
         entropy = getattr(outputs, 'entropy', None)
         boundary_cv = getattr(outputs, 'boundary_cv', None)
+        boundary_adjacent_pct = getattr(outputs, 'boundary_adjacent_pct', None)
 
         # Store compression ratios for logging
         self._compression_ratios = compression_ratios
@@ -333,6 +349,10 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         # Store boundary CV for diagnostics
         # Already a scalar, no need to move to CPU
         self._boundary_cv = boundary_cv
+
+        # Store boundary adjacent percentage for diagnostics
+        # Already a scalar, no need to move to CPU
+        self._boundary_adjacent_pct = boundary_adjacent_pct
 
         lm_logits = self.proj_out(outputs.last_hidden_state)
 
@@ -548,4 +568,5 @@ class MagnetWhisperModel(WhisperModel):
                 encoder_outputs, 'boundary_confidence', None),
             entropy=getattr(encoder_outputs, 'entropy', None),
             boundary_cv=getattr(encoder_outputs, 'boundary_cv', None),
+            boundary_adjacent_pct=getattr(encoder_outputs, 'boundary_adjacent_pct', None),
         )
