@@ -568,5 +568,6 @@ class MagnetWhisperModel(WhisperModel):
                 encoder_outputs, 'boundary_confidence', None),
             entropy=getattr(encoder_outputs, 'entropy', None),
             boundary_cv=getattr(encoder_outputs, 'boundary_cv', None),
-            boundary_adjacent_pct=getattr(encoder_outputs, 'boundary_adjacent_pct', None),
+            boundary_adjacent_pct=getattr(
+                encoder_outputs, 'boundary_adjacent_pct', None),
         )

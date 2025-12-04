@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible
-from utils import downsample, get_sinusoidal_positional_embeddings
+from utils import downsample, get_sinusoidal_positional_embeddings, common
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, max_positions=1500):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, max_positions=1500, use_attention_pooling=True):
         super().__init__()
         self.temp = temp
         self.prior = prior
@@ -53,6 +53,33 @@ class BoundaryPredictor2(nn.Module):
 
         self.dropout = nn.Dropout(p=0.1)
 
+        # Attention pooling parameters
+        self.use_attention_pooling = use_attention_pooling
+
+        if self.use_attention_pooling:
+            # Learned query vector for attention pooling
+            self.pool_query = nn.Parameter(torch.randn(input_dim) * 0.02)
+
+            # Key and Value projections
+            self.pool_key = nn.Linear(input_dim, input_dim, bias=False)
+            self.pool_value = nn.Linear(input_dim, input_dim, bias=False)
+
+            # Output projection after pooling
+            self.pool_output = nn.Linear(input_dim, input_dim, bias=False)
+
+            # Scaling factor for attention scores
+            self.pool_scale = input_dim ** -0.5
+
+            # Initialize projections as identity matrices
+            with torch.no_grad():
+                self.pool_key.weight.copy_(torch.eye(input_dim))
+                self.pool_value.weight.copy_(torch.eye(input_dim))
+                self.pool_output.weight.copy_(torch.eye(input_dim))
+
+            self.pool_key.weight._no_reinit = True
+            self.pool_value.weight._no_reinit = True
+            self.pool_output.weight._no_reinit = True
+
     def set_prior(self, prior):
         self.prior = prior
 
@@ -71,6 +98,23 @@ class BoundaryPredictor2(nn.Module):
         1.0 = boundary loss has full effect
         """
         self.boundary_loss_weight = float(weight)
+
+    def set_pooling_method(self, use_attention: bool):
+        """
+        Switch between weighted mean and attention pooling.
+
+        Args:
+            use_attention: If True, use attention pooling; if False, use weighted mean pooling
+
+        Raises:
+            ValueError: If attention pooling is requested but parameters were not initialized
+        """
+        if use_attention and not hasattr(self, 'pool_query'):
+            raise ValueError(
+                "Attention pooling parameters not initialized. "
+                "Create model with use_attention_pooling=True"
+            )
+        self.use_attention_pooling = use_attention
 
     def get_scheduled_prior(self):
         """
@@ -98,6 +142,78 @@ class BoundaryPredictor2(nn.Module):
     def _add_positional_embeddings(self, x):
         pos_embeds = get_sinusoidal_positional_embeddings(x)
         return x + pos_embeds
+
+    def _weighted_mean_pooling(self, boundaries, hidden, attention_mask=None):
+        """Weighted mean pooling using segment assignment normalization."""
+        pooled = downsample(boundaries, hidden.transpose(0, 1), attention_mask=attention_mask)
+        return pooled.transpose(0, 1)  # B x S x D
+
+    def _attention_pooling(self, boundaries, hidden, attention_mask=None):
+        """
+        Attention-based pooling using learned query vectors.
+
+        Args:
+            boundaries: (B, L) - binary boundary indicators
+            hidden: (B, L, D) - hidden states
+            attention_mask: (B, L) - attention mask
+
+        Returns:
+            pooled: (B, S, D) - pooled segment representations
+        """
+        batch_size, seq_len, hidden_dim = hidden.shape
+        device = hidden.device
+        dtype = hidden.dtype
+
+        # Step 1: Create segment assignment matrix using existing logic
+        foo = common(boundaries)  # B x L x S
+
+        if foo is None:
+            # No boundaries found
+            return torch.empty(batch_size, 0, hidden_dim, device=device, dtype=dtype)
+
+        max_segments = foo.size(2)  # S
+
+        # Step 2: Create binary segment mask (B x L x S)
+        # foo == 0 indicates token belongs to segment
+        segment_mask = (foo == 0).float()  # B x L x S
+
+        if attention_mask is not None:
+            # Apply attention mask: (B, L, 1) * (B, L, S) -> (B, L, S)
+            segment_mask = segment_mask * attention_mask.unsqueeze(-1)
+
+        # Step 3: Project to keys and values
+        keys = self.pool_key(hidden)      # B x L x D
+        values = self.pool_value(hidden)  # B x L x D
+
+        # Step 4: Compute attention scores: query @ keys
+        # pool_query: (D,) -> (1, 1, D)
+        # keys: (B, L, D)
+        query = self.pool_query.view(1, 1, -1)  # (1, 1, D)
+        attn_scores = torch.sum(query * keys, dim=-1, keepdim=True)  # (B, L, 1)
+        attn_scores = attn_scores * self.pool_scale
+
+        # Step 5: Expand to all segments: (B, L, S)
+        attn_scores = attn_scores.expand(-1, -1, max_segments)
+
+        # Step 6: Mask out positions not in segment
+        attn_scores = attn_scores.masked_fill(segment_mask == 0, float('-inf'))
+
+        # Step 7: Compute attention weights per segment
+        # Transpose to (B, S, L) for per-segment softmax
+        attn_scores = attn_scores.transpose(1, 2)  # B x S x L
+        attn_weights = F.softmax(attn_scores, dim=-1)  # B x S x L
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+
+        # Step 8: Apply attention: (B, S, L) @ (B, L, D) -> (B, S, D)
+        pooled = torch.bmm(attn_weights, values)  # B x S x D
+
+        # Step 9: Optional output projection
+        pooled = self.pool_output(pooled)
+
+        # Ensure output maintains same dtype as input
+        pooled = pooled.to(dtype=dtype)
+
+        return pooled  # B x S x D
 
     def forward(
         self,
@@ -170,12 +286,11 @@ class BoundaryPredictor2(nn.Module):
             hard_samples - soft_boundaries.detach() + soft_boundaries
         )
 
-        pooled = downsample(
-            hard_boundaries, hidden.transpose(0, 1), attention_mask=attention_mask
-        )
-
-        # Transpose to B x S x D
-        pooled = pooled.transpose(0, 1)
+        # Apply pooling based on selected method
+        if self.use_attention_pooling:
+            pooled = self._attention_pooling(hard_boundaries, hidden, attention_mask)  # B x S x D
+        else:
+            pooled = self._weighted_mean_pooling(hard_boundaries, hidden, attention_mask)  # B x S x D
 
         pooled = self._add_positional_embeddings(pooled)
 
