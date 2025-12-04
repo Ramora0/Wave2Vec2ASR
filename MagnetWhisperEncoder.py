@@ -180,6 +180,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # BoundaryPredictor2 now returns 10-tuple: (pooled, loss, num_boundaries, total_positions, shortened_mask, log_prob, confidence, entropy, cv, adjacent_pct)
         # BoundaryPredictor4 returns 9-tuple without log_prob: (pooled, loss, num_boundaries, total_positions, shortened_mask, confidence, entropy, cv, adjacent_pct)
         # Others may return fewer values
+        # DEBUG: Print tuple length
+        if isinstance(predictor_module, BoundaryPredictor2):
+            print(f"[DEBUG] BP2 result length: {len(result)}, last value: {result[-1]}")
         if isinstance(predictor_module, BoundaryPredictor4):
             # BP4 returns: (pooled, loss, num_boundaries, total_positions, shortened_mask, confidence, entropy, cv, adjacent_pct)
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_confidence, layer_entropy, layer_cv, layer_adjacent_pct = result

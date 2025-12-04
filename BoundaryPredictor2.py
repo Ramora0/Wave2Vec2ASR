@@ -23,13 +23,8 @@ class BoundaryPredictor2(nn.Module):
         # Boundary loss weight: 0 = loss has no effect, 1 = full loss effect
         self.boundary_loss_weight = 0.0  # Start with no boundary loss
 
-        # MLP layers before projections
-        self.q_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-        self.k_mlp = nn.Sequential(
+        # Shared MLP for boundary detection (used by both q and k)
+        self.boundary_mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, input_dim)
@@ -57,18 +52,26 @@ class BoundaryPredictor2(nn.Module):
         self.use_attention_pooling = use_attention_pooling
 
         if self.use_attention_pooling:
-            # Learned query vector for attention pooling
-            self.pool_query = nn.Parameter(torch.randn(input_dim) * 0.02)
+            # Multi-head attention configuration
+            self.num_heads = 8
+            self.head_dim = input_dim // self.num_heads
+            assert input_dim % self.num_heads == 0, f"input_dim ({input_dim}) must be divisible by num_heads ({self.num_heads})"
+
+            # Learned query vector (shared across all segments)
+            self.learned_query = nn.Parameter(torch.randn(input_dim))
 
             # Key and Value projections
             self.pool_key = nn.Linear(input_dim, input_dim, bias=False)
             self.pool_value = nn.Linear(input_dim, input_dim, bias=False)
 
-            # Output projection after pooling
+            # Output projection after pooling (combines heads)
             self.pool_output = nn.Linear(input_dim, input_dim, bias=False)
 
-            # Scaling factor for attention scores
-            self.pool_scale = input_dim ** -0.5
+            # LayerNorm for stabilizing attention inputs
+            self.pool_layernorm = nn.LayerNorm(input_dim)
+
+            # Scaling factor for attention scores (per head)
+            self.pool_scale = self.head_dim ** -0.5
 
             # Initialize projections as identity matrices
             with torch.no_grad():
@@ -109,7 +112,7 @@ class BoundaryPredictor2(nn.Module):
         Raises:
             ValueError: If attention pooling is requested but parameters were not initialized
         """
-        if use_attention and not hasattr(self, 'pool_query'):
+        if use_attention and not hasattr(self, 'learned_query'):
             raise ValueError(
                 "Attention pooling parameters not initialized. "
                 "Create model with use_attention_pooling=True"
@@ -150,7 +153,7 @@ class BoundaryPredictor2(nn.Module):
 
     def _attention_pooling(self, boundaries, hidden, attention_mask=None):
         """
-        Attention-based pooling using learned query vectors.
+        Multi-head attention-based pooling using query matrix applied to boundary positions.
 
         Args:
             boundaries: (B, L) - binary boundary indicators
@@ -181,33 +184,45 @@ class BoundaryPredictor2(nn.Module):
             # Apply attention mask: (B, L, 1) * (B, L, S) -> (B, L, S)
             segment_mask = segment_mask * attention_mask.unsqueeze(-1)
 
-        # Step 3: Project to keys and values
-        keys = self.pool_key(hidden)      # B x L x D
-        values = self.pool_value(hidden)  # B x L x D
+        # Step 3: Use learned query vector for all segments
+        # Expand learned query to (B, S, D) - same query for all segments in all batches
+        queries = self.learned_query.unsqueeze(0).unsqueeze(0).expand(batch_size, max_segments, -1)  # (B, S, D)
 
-        # Step 4: Compute attention scores: query @ keys
-        # pool_query: (D,) -> (1, 1, D)
-        # keys: (B, L, D)
-        query = self.pool_query.view(1, 1, -1)  # (1, 1, D)
-        attn_scores = torch.sum(query * keys, dim=-1, keepdim=True)  # (B, L, 1)
+        # Step 4: Reshape queries for multi-head attention
+        queries = queries.view(batch_size, max_segments, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, S, head_dim)
+
+        # Step 5: Apply LayerNorm before projecting to keys and values
+        hidden_normed = self.pool_layernorm(hidden)  # (B, L, D)
+
+        # Step 6: Project to keys and values and reshape for multi-head
+        keys = self.pool_key(hidden_normed)      # (B, L, D)
+        keys = keys.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, L, head_dim)
+
+        values = self.pool_value(hidden_normed)  # (B, L, D)
+        values = values.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, L, head_dim)
+
+        # Step 7: Compute attention scores: queries @ keys
+        # queries: (B, H, S, head_dim), keys: (B, H, L, head_dim) -> (B, H, S, L)
+        attn_scores = torch.matmul(queries, keys.transpose(-2, -1))  # (B, H, S, L)
         attn_scores = attn_scores * self.pool_scale
 
-        # Step 5: Expand to all segments: (B, L, S)
-        attn_scores = attn_scores.expand(-1, -1, max_segments)
+        # Step 8: Mask out positions not in segment
+        # segment_mask is (B, L, S), we need (B, 1, S, L) for broadcasting across heads
+        segment_mask_transposed = segment_mask.transpose(1, 2).unsqueeze(1)  # (B, 1, S, L)
+        attn_scores = attn_scores.masked_fill(segment_mask_transposed == 0, float('-inf'))
 
-        # Step 6: Mask out positions not in segment
-        attn_scores = attn_scores.masked_fill(segment_mask == 0, float('-inf'))
-
-        # Step 7: Compute attention weights per segment
-        # Transpose to (B, S, L) for per-segment softmax
-        attn_scores = attn_scores.transpose(1, 2)  # B x S x L
-        attn_weights = F.softmax(attn_scores, dim=-1)  # B x S x L
+        # Step 9: Compute attention weights per segment
+        attn_weights = F.softmax(attn_scores, dim=-1)  # (B, H, S, L)
         attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
-        # Step 8: Apply attention: (B, S, L) @ (B, L, D) -> (B, S, D)
-        pooled = torch.bmm(attn_weights, values)  # B x S x D
+        # Step 10: Apply attention: (B, H, S, L) @ (B, H, L, head_dim) -> (B, H, S, head_dim)
+        pooled = torch.matmul(attn_weights, values)  # (B, H, S, head_dim)
 
-        # Step 9: Optional output projection
+        # Step 11: Concatenate heads back together
+        pooled = pooled.transpose(1, 2).contiguous()  # (B, S, H, head_dim)
+        pooled = pooled.view(batch_size, max_segments, hidden_dim)  # (B, S, D)
+
+        # Step 12: Output projection to combine information from all heads
         pooled = self.pool_output(pooled)
 
         # Ensure output maintains same dtype as input
@@ -228,11 +243,16 @@ class BoundaryPredictor2(nn.Module):
     ):
         batch_size = hidden.size(0)
 
-        # Apply MLP transformation with normalization before and after
-        q_hidden = self.q_proj_layer(F.normalize(
-            self.q_mlp(F.normalize(self.dropout(hidden[:, :-1]), dim=-1)), dim=-1))
-        k_hidden = self.k_proj_layer(F.normalize(
-            self.k_mlp(F.normalize(self.dropout(hidden[:, 1:]), dim=-1)), dim=-1))
+        # Apply shared MLP with residual connections
+        q_input = F.normalize(self.dropout(hidden[:, :-1]), dim=-1)
+        q_mlp_out = self.boundary_mlp(q_input)
+        q_residual = q_mlp_out + q_input  # Residual connection
+        q_hidden = self.q_proj_layer(F.normalize(q_residual, dim=-1))
+
+        k_input = F.normalize(self.dropout(hidden[:, 1:]), dim=-1)
+        k_mlp_out = self.boundary_mlp(k_input)
+        k_residual = k_mlp_out + k_input  # Residual connection
+        k_hidden = self.k_proj_layer(F.normalize(k_residual, dim=-1))
 
         cos_sim = torch.einsum("bld,bld->bl", q_hidden, k_hidden)
         probs = torch.clamp(
