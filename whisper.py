@@ -33,7 +33,7 @@ print("hi")
 model = WhisperForConditionalGeneration.from_pretrained(
     "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
 
-# # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor2.
+# # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor1.
 model.__class__ = MagnetWhisper
 BOUNDARY_TEMP = 1  # Final temperature we keep fixed during this run
 # Max compression, i.e., syllable target throughout training
@@ -41,7 +41,7 @@ BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 boundary_priors = [(0, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+model.load_magnet(boundary_priors, "BoundaryPredictor1")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -93,6 +93,9 @@ training_args = Seq2SeqTrainingArguments(
 
     per_device_train_batch_size=32,
     per_device_eval_batch_size=64,
+
+    # gradient_accumulation_steps=2,
+    # gradient_checkpointing=True,
 
     fp16=True,
     fp16_full_eval=True,

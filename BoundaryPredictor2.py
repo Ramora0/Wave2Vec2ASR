@@ -396,6 +396,51 @@ class BoundaryPredictor2(nn.Module):
                     attention_mask.to(entropy_map.dtype)
             entropy = entropy_map.sum(dim=1)
 
+        # Calculate boundary spacing statistics
+        boundary_cv = None
+        boundary_adjacent_pct = None
+
+        with torch.no_grad():
+            all_spacings = []
+            adjacent_count = 0
+            total_boundaries = 0
+
+            for b in range(batch_size):
+                # Get boundary positions for this sample
+                if attention_mask is not None:
+                    valid_length = int(attention_mask[b].sum().item())
+                    boundaries_b = hard_samples[b, :valid_length]
+                else:
+                    boundaries_b = hard_samples[b]
+
+                # Find positions where boundaries occur
+                boundary_positions = boundaries_b.nonzero(as_tuple=True)[0]
+
+                if len(boundary_positions) > 1:
+                    # Calculate spacings between consecutive boundaries
+                    spacings = boundary_positions[1:] - boundary_positions[:-1]
+                    all_spacings.extend(spacings.cpu().tolist())
+
+                    # Count adjacent boundaries (spacing == 1)
+                    adjacent_count += (spacings == 1).sum().item()
+                    total_boundaries += len(boundary_positions) - 1  # Number of gaps between boundaries
+
+            # Calculate coefficient of variation (CV = std / mean)
+            if len(all_spacings) > 0:
+                spacings_tensor = torch.tensor(all_spacings, dtype=torch.float32)
+                mean_spacing = spacings_tensor.mean()
+                std_spacing = spacings_tensor.std()
+                if mean_spacing > 0:
+                    boundary_cv = (std_spacing / mean_spacing).item()
+                else:
+                    boundary_cv = 0.0
+
+            # Calculate adjacent percentage
+            if total_boundaries > 0:
+                boundary_adjacent_pct = (adjacent_count / total_boundaries) * 100.0
+            else:
+                boundary_adjacent_pct = 0.0
+
         return (
             pooled,
             loss,
@@ -405,6 +450,8 @@ class BoundaryPredictor2(nn.Module):
             log_prob,
             confidence,
             entropy,
+            boundary_cv,
+            boundary_adjacent_pct,
         )
 
     def calc_loss(self, num_boundaries, total_positions):
