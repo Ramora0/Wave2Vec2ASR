@@ -91,7 +91,7 @@ training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=64,
+    per_device_train_batch_size=128,
     per_device_eval_batch_size=64,
 
     # gradient_accumulation_steps=2,
@@ -102,7 +102,7 @@ training_args = Seq2SeqTrainingArguments(
     # bf16=True,
     # bf16_full_eval=True,
 
-    learning_rate=5e-4,
+    learning_rate=1e-4,
     warmup_ratio=0.1,
     # max_steps=16000,
     num_train_epochs=5,
@@ -111,7 +111,7 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     save_steps=16000,
     save_total_limit=2,
-    eval_steps=2000,
+    eval_steps=1000,
     logging_steps=100,
     report_to="wandb",
     greater_is_better=False,

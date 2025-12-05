@@ -182,7 +182,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # Others may return fewer values
         # DEBUG: Print tuple length
         if isinstance(predictor_module, BoundaryPredictor2):
-            print(f"[DEBUG] BP2 result length: {len(result)}, last value: {result[-1]}")
+            print(
+                f"[DEBUG] BP2 result length: {len(result)}, last value: {result[-1]}")
         if isinstance(predictor_module, BoundaryPredictor4):
             # BP4 returns: (pooled, loss, num_boundaries, total_positions, shortened_mask, confidence, entropy, cv, adjacent_pct)
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_confidence, layer_entropy, layer_cv, layer_adjacent_pct = result
@@ -192,7 +193,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy, layer_cv, layer_adjacent_pct = result
         elif len(result) == 9:
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy, layer_cv = result
-            layer_adjacent_pct = None  # BP1/2/3 don't return adjacent_pct (old versions)
+            # BP1/2/3 don't return adjacent_pct (old versions)
+            layer_adjacent_pct = None
         elif len(result) == 8:
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_log_prob, layer_confidence, layer_entropy = result
             layer_cv = None

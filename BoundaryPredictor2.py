@@ -148,7 +148,8 @@ class BoundaryPredictor2(nn.Module):
 
     def _weighted_mean_pooling(self, boundaries, hidden, attention_mask=None):
         """Weighted mean pooling using segment assignment normalization."""
-        pooled = downsample(boundaries, hidden.transpose(0, 1), attention_mask=attention_mask)
+        pooled = downsample(boundaries, hidden.transpose(
+            0, 1), attention_mask=attention_mask)
         return pooled.transpose(0, 1)  # B x S x D
 
     def _attention_pooling(self, boundaries, hidden, attention_mask=None):
@@ -180,36 +181,53 @@ class BoundaryPredictor2(nn.Module):
         # foo == 0 indicates token belongs to segment
         segment_mask = (foo == 0).float()  # B x L x S
 
+        # Expand view forward by one chunk: allow each segment to attend to next segment
+        # if max_segments > 1:
+        #     # Create mask for next segment's tokens
+        #     next_segment_mask = torch.zeros_like(segment_mask)
+        #     next_segment_mask[:, :, :-1] = segment_mask[:, :, 1:]
+        #     # Combine current and next segment masks
+        #     segment_mask = torch.clamp(segment_mask + next_segment_mask, 0, 1)
+
         if attention_mask is not None:
             # Apply attention mask: (B, L, 1) * (B, L, S) -> (B, L, S)
             segment_mask = segment_mask * attention_mask.unsqueeze(-1)
 
         # Step 3: Use learned query vector for all segments
         # Expand learned query to (B, S, D) - same query for all segments in all batches
-        queries = self.learned_query.unsqueeze(0).unsqueeze(0).expand(batch_size, max_segments, -1)  # (B, S, D)
+        queries = self.learned_query.unsqueeze(0).unsqueeze(
+            0).expand(batch_size, max_segments, -1)  # (B, S, D)
 
         # Step 4: Reshape queries for multi-head attention
-        queries = queries.view(batch_size, max_segments, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, S, head_dim)
+        queries = queries.view(batch_size, max_segments, self.num_heads,
+                               # (B, H, S, head_dim)
+                               self.head_dim).transpose(1, 2)
 
         # Step 5: Apply LayerNorm before projecting to keys and values
         hidden_normed = self.pool_layernorm(hidden)  # (B, L, D)
 
         # Step 6: Project to keys and values and reshape for multi-head
         keys = self.pool_key(hidden_normed)      # (B, L, D)
-        keys = keys.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, L, head_dim)
+        keys = keys.view(batch_size, seq_len, self.num_heads,
+                         self.head_dim).transpose(1, 2)  # (B, H, L, head_dim)
 
         values = self.pool_value(hidden_normed)  # (B, L, D)
-        values = values.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, L, head_dim)
+        values = values.view(batch_size, seq_len, self.num_heads,
+                             # (B, H, L, head_dim)
+                             self.head_dim).transpose(1, 2)
 
         # Step 7: Compute attention scores: queries @ keys
         # queries: (B, H, S, head_dim), keys: (B, H, L, head_dim) -> (B, H, S, L)
-        attn_scores = torch.matmul(queries, keys.transpose(-2, -1))  # (B, H, S, L)
+        attn_scores = torch.matmul(
+            queries, keys.transpose(-2, -1))  # (B, H, S, L)
         attn_scores = attn_scores * self.pool_scale
 
         # Step 8: Mask out positions not in segment
         # segment_mask is (B, L, S), we need (B, 1, S, L) for broadcasting across heads
-        segment_mask_transposed = segment_mask.transpose(1, 2).unsqueeze(1)  # (B, 1, S, L)
-        attn_scores = attn_scores.masked_fill(segment_mask_transposed == 0, float('-inf'))
+        segment_mask_transposed = segment_mask.transpose(
+            1, 2).unsqueeze(1)  # (B, 1, S, L)
+        attn_scores = attn_scores.masked_fill(
+            segment_mask_transposed == 0, float('-inf'))
 
         # Step 9: Compute attention weights per segment
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, H, S, L)
@@ -308,9 +326,11 @@ class BoundaryPredictor2(nn.Module):
 
         # Apply pooling based on selected method
         if self.use_attention_pooling:
-            pooled = self._attention_pooling(hard_boundaries, hidden, attention_mask)  # B x S x D
+            pooled = self._attention_pooling(
+                hard_boundaries, hidden, attention_mask)  # B x S x D
         else:
-            pooled = self._weighted_mean_pooling(hard_boundaries, hidden, attention_mask)  # B x S x D
+            pooled = self._weighted_mean_pooling(
+                hard_boundaries, hidden, attention_mask)  # B x S x D
 
         pooled = self._add_positional_embeddings(pooled)
 
@@ -443,11 +463,13 @@ class BoundaryPredictor2(nn.Module):
 
                     # Count adjacent boundaries (spacing == 1)
                     adjacent_count += (spacings == 1).sum().item()
-                    total_boundaries += len(boundary_positions) - 1  # Number of gaps between boundaries
+                    # Number of gaps between boundaries
+                    total_boundaries += len(boundary_positions) - 1
 
             # Calculate coefficient of variation (CV = std / mean)
             if len(all_spacings) > 0:
-                spacings_tensor = torch.tensor(all_spacings, dtype=torch.float32)
+                spacings_tensor = torch.tensor(
+                    all_spacings, dtype=torch.float32)
                 mean_spacing = spacings_tensor.mean()
                 std_spacing = spacings_tensor.std()
                 if mean_spacing > 0:
@@ -457,7 +479,8 @@ class BoundaryPredictor2(nn.Module):
 
             # Calculate adjacent percentage
             if total_boundaries > 0:
-                boundary_adjacent_pct = (adjacent_count / total_boundaries) * 100.0
+                boundary_adjacent_pct = (
+                    adjacent_count / total_boundaries) * 100.0
             else:
                 boundary_adjacent_pct = 0.0
 
