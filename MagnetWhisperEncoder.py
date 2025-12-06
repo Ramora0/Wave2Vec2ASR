@@ -45,6 +45,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         for layer in self.layers:
             layer.__class__ = MagnetEncoderLayer
             layer.self_attn.__class__ = MagnetAttention
+            # Initialize RoPE for this attention module
+            layer.self_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
 
         for layer_idx, prior_value in lp:
             if predictor_type == "BoundaryPredictor1":

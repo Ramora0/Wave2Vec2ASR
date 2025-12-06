@@ -15,6 +15,9 @@ class MagnetWhisperDecoder(WhisperDecoder):
             layer.__class__ = MagnetDecoderLayer
             layer.self_attn.__class__ = MagnetAttention
             layer.encoder_attn.__class__ = MagnetAttention
+            # Initialize RoPE for both self-attention and cross-attention
+            layer.self_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
+            layer.encoder_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
 
     def forward(
         self,
@@ -153,17 +156,18 @@ class MagnetWhisperDecoder(WhisperDecoder):
             position_ids = cache_position.unsqueeze(
                 0).repeat(input_shape[0], 1)
 
-        # embed positions
-        if input_ids is not None:
-            positions = self.embed_positions(
-                input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
-            )
-        else:
-            positions = self.embed_positions(
-                inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
-            )
+        # embed positions - DISABLED: using RoPE instead
+        # if input_ids is not None:
+        #     positions = self.embed_positions(
+        #         input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
+        #     )
+        # else:
+        #     positions = self.embed_positions(
+        #         inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
+        #     )
 
-        hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        # hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        hidden_states = inputs_embeds
         hidden_states = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
 

@@ -85,12 +85,17 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         for layer in model.model.encoder.layers:
             layer.__class__ = MagnetEncoderLayer
             layer.self_attn.__class__ = MagnetAttention
+            # Initialize RoPE for encoder self-attention
+            layer.self_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
 
         # Convert decoder layers to use MagnetAttention
         for layer in model.model.decoder.layers:
             layer.__class__ = MagnetDecoderLayer
             layer.self_attn.__class__ = MagnetAttention
             layer.encoder_attn.__class__ = MagnetAttention
+            # Initialize RoPE for decoder self-attention and cross-attention
+            layer.self_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
+            layer.encoder_attn.load_magnet(max_position_embeddings=1500, rope_theta=10000.0)
 
         # Create new ModuleList based on saved types
         model.model.encoder.boundary_predictors = nn.ModuleList(

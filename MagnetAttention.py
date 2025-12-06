@@ -1,13 +1,34 @@
-import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from transformers.cache_utils import EncoderDecoderCache
 from transformers.models.whisper.modeling_whisper import WhisperAttention
-import inspect
+from utils import precompute_freqs_cis
 
 
 class MagnetAttention(WhisperAttention):
+    def __init__(self, *args, max_position_embeddings=1500, rope_theta=10000.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Precompute RoPE frequencies
+        self.freqs_cis = precompute_freqs_cis(
+            dim=self.head_dim,
+            end=max_position_embeddings,
+            theta=rope_theta,
+            device=None  # Will be moved to correct device on first use
+        )
+
+    def load_magnet(self, max_position_embeddings=1500, rope_theta=10000.0):
+        """
+        Initialize RoPE frequencies for this attention module.
+        Called when converting WhisperAttention to MagnetAttention via class reassignment.
+        """
+        self.freqs_cis = precompute_freqs_cis(
+            dim=self.head_dim,
+            end=max_position_embeddings,
+            theta=rope_theta,
+            device=None  # Will be moved to correct device on first use
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -53,6 +74,26 @@ class MagnetAttention(WhisperAttention):
             bsz, tgt_len, self.num_heads, self.head_dim)
         query_states = query_states.transpose(1, 2).contiguous()
 
+        # Ensure freqs_cis is on the correct device
+        if self.freqs_cis.device != query_states.device:
+            self.freqs_cis = self.freqs_cis.to(query_states.device)
+
+        # Determine query positions
+        if cache_position is not None:
+            # During generation: use cache positions
+            query_positions = cache_position
+        else:
+            # During training: sequential positions
+            query_positions = torch.arange(tgt_len, device=query_states.device, dtype=torch.long)
+
+        # Get frequency tensor for queries
+        query_freqs = self.freqs_cis[query_positions]
+
+        # Apply RoPE to queries (always needed since queries are always freshly computed)
+        query_states_rotated = torch.view_as_complex(query_states.float().reshape(*query_states.shape[:-1], -1, 2))
+        query_freqs_expanded = query_freqs.unsqueeze(0).unsqueeze(0)
+        query_states = torch.view_as_real(query_states_rotated * query_freqs_expanded).flatten(-2).type_as(query_states)
+
         if past_key_value is not None:
             is_updated = past_key_value.is_updated.get(self.layer_idx)
             if is_cross_attention:
@@ -70,6 +111,7 @@ class MagnetAttention(WhisperAttention):
         # print(
         #     f"ATTENTION PROCESSING: is_cross_attention={is_cross_attention}, is_updated={is_updated if past_key_value else None}")
         if is_cross_attention and past_key_value and is_updated:
+            # Retrieve cached keys/values (already have RoPE applied)
             if hasattr(past_key_value, 'layers'):
                 layer_cache = past_key_value.layers[self.layer_idx]
                 key_states = layer_cache.keys
@@ -80,12 +122,31 @@ class MagnetAttention(WhisperAttention):
                 key_states = past_key_value.key_cache[self.layer_idx]
                 value_states = past_key_value.value_cache[self.layer_idx]
         else:
+            # Project keys and values
             key_states = self.k_proj(current_states).view(
                 bsz, -1, self.num_heads, self.head_dim)
             value_states = self.v_proj(current_states).view(
                 bsz, -1, self.num_heads, self.head_dim)
             key_states = key_states.transpose(1, 2).contiguous()
             value_states = value_states.transpose(1, 2).contiguous()
+
+            # Apply RoPE to keys
+            src_len = key_states.size(2)
+
+            # Determine positions for keys
+            if is_cross_attention:
+                # Cross-attention: encoder positions (always 0 to src_len-1)
+                key_positions = torch.arange(src_len, device=key_states.device, dtype=torch.long)
+            else:
+                # Self-attention: keys are at positions 0 to src_len-1 (accounting for cache)
+                key_positions = torch.arange(src_len, device=key_states.device, dtype=torch.long)
+
+            # Get frequency tensor for keys and apply RoPE
+            key_freqs = self.freqs_cis[key_positions]
+            key_states_rotated = torch.view_as_complex(key_states.float().reshape(*key_states.shape[:-1], -1, 2))
+            key_freqs_expanded = key_freqs.unsqueeze(0).unsqueeze(0)
+            key_states = torch.view_as_real(key_states_rotated * key_freqs_expanded).flatten(-2).type_as(key_states)
+
             if past_key_value is not None:
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
                 cache_position = cache_position if not is_cross_attention else None
