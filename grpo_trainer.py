@@ -81,7 +81,7 @@ class GRPOBoundaryTrainer:
             if not param.requires_grad:
                 continue
 
-            if "boundary_predictors" in name:
+            if "boundary_predictor" in name:
                 boundary_params.append(param)
             else:
                 whisper_params.append(param)
@@ -89,12 +89,12 @@ class GRPOBoundaryTrainer:
         if not boundary_params:
             raise ValueError(
                 "No trainable boundary predictor parameters found! "
-                "Make sure boundary predictors are initialized."
+                "Make sure boundary predictor is initialized."
             )
 
         # Build parameter groups for optimizer
         param_groups = [
-            {"params": boundary_params, "lr": learning_rate, "name": "boundary_predictors"}
+            {"params": boundary_params, "lr": learning_rate, "name": "boundary_predictor"}
         ]
 
         if train_full_model and whisper_params:
@@ -126,9 +126,9 @@ class GRPOBoundaryTrainer:
                 print(f"[GRPOBoundaryTrainer] callback error: {exc}")
 
     def _freeze_non_boundary_params(self):
-        """Freeze all parameters except boundary predictors."""
+        """Freeze all parameters except boundary predictor."""
         for name, param in self.model.named_parameters():
-            if "boundary_predictors" not in name:
+            if "boundary_predictor" not in name:
                 param.requires_grad = False
             else:
                 param.requires_grad = True

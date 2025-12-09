@@ -74,10 +74,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         return hidden_states, attention_mask_1d
 
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
-        self.boundary_predictors = nn.ModuleList(
-            [nn.Identity() for _ in range(12)]
-        )
+    def load_magnet(self, prior=None, predictor_type="BoundaryPredictor1"):
         self.compression_ratios = {}
         self.total_boundaries = 0
         self.total_positions = 0
@@ -87,46 +84,55 @@ class MagnetWhisperEncoder(WhisperEncoder):
             layer.__class__ = MagnetEncoderLayer
             layer.self_attn.__class__ = MagnetAttention
 
-        for layer_idx, prior_value in lp:
-            if predictor_type == "BoundaryPredictor1":
-                self.boundary_predictors[layer_idx] = BoundaryPredictor1(
-                    768,
-                    768,
-                    prior_value,
-                    1,
-                    0.5
-                )
-            elif predictor_type == "BoundaryPredictor2":
-                self.boundary_predictors[layer_idx] = BoundaryPredictor2(
-                    768,
-                    768,
-                    prior_value,
-                    1,
-                    0.5
-                )
-            elif predictor_type == "BoundaryPredictor3":
-                self.boundary_predictors[layer_idx] = BoundaryPredictor3(
-                    768,
-                    768,
-                    prior_value,
-                    1,
-                    0.5
-                )
-            elif predictor_type == "BoundaryPredictor4":
-                self.boundary_predictors[layer_idx] = BoundaryPredictor4(
-                    768,
-                    768,
-                    prior_value,
-                    1,
-                    0.5
-                )
-            else:
-                raise ValueError(
-                    f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4")
+        # Handle case where no boundary predictor is desired
+        if predictor_type.lower() == "none":
+            # Don't create a boundary predictor, just set up the layers
+            return
+
+        # Require prior if we're creating a boundary predictor
+        if prior is None:
+            raise ValueError(
+                f"prior parameter is required when predictor_type is not 'none'"
+            )
+
+        if predictor_type == "BoundaryPredictor1":
+            self.boundary_predictor = BoundaryPredictor1(
+                768,
+                768,
+                prior,
+                1,
+                0.5
+            )
+        elif predictor_type == "BoundaryPredictor2":
+            self.boundary_predictor = BoundaryPredictor2(
+                768,
+                768,
+                prior,
+                1,
+                0.5
+            )
+        elif predictor_type == "BoundaryPredictor3":
+            self.boundary_predictor = BoundaryPredictor3(
+                768,
+                768,
+                prior,
+                1,
+                0.5
+            )
+        elif predictor_type == "BoundaryPredictor4":
+            self.boundary_predictor = BoundaryPredictor4(
+                768,
+                768,
+                prior,
+                1,
+                0.5
+            )
+        else:
+            raise ValueError(
+                f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4, none")
 
     def _apply_boundary_predictor(
         self,
-        idx,
         hidden_states,
         attention_mask_1d,
         target_matrix,
@@ -138,7 +144,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # hidden_states = remove_positional_embeddings(
         #     hidden_states, self.embed_positions)
 
-        predictor_module = self.boundary_predictors[idx]
+        if not hasattr(self, 'boundary_predictor'):
+            return hidden_states, attention_mask_1d, 0.0, None, None, None, None, None, target_pointer
+
+        predictor_module = self.boundary_predictor
         if not isinstance(predictor_module, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
             return hidden_states, attention_mask_1d, 0.0, None, None, None, None, None, target_pointer
 
@@ -259,10 +268,10 @@ class MagnetWhisperEncoder(WhisperEncoder):
         self.total_boundaries += num_boundaries
         self.total_positions += total_positions
         if total_positions > 0:
-            self.compression_ratios[idx] = num_boundaries / \
+            self.compression_ratios['boundary_predictor'] = num_boundaries / \
                 total_positions
         else:
-            self.compression_ratios[idx] = 0.0
+            self.compression_ratios['boundary_predictor'] = 0.0
 
         return hidden_states, attention_mask_1d, current_b_loss, layer_log_prob, layer_confidence, layer_entropy, layer_cv, layer_adjacent_pct, target_pointer
 
@@ -323,17 +332,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 len(self.layers)
             ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
 
-        boundary_loss = 0.0
-        total_log_probs = None
-        total_confidence = None
-        confidence_layers = 0
-        total_entropy = None
-        entropy_layers = 0
-        total_cv = None
-        cv_layers = 0
-        total_adjacent_pct = None
-        adjacent_pct_layers = 0
-
         target_matrix: Optional[torch.Tensor] = None
         if target_boundary_counts is not None:
             target_matrix = target_boundary_counts.to(hidden_states.device)
@@ -358,70 +356,37 @@ class MagnetWhisperEncoder(WhisperEncoder):
         #     )
         # ============================================================================
 
+        # Apply boundary predictor ONCE before all transformer layers
+        # This operates directly on convolutional features
+        (
+            hidden_states,
+            attention_mask_1d,
+            boundary_loss,
+            total_log_probs,
+            total_confidence,
+            total_entropy,
+            total_cv,
+            total_adjacent_pct,
+            target_pointer,
+        ) = self._apply_boundary_predictor(
+            hidden_states,
+            attention_mask_1d,
+            target_matrix,
+            target_pointer,
+            boundary_rl,
+            return_boundary_confidence,
+            return_entropy
+        )
+
+        # Initialize layer counters for metrics
+        confidence_layers = 1 if total_confidence is not None else 0
+        entropy_layers = 1 if total_entropy is not None else 0
+        cv_layers = 1 if total_cv is not None else 0
+        adjacent_pct_layers = 1 if total_adjacent_pct is not None else 0
+
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-
-            (
-                hidden_states,
-                attention_mask_1d,
-                current_b_loss,
-                layer_log_prob,
-                layer_confidence,
-                layer_entropy,
-                layer_cv,
-                layer_adjacent_pct,
-                target_pointer,
-            ) = self._apply_boundary_predictor(
-                idx,
-                hidden_states,
-                attention_mask_1d,
-                target_matrix,
-                target_pointer,
-                boundary_rl,
-                return_boundary_confidence,
-                return_entropy
-            )
-            # Run boundary predictor BEFORE the layer
-            # (
-            #     hidden_states,
-            #     attention_mask_1d,
-            #     current_b_loss,
-            #     layer_log_prob,
-            #     layer_confidence,
-            #     layer_entropy,
-            #     layer_cv,
-            #     target_pointer,
-            # ) = self._apply_boundary_predictor(
-            #     idx,
-            #     hidden_states,
-            #     attention_mask_1d,
-            #     target_matrix,
-            #     target_pointer,
-            #     boundary_rl,
-            #     return_boundary_confidence,
-            #     return_entropy
-            # )
-
-            if layer_log_prob is not None:
-                if total_log_probs is None:
-                    total_log_probs = layer_log_prob
-                else:
-                    total_log_probs = total_log_probs + layer_log_prob
-            if layer_confidence is not None:
-                total_confidence = layer_confidence if total_confidence is None else total_confidence + layer_confidence
-                confidence_layers += 1
-            if layer_entropy is not None:
-                total_entropy = layer_entropy if total_entropy is None else total_entropy + layer_entropy
-                entropy_layers += 1
-            if layer_cv is not None:
-                total_cv = layer_cv if total_cv is None else total_cv + layer_cv
-                cv_layers += 1
-            if layer_adjacent_pct is not None:
-                total_adjacent_pct = layer_adjacent_pct if total_adjacent_pct is None else total_adjacent_pct + layer_adjacent_pct
-                adjacent_pct_layers += 1
-
-            boundary_loss += current_b_loss
 
             to_drop = False
             if self.training:

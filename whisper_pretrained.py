@@ -20,14 +20,14 @@ config = WhisperConfig.from_pretrained(
     "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
 model = WhisperForConditionalGeneration(config)
 
-# Convert to the custom MagnetWhisper stack without boundary predictors
+# Convert to the custom MagnetWhisper stack without boundary predictor
 model.__class__ = MagnetWhisper
-model.load_magnet([], "BoundaryPredictor2")
+model.load_magnet(predictor_type="none")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
-    predictors = getattr(magnet_model.model.encoder, "boundary_predictors", [])
-    for predictor in predictors:
+    if hasattr(magnet_model.model.encoder, "boundary_predictor"):
+        predictor = magnet_model.model.encoder.boundary_predictor
         if hasattr(predictor, "temp"):
             predictor.temp = temperature
     magnet_model.boundary_temperature = temperature
@@ -164,14 +164,14 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_adjacent_pct is not None:
             logs["train/boundary_adjacent_pct"] = boundary_adjacent_pct
 
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        if predictors:
-            if hasattr(predictors[0], "get_scheduled_prior"):
-                scheduled_prior = predictors[0].get_scheduled_prior()
+        if hasattr(model.model.encoder, "boundary_predictor"):
+            predictor = model.model.encoder.boundary_predictor
+            if hasattr(predictor, "get_scheduled_prior"):
+                scheduled_prior = predictor.get_scheduled_prior()
                 logs["train/scheduled_prior"] = scheduled_prior
 
-            if hasattr(predictors[0], "boundary_loss_weight"):
-                loss_weight = predictors[0].boundary_loss_weight
+            if hasattr(predictor, "boundary_loss_weight"):
+                loss_weight = predictor.boundary_loss_weight
                 logs["train/boundary_loss_weight"] = loss_weight
 
         wandb.log(logs, step=state.global_step)
@@ -236,8 +236,8 @@ class CompressionScheduler(TrainerCallback):
             compression_value = self.start_value + \
                 (self.end_value - self.start_value) * progress
 
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        for predictor in predictors:
+        if hasattr(model.model.encoder, "boundary_predictor"):
+            predictor = model.model.encoder.boundary_predictor
             if hasattr(predictor, "set_compression_schedule"):
                 predictor.set_compression_schedule(compression_value)
 

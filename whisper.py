@@ -40,13 +40,13 @@ BOUNDARY_TEMP = 1  # Final temperature we keep fixed during this run
 BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_priors = [(0, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor2")
+boundary_prior = 0.08
+model.load_magnet(boundary_prior, "BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
-    predictors = getattr(magnet_model.model.encoder, "boundary_predictors", [])
-    for predictor in predictors:
+    if hasattr(magnet_model.model.encoder, "boundary_predictor"):
+        predictor = magnet_model.model.encoder.boundary_predictor
         if hasattr(predictor, "temp"):
             predictor.temp = temperature
     magnet_model.boundary_temperature = temperature
@@ -208,17 +208,17 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_adjacent_pct is not None:
             logs["train/boundary_adjacent_pct"] = boundary_adjacent_pct
 
-        # Log scheduled_prior and boundary_loss_weight from boundary predictors
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        if predictors:
+        # Log scheduled_prior and boundary_loss_weight from boundary predictor
+        if hasattr(model.model.encoder, "boundary_predictor"):
+            predictor = model.model.encoder.boundary_predictor
             # Log the scheduled prior value
-            if hasattr(predictors[0], "get_scheduled_prior"):
-                scheduled_prior = predictors[0].get_scheduled_prior()
+            if hasattr(predictor, "get_scheduled_prior"):
+                scheduled_prior = predictor.get_scheduled_prior()
                 logs["train/scheduled_prior"] = scheduled_prior
 
             # Log the boundary loss weight
-            if hasattr(predictors[0], "boundary_loss_weight"):
-                loss_weight = predictors[0].boundary_loss_weight
+            if hasattr(predictor, "boundary_loss_weight"):
+                loss_weight = predictor.boundary_loss_weight
                 logs["train/boundary_loss_weight"] = loss_weight
 
         # downsample_grad_enabled = getattr(
@@ -296,9 +296,9 @@ class CompressionScheduler(TrainerCallback):
             compression_value = self.start_value + \
                 (self.end_value - self.start_value) * progress
 
-        # Set compression schedule for all boundary predictors
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        for predictor in predictors:
+        # Set compression schedule for boundary predictor
+        if hasattr(model.model.encoder, "boundary_predictor"):
+            predictor = model.model.encoder.boundary_predictor
             if hasattr(predictor, "set_compression_schedule"):
                 predictor.set_compression_schedule(compression_value)
 
@@ -349,9 +349,9 @@ class BoundaryLossWeightScheduler(TrainerCallback):
         weight = self.start_weight + \
             (self.end_weight - self.start_weight) * progress
 
-        # Set boundary loss weight for all boundary predictors
-        predictors = getattr(model.model.encoder, "boundary_predictors", [])
-        for predictor in predictors:
+        # Set boundary loss weight for boundary predictor
+        if hasattr(model.model.encoder, "boundary_predictor"):
+            predictor = model.model.encoder.boundary_predictor
             if hasattr(predictor, "set_boundary_loss_weight"):
                 predictor.set_boundary_loss_weight(weight)
 

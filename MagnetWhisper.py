@@ -50,9 +50,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         if hasattr(self.model, "encoder"):
             setattr(self.model.encoder, "boundary_target_progress", progress)
 
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
+    def load_magnet(self, prior=None, predictor_type="BoundaryPredictor1"):
         self.model.__class__ = MagnetWhisperModel
-        self.model.load_magnet(lp, predictor_type)
+        self.model.load_magnet(prior, predictor_type)
         self.set_boundary_target_progress(1.0)
         self._reset_boundary_loss_tracker()
 
@@ -64,14 +64,18 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         boundary_params_path = os.path.join(
             pretrained_model_name_or_path, "boundary_params.pt")
         boundary_states_path = os.path.join(
-            pretrained_model_name_or_path, "boundary_predictors.bin")
+            pretrained_model_name_or_path, "boundary_predictor.bin")
 
-        # Load from separate files
+        # If boundary predictor files don't exist, return the base model
+        if not os.path.exists(boundary_params_path) or not os.path.exists(boundary_states_path):
+            return model
+
+        # Load boundary predictor parameters
         params = torch.load(boundary_params_path, map_location="cpu")
-        layer_priors = params["layer_priors"]
-        layer_temps = params.get("layer_temps", [])
-        layer_thresholds = params.get("layer_thresholds", [])
-        layer_types = params.get("layer_types", [])
+        prior = params["prior"]
+        temp = params.get("temp", 1.0)
+        threshold = params.get("threshold", 0.5)
+        predictor_type = params.get("predictor_type", "BoundaryPredictor1")
 
         # Initialize the magnet component
         model.__class__ = cls
@@ -81,7 +85,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         model.model.encoder.__class__ = MagnetWhisperEncoder
         model.model.decoder.__class__ = MagnetWhisperDecoder
 
-        # Convert encoder layers to use MagnetAttention (without affecting boundary predictors)
+        # Convert encoder layers to use MagnetAttention
         for layer in model.model.encoder.layers:
             layer.__class__ = MagnetEncoderLayer
             layer.self_attn.__class__ = MagnetAttention
@@ -92,81 +96,36 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             layer.self_attn.__class__ = MagnetAttention
             layer.encoder_attn.__class__ = MagnetAttention
 
-        # Create new ModuleList based on saved types
-        model.model.encoder.boundary_predictors = nn.ModuleList(
-            [nn.Identity() for _ in range(12)]
-        )
+        # Initialize encoder attributes
         model.model.encoder.compression_ratios = {}
-        # Initialize boundary and position counters in encoder
         model.model.encoder.total_boundaries = 0
         model.model.encoder.total_positions = 0
         model.model.encoder.boundary_target_progress = 1.0
 
-        # If we have layer_types information, reconstruct boundary_predictors based on saved types
-        if layer_types:
-            # Reconstruct each predictor based on saved type information
-            layer_types_dict = dict(layer_types)
-            layer_priors_dict = dict(layer_priors)
+        # Create the boundary predictor based on type
+        if predictor_type == "BoundaryPredictor1":
+            model.model.encoder.boundary_predictor = BoundaryPredictor1(
+                768, 768, prior, 1, threshold
+            )
+        elif predictor_type == "BoundaryPredictor2":
+            model.model.encoder.boundary_predictor = BoundaryPredictor2(
+                768, 768, prior, 1, threshold
+            )
+        elif predictor_type == "BoundaryPredictor3":
+            model.model.encoder.boundary_predictor = BoundaryPredictor3(
+                768, 768, prior, 1, threshold
+            )
+        elif predictor_type == "BoundaryPredictor4":
+            model.model.encoder.boundary_predictor = BoundaryPredictor4(
+                768, 768, prior, 1, threshold
+            )
 
-            for idx in range(12):
-                predictor_type = layer_types_dict.get(idx, "Identity")
-                if predictor_type == "BoundaryPredictor1" and idx in layer_priors_dict:
-                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor1(
-                        768,
-                        768,
-                        layer_priors_dict[idx],
-                        1,
-                        0.95,
-                        init_for_12=False  # Don't initialize bias when loading from pretrained
-                    )
-                elif predictor_type == "BoundaryPredictor2" and idx in layer_priors_dict:
-                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor2(
-                        768,
-                        768,
-                        layer_priors_dict[idx],
-                        1,
-                        0.5
-                    )
-                elif predictor_type == "BoundaryPredictor3" and idx in layer_priors_dict:
-                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor3(
-                        768,
-                        768,
-                        layer_priors_dict[idx],
-                        1,
-                        0.5
-                    )
-                elif predictor_type == "BoundaryPredictor4" and idx in layer_priors_dict:
-                    model.model.encoder.boundary_predictors[idx] = BoundaryPredictor4(
-                        768,
-                        768,
-                        layer_priors_dict[idx],
-                        1,
-                        0.5
-                    )
-        else:
-            # Fallback to old method for backward compatibility
-            model.load_magnet(layer_priors, "BoundaryPredictor1")
+        # Load boundary predictor state dict
+        boundary_state_dict = torch.load(boundary_states_path, map_location="cpu")
+        model.model.encoder.boundary_predictor.load_state_dict(boundary_state_dict)
 
-        # Load boundary predictor states
-        boundary_state_dict = torch.load(
-            boundary_states_path, map_location="cpu")
-
-        # Load state dict only for BoundaryPredictor instances, not Identity layers
-        for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
-                predictor_key = str(idx)
-                if predictor_key in boundary_state_dict:
-                    boundary_predictor.load_state_dict(
-                        boundary_state_dict[predictor_key])
-
-        # Update temperature and threshold for boundary predictors using saved values
-        temp_dict = dict(layer_temps)
-        threshold_dict = dict(layer_thresholds)
-
-        for idx, boundary_predictor in enumerate(model.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
-                boundary_predictor.temp = temp_dict[idx]
-                boundary_predictor.threshold = threshold_dict[idx]
+        # Set temperature
+        model.model.encoder.boundary_predictor.temp = temp
 
         model._reset_boundary_loss_tracker()
 
@@ -175,57 +134,37 @@ class MagnetWhisper(WhisperForConditionalGeneration):
     def save_pretrained(self, save_directory, *args, **kwargs):
         super().save_pretrained(save_directory, *args, **kwargs)
 
-        # Save boundary predictor states - only for BoundaryPredictor1 instances
+        # Check if encoder has boundary predictor
+        if not hasattr(self.model.encoder, 'boundary_predictor'):
+            return
+
+        boundary_predictor = self.model.encoder.boundary_predictor
+
+        # Save boundary predictor state
         boundary_states_path = os.path.join(
-            save_directory, "boundary_predictors.bin")
-
-        # Create a state dict containing only BoundaryPredictor instances
-        boundary_state_dict = {}
-        for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, (BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4)):
-                boundary_state_dict[str(idx)] = boundary_predictor.state_dict()
-
-        torch.save(boundary_state_dict, boundary_states_path)
+            save_directory, "boundary_predictor.bin")
+        torch.save(boundary_predictor.state_dict(), boundary_states_path)
 
         # Save boundary predictor parameters
         boundary_params_path = os.path.join(
             save_directory, "boundary_params.pt")
 
-        # Collect parameters from boundary predictors and track their types
-        layer_priors = []
-        layer_temps = []
-        layer_thresholds = []
-        layer_types = []  # Track what type each layer is
-
-        for idx, boundary_predictor in enumerate(self.model.encoder.boundary_predictors):
-            if isinstance(boundary_predictor, BoundaryPredictor1):
-                layer_priors.append((idx, boundary_predictor.prior))
-                layer_temps.append((idx, boundary_predictor.temp))
-                layer_thresholds.append((idx, boundary_predictor.threshold))
-                layer_types.append((idx, "BoundaryPredictor1"))
-            elif isinstance(boundary_predictor, BoundaryPredictor2):
-                layer_priors.append((idx, boundary_predictor.prior))
-                layer_temps.append((idx, boundary_predictor.temp))
-                layer_thresholds.append((idx, boundary_predictor.threshold))
-                layer_types.append((idx, "BoundaryPredictor2"))
-            elif isinstance(boundary_predictor, BoundaryPredictor3):
-                layer_priors.append((idx, boundary_predictor.prior))
-                layer_temps.append((idx, boundary_predictor.temp))
-                layer_thresholds.append((idx, boundary_predictor.threshold))
-                layer_types.append((idx, "BoundaryPredictor3"))
-            elif isinstance(boundary_predictor, BoundaryPredictor4):
-                layer_priors.append((idx, boundary_predictor.prior))
-                layer_temps.append((idx, boundary_predictor.temp))
-                layer_thresholds.append((idx, boundary_predictor.threshold))
-                layer_types.append((idx, "BoundaryPredictor4"))
-            else:
-                layer_types.append((idx, "Identity"))
+        # Determine predictor type
+        predictor_type = None
+        if isinstance(boundary_predictor, BoundaryPredictor1):
+            predictor_type = "BoundaryPredictor1"
+        elif isinstance(boundary_predictor, BoundaryPredictor2):
+            predictor_type = "BoundaryPredictor2"
+        elif isinstance(boundary_predictor, BoundaryPredictor3):
+            predictor_type = "BoundaryPredictor3"
+        elif isinstance(boundary_predictor, BoundaryPredictor4):
+            predictor_type = "BoundaryPredictor4"
 
         params = {
-            "layer_priors": layer_priors,
-            "layer_temps": layer_temps,
-            "layer_thresholds": layer_thresholds,
-            "layer_types": layer_types,
+            "prior": boundary_predictor.prior,
+            "temp": boundary_predictor.temp,
+            "threshold": boundary_predictor.threshold,
+            "predictor_type": predictor_type,
         }
         torch.save(params, boundary_params_path)
 
@@ -444,9 +383,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
 
 class MagnetWhisperModel(WhisperModel):
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
+    def load_magnet(self, prior=None, predictor_type="BoundaryPredictor1"):
         self.encoder.__class__ = MagnetWhisperEncoder
-        self.encoder.load_magnet(lp, predictor_type)
+        self.encoder.load_magnet(prior, predictor_type)
 
         self.decoder.__class__ = MagnetWhisperDecoder
         self.decoder.load_magnet()
