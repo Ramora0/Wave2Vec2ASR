@@ -33,6 +33,47 @@ class MagnetModelOutput(BaseModelOutput):
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
+    # Flag to enable/disable input truncation optimization
+    # Set to True to truncate hidden states to the smallest sequence length in the batch
+    # This happens AFTER convolutions but BEFORE transformer layers
+    # This saves compute and memory by removing padding in the transformer
+    enable_input_truncation = False
+
+    def _truncate_to_min_length(
+        self,
+        hidden_states: torch.FloatTensor,
+        attention_mask_1d: Optional[torch.LongTensor] = None
+    ) -> Tuple[torch.FloatTensor, Optional[torch.LongTensor]]:
+        """
+        Truncate hidden_states and attention_mask to the minimum required length
+        based on the attention mask. This is applied AFTER convolutions but BEFORE
+        transformer layers to save compute and memory.
+
+        Args:
+            hidden_states: Hidden states tensor of shape (batch_size, seq_len, feature_dim)
+            attention_mask_1d: Attention mask of shape (batch_size, seq_len), where 1 indicates
+                              valid positions and 0 indicates padding
+
+        Returns:
+            Tuple of (truncated_hidden_states, truncated_attention_mask)
+        """
+        if attention_mask_1d is None:
+            # If no attention mask, assume all positions are valid
+            return hidden_states, attention_mask_1d
+
+        # Find the maximum sequence length that contains valid data across the batch
+        # attention_mask_1d is (batch_size, seq_len) where 1 = valid, 0 = padding
+        # For each sample, find the last valid position
+        valid_lengths = attention_mask_1d.sum(dim=1)  # (batch_size,)
+        max_valid_length = valid_lengths.max().item()
+
+        if max_valid_length < hidden_states.shape[1]:
+            # Truncate to the minimum required length
+            hidden_states = hidden_states[:, :max_valid_length, :]
+            attention_mask_1d = attention_mask_1d[:, :max_valid_length]
+
+        return hidden_states, attention_mask_1d
+
     def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
@@ -304,6 +345,18 @@ class MagnetWhisperEncoder(WhisperEncoder):
             attention_mask_1d = attention_mask
         else:
             attention_mask_1d = None
+
+        # ============================================================================
+        # INPUT TRUNCATION OPTIMIZATION (can be easily disabled/removed)
+        # ============================================================================
+        # Truncate hidden states to the minimum required length based on attention mask
+        # This happens AFTER convolutions but BEFORE transformer layers
+        # This saves compute and memory by removing padding in the transformer
+        # if self.enable_input_truncation:
+        #     hidden_states, attention_mask_1d = self._truncate_to_min_length(
+        #         hidden_states, attention_mask_1d
+        #     )
+        # ============================================================================
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:

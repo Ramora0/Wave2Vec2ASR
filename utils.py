@@ -352,3 +352,49 @@ def get_sinusoidal_positional_embeddings(x):
     pos_emb[:, 1::2] = torch.cos(position * div_term)
 
     return pos_emb.unsqueeze(0)
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None):
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    Args:
+        dim (int): Dimension of the embedding (should be even, typically head_dim)
+        end (int): Maximum sequence length
+        theta (float): Base for frequency computation, default 10000.0
+        device: Device to create tensor on
+
+    Returns:
+        torch.Tensor: Complex tensor of shape (end, dim//2) containing rotation frequencies
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor.
+
+    Args:
+        xq (torch.Tensor): Query tensor of shape (batch, num_heads, seq_len, head_dim)
+        xk (torch.Tensor): Key tensor of shape (batch, num_heads, seq_len, head_dim)
+        freqs_cis (torch.Tensor): Precomputed frequency tensor of shape (seq_len, head_dim//2)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Rotated query and key tensors
+    """
+    # Reshape xq and xk to merge last dimension pairs into complex numbers
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    # Reshape freqs_cis to match dimensions: (1, 1, seq_len, head_dim//2)
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(0)
+
+    # Apply rotation
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)

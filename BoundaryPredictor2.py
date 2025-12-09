@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible
-from utils import downsample, get_sinusoidal_positional_embeddings, common
+from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible, local_rate_uniformity_loss
+from utils import downsample, get_sinusoidal_positional_embeddings, common, precompute_freqs_cis
 
 
 class BoundaryPredictor2(nn.Module):
@@ -22,6 +22,10 @@ class BoundaryPredictor2(nn.Module):
 
         # Boundary loss weight: 0 = loss has no effect, 1 = full loss effect
         self.boundary_loss_weight = 0.0  # Start with no boundary loss
+
+        # Step counter for debug printing
+        self.step_count = 0
+        self.print_every = 100  # Print every N steps
 
         # Shared MLP for boundary detection (used by both q and k)
         self.boundary_mlp = nn.Sequential(
@@ -324,6 +328,28 @@ class BoundaryPredictor2(nn.Module):
             hard_samples - soft_boundaries.detach() + soft_boundaries
         )
 
+        # Print boundary visualization periodically during training
+        if self.training:
+            self.step_count += 1
+            if self.step_count % self.print_every == 0:
+                # Get first item in batch
+                first_boundaries = hard_samples[0]
+
+                # Cut out padding using attention mask
+                if attention_mask is not None:
+                    valid_length = int(attention_mask[0].sum().item())
+                    first_boundaries = first_boundaries[:valid_length]
+
+                # Convert to list of characters: '|' for boundary, ' ' for space
+                boundary_str = ''.join(
+                    ['|' if b > 0.5 else ' ' for b in first_boundaries.cpu().tolist()])
+
+                # Print with step info
+                print(
+                    f"\nStep {self.step_count}: Boundary pattern (first in batch, {len(boundary_str)} positions):")
+                print(boundary_str)
+                print()
+
         # Apply pooling based on selected method
         if self.use_attention_pooling:
             pooled = self._attention_pooling(
@@ -383,7 +409,23 @@ class BoundaryPredictor2(nn.Module):
             #     attention_mask,
             #     reduce=False
             # )
-            loss = per_sample_loss if return_unreduced_boundary_loss else per_sample_loss.mean()
+
+            # Add local rate uniformity loss to enforce even distribution
+            # This checks random windows with random sizes to ensure boundaries are spread evenly
+            uniformity = local_rate_uniformity_loss(
+                hard_boundaries,
+                attention_mask,
+                target_boundary_counts=target_boundary_counts,
+                min_window_size=13,
+                max_window_size=39,
+                num_samples=8,
+            )
+            uniformity_weight = 2.0
+
+            if return_unreduced_boundary_loss:
+                loss = per_sample_loss + uniformity_weight * uniformity
+            else:
+                loss = per_sample_loss.mean() + uniformity_weight * uniformity
         else:
             # Don't calculate loss during evaluation
             loss = torch.tensor(0.0, device=hidden.device)
