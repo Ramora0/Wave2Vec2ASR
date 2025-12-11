@@ -1,3 +1,4 @@
+from transformers import WhisperForConditionalGeneration as WhisperPretrained
 import torch
 from transformers import TrainerCallback
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
@@ -22,7 +23,8 @@ model = WhisperForConditionalGeneration(config)
 
 # Convert to the custom MagnetWhisper stack without boundary predictor
 model.__class__ = MagnetWhisper
-model.load_magnet(predictor_type="none")
+# model.load_magnet(predictor_type="none")
+model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -40,9 +42,6 @@ def _set_boundary_target_progress(magnet_model, progress):
         magnet_model.boundary_target_progress = progress
 
 
-# _set_boundary_temperature(model, BOUNDARY_TEMP)
-# _set_boundary_target_progress(model, BOUNDARY_TARGET_PROGRESS)
-
 model.to("cuda")
 
 model.generation_config.language = "english"
@@ -57,21 +56,22 @@ processor = data_module.processor
 data_collator = data_module.data_collator
 compute_metrics = data_module.compute_metrics
 
-os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
+os.environ["WANDB_PROJECT"] = "glimpse-pretraining"
 
-MODEL_NAME = "baseline-whisper-from-scratch"
+MODEL_NAME = "bp-s-pretrain"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=32,
-    per_device_eval_batch_size=64,
+    per_device_train_batch_size=64,
+    # gradient_accumulation_steps=4,
+    per_device_eval_batch_size=16,
 
     # Temporarily disabled to debug backward graph error
-    gradient_checkpointing=True,
-    use_reentrant_gradients=False,
+    # gradient_checkpointing=True,
+    # use_reentrant_gradients=False,
 
     fp16=True,
     fp16_full_eval=True,
@@ -91,16 +91,16 @@ training_args = Seq2SeqTrainingArguments(
 
     eval_strategy="steps",
     # Temporarily disabled to debug backward graph error
-    predict_with_generate=False,
+    predict_with_generate=True,
     generation_max_length=225,
 
     # Save more frequently to not lose progress if training crashes
-    save_steps=4000,
+    save_steps=1000,
     save_total_limit=3,
 
     # Eval more frequently to catch early issues
-    eval_steps=3000,
-    logging_steps=100,
+    eval_steps=2000,
+    logging_steps=50,
 
     report_to="wandb",
     greater_is_better=False,
@@ -108,8 +108,10 @@ training_args = Seq2SeqTrainingArguments(
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
+    # dataloader_prefetch_factor=2,
     remove_unused_columns=False,
     max_grad_norm=2.0,
+    # torch_compile=True,
 )
 
 
@@ -140,39 +142,44 @@ class CompressionRatioCallback(TrainerCallback):
             return
 
         compression_ratio = model.get_and_reset_compression_ratio()
+
         boundary_loss = model.get_and_reset_boundary_loss()
 
-        logs["train/compression_ratio"] = compression_ratio
+        logs["boundaries/compression_ratio"] = compression_ratio
 
         if boundary_loss is not None:
-            logs["train/boundary_loss"] = boundary_loss
+            logs["boundaries/boundary_loss"] = boundary_loss
+
+            # Subtract boundary loss from train/loss to show only ASR loss
+            if "loss" in logs:
+                # Override with ASR-only loss
+                logs["loss"] = logs["loss"] - boundary_loss
+            if "train/loss" in logs:
+                logs["train/loss"] = logs["train/loss"] - \
+                    boundary_loss  # Override with ASR-only loss
 
         boundary_temp = getattr(model, "boundary_temperature", None)
         if boundary_temp is not None:
-            logs["train/boundary_temperature"] = boundary_temp
+            logs["boundaries/boundary_temperature"] = boundary_temp
 
         boundary_target_progress = getattr(
             model, "boundary_target_progress", None)
         if boundary_target_progress is not None:
-            logs["train/boundary_target_progress"] = boundary_target_progress
+            logs["boundaries/boundary_target_progress"] = boundary_target_progress
 
         boundary_cv = getattr(model, "_boundary_cv", None)
         if boundary_cv is not None:
-            logs["train/boundary_cv"] = boundary_cv
+            logs["boundaries/boundary_cv"] = boundary_cv
 
         boundary_adjacent_pct = getattr(model, "_boundary_adjacent_pct", None)
         if boundary_adjacent_pct is not None:
-            logs["train/boundary_adjacent_pct"] = boundary_adjacent_pct
+            logs["boundaries/boundary_adjacent_pct"] = boundary_adjacent_pct
 
         if hasattr(model.model.encoder, "boundary_predictor"):
             predictor = model.model.encoder.boundary_predictor
             if hasattr(predictor, "get_scheduled_prior"):
                 scheduled_prior = predictor.get_scheduled_prior()
-                logs["train/scheduled_prior"] = scheduled_prior
-
-            if hasattr(predictor, "boundary_loss_weight"):
-                loss_weight = predictor.boundary_loss_weight
-                logs["train/boundary_loss_weight"] = loss_weight
+                logs["boundaries/scheduled_prior"] = scheduled_prior
 
         wandb.log(logs, step=state.global_step)
 
@@ -185,17 +192,16 @@ class CompressionRatioCallback(TrainerCallback):
         if boundary_cv is not None:
             eval_log = {"eval/boundary_cv": boundary_cv}
             wandb.log(eval_log, step=state.global_step)
-            metrics["boundary_cv"] = boundary_cv
+            metrics["eval/boundary_cv"] = boundary_cv
 
         boundary_adjacent_pct = getattr(model, "_boundary_adjacent_pct", None)
         if boundary_adjacent_pct is not None:
             eval_log = {"eval/boundary_adjacent_pct": boundary_adjacent_pct}
             wandb.log(eval_log, step=state.global_step)
-            metrics["boundary_adjacent_pct"] = boundary_adjacent_pct
+            metrics["eval/boundary_adjacent_pct"] = boundary_adjacent_pct
 
 
 # COMMENTED OUT - CompressionRatioCallback only needed for MagnetWhisper experiments
-# trainer.add_callback(CompressionRatioCallback())
 
 
 class CompressionScheduler(TrainerCallback):
@@ -252,30 +258,41 @@ def compression_schedule(progress):
 #     schedule_fn=compression_schedule))
 
 
-# class TemperatureScheduler(TrainerCallback):
-#     """
-#     Linearly schedule the temperature from a start to an end value over training.
-#     """
+class TemperatureScheduler(TrainerCallback):
+    """
+    Linearly schedule the temperature from a start to an end value over training.
+    """
 
-#     def __init__(self, start_temp=1.0, end_temp=0.0):
-#         self.start_temp = start_temp
-#         self.end_temp = end_temp
+    def __init__(self, start_temp=1.0, end_temp=0.0):
+        self.start_temp = start_temp
+        self.end_temp = end_temp
 
-#     def on_step_begin(self, args, state, control, model=None, **kwargs):
-#         if model is None:
-#             return
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return
 
-#         total_steps = state.max_steps if state and state.max_steps else None
-#         if not total_steps or total_steps <= 0:
-#             return
+        total_steps = state.max_steps if state and state.max_steps else None
+        if not total_steps or total_steps <= 0:
+            return
 
-#         progress = min(1.0, state.global_step / total_steps)
-#         temperature = self.start_temp + \
-#             (self.end_temp - self.start_temp) * progress
+        progress = min(1.0, state.global_step / total_steps)
+        temperature = self.start_temp + \
+            (self.end_temp - self.start_temp) * progress
 
-#         _set_boundary_temperature(model, temperature)
+        _set_boundary_temperature(model, temperature)
 
 
-# trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
+trainer.add_callback(CompressionRatioCallback())
+trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
+
+
+class EvaluateFirstStepCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 1:
+            control.should_evaluate = True
+        return control
+
+
+trainer.add_callback(EvaluateFirstStepCallback())
 
 trainer.train()

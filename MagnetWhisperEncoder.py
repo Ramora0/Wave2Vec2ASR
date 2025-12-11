@@ -37,7 +37,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
     # Set to True to truncate hidden states to the smallest sequence length in the batch
     # This happens AFTER convolutions but BEFORE transformer layers
     # This saves compute and memory by removing padding in the transformer
-    enable_input_truncation = False
+    enable_input_truncation = True
 
     def _truncate_to_min_length(
         self,
@@ -57,6 +57,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         Returns:
             Tuple of (truncated_hidden_states, truncated_attention_mask)
         """
+        original_length = hidden_states.shape[1]
+
         if attention_mask_1d is None:
             # If no attention mask, assume all positions are valid
             return hidden_states, attention_mask_1d
@@ -65,12 +67,16 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # attention_mask_1d is (batch_size, seq_len) where 1 = valid, 0 = padding
         # For each sample, find the last valid position
         valid_lengths = attention_mask_1d.sum(dim=1)  # (batch_size,)
-        max_valid_length = valid_lengths.max().item()
+        max_valid_length = int(valid_lengths.max().item())
 
         if max_valid_length < hidden_states.shape[1]:
             # Truncate to the minimum required length
             hidden_states = hidden_states[:, :max_valid_length, :]
             attention_mask_1d = attention_mask_1d[:, :max_valid_length]
+            # Calculate and print percentage of sequence removed
+            shortening_pct = (
+                (original_length - max_valid_length) / original_length) * 100.0
+            # print(f"Sequence truncated: {original_length} -> {max_valid_length} ({shortening_pct:.1f}% shorter)")
 
         return hidden_states, attention_mask_1d
 
@@ -231,9 +237,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
         # BoundaryPredictor4 returns 9-tuple without log_prob: (pooled, loss, num_boundaries, total_positions, shortened_mask, confidence, entropy, cv, adjacent_pct)
         # Others may return fewer values
         # DEBUG: Print tuple length
-        if isinstance(predictor_module, BoundaryPredictor2):
-            print(
-                f"[DEBUG] BP2 result length: {len(result)}, last value: {result[-1]}")
+        # if isinstance(predictor_module, BoundaryPredictor2):
+            # print(
+            #     f"[DEBUG] BP2 result length: {len(result)}, last value: {result[-1]}")
         if isinstance(predictor_module, BoundaryPredictor4):
             # BP4 returns: (pooled, loss, num_boundaries, total_positions, shortened_mask, confidence, entropy, cv, adjacent_pct)
             final_hs_for_layer, current_b_loss, num_boundaries, total_positions, shortened_attention_mask_1d, layer_confidence, layer_entropy, layer_cv, layer_adjacent_pct = result
@@ -302,35 +308,36 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 Whether or not to return the hidden states of all layers.
         """
 
-        expected_seq_length = self.config.max_source_positions * \
-            self.conv1.stride[0] * self.conv2.stride[0]
-        if input_features.shape[-1] != expected_seq_length:
-            raise ValueError(
-                f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
-            )
+        # Calculate expected input length based on conv layers
+        conv_stride_product = self.conv1.stride[0] * self.conv2.stride[0]
+
+        # expected_seq_length = self.config.max_source_positions  # * conv_stride_product
+        # if input_features.shape[-1] != expected_seq_length:
+        #     raise ValueError(
+        #         f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
+        #     )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
-        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+        inputs_embeds_1 = nn.functional.gelu(
+            self.conv1(input_features))  # (B, 768, 3000)
+        inputs_embeds_2 = nn.functional.gelu(
+            self.conv2(inputs_embeds_1))  # (B, 768, 1500)
 
-        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        # Permute to (B, L, D) format
+        hidden_states = inputs_embeds_2.permute(0, 2, 1)  # (B, 1500, 768)
 
-        # embed_pos = self.embed_positions.weight
-        # hidden_states = inputs_embeds + embed_pos
-        hidden_states = inputs_embeds
-        hidden_states = nn.functional.dropout(
+        # Apply dropout before boundary predictor
+        bp_hidden = nn.functional.dropout(
             hidden_states, p=self.dropout, training=self.training)
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
-        if head_mask is not None:
-            assert head_mask.size()[0] == (
-                len(self.layers)
-            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+        if attention_mask is not None:
+            attention_mask_1d = max_pool_attention_mask(
+                attention_mask, stride=2)
+        else:
+            attention_mask_1d = None
 
         target_matrix: Optional[torch.Tensor] = None
         if target_boundary_counts is not None:
@@ -338,26 +345,6 @@ class MagnetWhisperEncoder(WhisperEncoder):
 
         target_pointer = 0
 
-        if attention_mask is not None:
-            attention_mask = max_pool_attention_mask(attention_mask)
-            attention_mask_1d = attention_mask
-        else:
-            attention_mask_1d = None
-
-        # ============================================================================
-        # INPUT TRUNCATION OPTIMIZATION (can be easily disabled/removed)
-        # ============================================================================
-        # Truncate hidden states to the minimum required length based on attention mask
-        # This happens AFTER convolutions but BEFORE transformer layers
-        # This saves compute and memory by removing padding in the transformer
-        # if self.enable_input_truncation:
-        #     hidden_states, attention_mask_1d = self._truncate_to_min_length(
-        #         hidden_states, attention_mask_1d
-        #     )
-        # ============================================================================
-
-        # Apply boundary predictor ONCE before all transformer layers
-        # This operates directly on convolutional features
         (
             hidden_states,
             attention_mask_1d,
@@ -369,7 +356,7 @@ class MagnetWhisperEncoder(WhisperEncoder):
             total_adjacent_pct,
             target_pointer,
         ) = self._apply_boundary_predictor(
-            hidden_states,
+            bp_hidden,
             attention_mask_1d,
             target_matrix,
             target_pointer,
@@ -378,6 +365,28 @@ class MagnetWhisperEncoder(WhisperEncoder):
             return_entropy
         )
 
+        encoder_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+
+        if head_mask is not None:
+            assert head_mask.size()[0] == (
+                len(self.layers)
+            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+
+        # ============================================================================
+        # INPUT TRUNCATION OPTIMIZATION (can be easily disabled/removed)
+        # ============================================================================
+        # Truncate hidden states to the minimum required length based on attention mask
+        # This happens AFTER convolutions but BEFORE transformer layers
+        # This saves compute and memory by removing padding in the transformer
+        if self.enable_input_truncation:
+            hidden_states, attention_mask_1d = self._truncate_to_min_length(
+                hidden_states, attention_mask_1d
+            )
+        # ============================================================================
+
+        # Apply boundary predictor ONCE before all transformer layers
+        # This operates directly on convolutional features
         # Initialize layer counters for metrics
         confidence_layers = 1 if total_confidence is not None else 0
         entropy_layers = 1 if total_entropy is not None else 0

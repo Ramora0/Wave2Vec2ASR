@@ -40,8 +40,8 @@ BOUNDARY_TEMP = 1  # Final temperature we keep fixed during this run
 BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_prior = 0.08
-model.load_magnet(boundary_prior, "BoundaryPredictor2")
+# Load magnet architecture without boundary predictor (just conv layers + MagnetAttention)
+model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):

@@ -27,11 +27,18 @@ class BoundaryPredictor2(nn.Module):
         self.step_count = 0
         self.print_every = 100  # Print every N steps
 
-        # Shared MLP for boundary detection (used by both q and k)
+        # Fusion MLP to combine all 4 conv features (3072 -> 768)
+        # self.fusion_mlp = nn.Sequential(
+        #     nn.Linear(input_dim, input_dim),
+        #     nn.GELU(),
+        #     nn.Linear(input_dim, input_dim)
+        # )
+
+        # Boundary MLP for refining features before Q/K (768 -> 768)
         self.boundary_mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, input_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, input_dim)
+            nn.Linear(input_dim, input_dim)
         )
 
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
@@ -150,7 +157,7 @@ class BoundaryPredictor2(nn.Module):
         pos_embeds = get_sinusoidal_positional_embeddings(x)
         return x + pos_embeds
 
-    def _weighted_mean_pooling(self, boundaries, hidden, attention_mask=None):
+    def _mean_pooling(self, boundaries, hidden, attention_mask=None):
         """Weighted mean pooling using segment assignment normalization."""
         pooled = downsample(boundaries, hidden.transpose(
             0, 1), attention_mask=attention_mask)
@@ -265,7 +272,10 @@ class BoundaryPredictor2(nn.Module):
     ):
         batch_size = hidden.size(0)
 
-        # Apply shared MLP with residual connections
+        # Apply fusion MLP to combine all 4 conv features (3072 -> 768)
+        # fused_hidden = self.fusion_mlp(hidden)  # (B, L, 3072) -> (B, L, 768)
+
+        # Apply boundary MLP before Q/K with residual connections
         q_input = F.normalize(self.dropout(hidden[:, :-1]), dim=-1)
         q_mlp_out = self.boundary_mlp(q_input)
         q_residual = q_mlp_out + q_input  # Residual connection
@@ -345,17 +355,17 @@ class BoundaryPredictor2(nn.Module):
                     ['|' if b > 0.5 else ' ' for b in first_boundaries.cpu().tolist()])
 
                 # Print with step info
-                print(
-                    f"\nStep {self.step_count}: Boundary pattern (first in batch, {len(boundary_str)} positions):")
-                print(boundary_str)
-                print()
+                # print(
+                #     f"\nStep {self.step_count}: Boundary pattern (first in batch, {len(boundary_str)} positions):")
+                # print(boundary_str)
+                # print()
 
-        # Apply pooling based on selected method
+        # Apply pooling based on selected method (use fused features)
         if self.use_attention_pooling:
             pooled = self._attention_pooling(
                 hard_boundaries, hidden, attention_mask)  # B x S x D
         else:
-            pooled = self._weighted_mean_pooling(
+            pooled = self._mean_pooling(
                 hard_boundaries, hidden, attention_mask)  # B x S x D
 
         pooled = self._add_positional_embeddings(pooled)
@@ -412,20 +422,20 @@ class BoundaryPredictor2(nn.Module):
 
             # Add local rate uniformity loss to enforce even distribution
             # This checks random windows with random sizes to ensure boundaries are spread evenly
-            uniformity = local_rate_uniformity_loss(
-                hard_boundaries,
-                attention_mask,
-                target_boundary_counts=target_boundary_counts,
-                min_window_size=13,
-                max_window_size=39,
-                num_samples=8,
-            )
-            uniformity_weight = 2.0
+            # uniformity = local_rate_uniformity_loss(
+            #     hard_boundaries,
+            #     attention_mask,
+            #     target_boundary_counts=target_boundary_counts,
+            #     min_window_size=13,
+            #     max_window_size=39,
+            #     num_samples=8,
+            # )
+            # uniformity_weight = 2.0
 
             if return_unreduced_boundary_loss:
-                loss = per_sample_loss + uniformity_weight * uniformity
+                loss = per_sample_loss  # + uniformity_weight * uniformity
             else:
-                loss = per_sample_loss.mean() + uniformity_weight * uniformity
+                loss = per_sample_loss.mean()  # + uniformity_weight * uniformity
         else:
             # Don't calculate loss during evaluation
             loss = torch.tensor(0.0, device=hidden.device)
