@@ -249,7 +249,7 @@ class BoundaryPredictor2(nn.Module):
 
         # Step 11: Concatenate heads back together
         pooled = pooled.transpose(1, 2).contiguous()  # (B, S, H, head_dim)
-        pooled = pooled.view(batch_size, max_segments, hidden_dim)  # (B, S, D)
+        pooled = pooled.flatten(2)  # (B, S, H*head_dim) -> (B, S, D)
 
         # Step 12: Output projection to combine information from all heads
         pooled = self.pool_output(pooled)

@@ -5,9 +5,10 @@ from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import os
 from pathlib import Path
 from MagnetWhisper import MagnetWhisper
-from transformers import WhisperForConditionalGeneration, WhisperConfig
+from transformers import WhisperForConditionalGeneration, WhisperConfig, WhisperTokenizer
 
 import wandb
+from transformers import GenerationConfig
 
 from librispeech import (
     create_librispeech_data_module,
@@ -16,15 +17,34 @@ from librispeech import (
 print("Starting baseline Whisper training with random initialization (no boundary predictor)...")
 
 
-# Load only the config (architecture) from checkpoint, then create model with random weights
-config = WhisperConfig.from_pretrained(
-    "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
-model = WhisperForConditionalGeneration(config)
+# Check if we should resume from a checkpoint
+resume_checkpoint = "models/whisper-pretrain/checkpoint-8800"
+resume_from_checkpoint = Path(
+    resume_checkpoint).exists() if resume_checkpoint else False
 
-# Convert to the custom MagnetWhisper stack without boundary predictor
-model.__class__ = MagnetWhisper
-# model.load_magnet(predictor_type="none")
-model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
+if resume_from_checkpoint:
+    print(f"Resuming training from checkpoint: {resume_checkpoint}")
+    # Load the full model with weights from checkpoint
+    model = WhisperForConditionalGeneration.from_pretrained(resume_checkpoint)
+    generation_config = GenerationConfig.from_pretrained(resume_checkpoint)
+    model.generation_config = generation_config
+
+    # Convert to the custom MagnetWhisper stack without boundary predictor
+    model.__class__ = MagnetWhisper
+    model.load_magnet(predictor_type="none")
+else:
+    print("Starting training with random initialization...")
+    # Load only the config (architecture) from checkpoint, then create model with random weights
+    checkpoint_path = "whisper-pretrain/checkpoint-8800"
+    config = WhisperConfig.from_pretrained(checkpoint_path)
+    model = WhisperForConditionalGeneration(config)
+    generation_config = GenerationConfig.from_pretrained(checkpoint_path)
+    model.generation_config = generation_config
+
+    # Convert to the custom MagnetWhisper stack without boundary predictor
+    model.__class__ = MagnetWhisper
+    model.load_magnet(predictor_type="none")
+    # model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -58,23 +78,23 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "glimpse-pretraining"
 
-MODEL_NAME = "bp-s-pretrain"
+MODEL_NAME = "whisper-pretrain"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=64,
-    # gradient_accumulation_steps=4,
-    per_device_eval_batch_size=16,
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=8,
+    per_device_eval_batch_size=32,
 
     # Temporarily disabled to debug backward graph error
     # gradient_checkpointing=True,
     # use_reentrant_gradients=False,
 
-    fp16=True,
-    fp16_full_eval=True,
+    bf16=True,
+    bf16_full_eval=True,
 
     # Pretraining requires MUCH more training than finetuning
     # LibriSpeech is ~1000 hours vs Whisper's original 680k hours
@@ -83,11 +103,12 @@ training_args = Seq2SeqTrainingArguments(
 
     # Lower initial LR for more stable training from random init
     # Random weights need gentler optimization initially
-    learning_rate=1e-4,
+    learning_rate=2e-4,
 
     # Longer warmup (20% vs 10%) helps stabilize early training
     # Critical when starting from random weights
     warmup_ratio=0.2,
+    lr_scheduler_type="cosine",
 
     eval_strategy="steps",
     # Temporarily disabled to debug backward graph error
@@ -95,23 +116,24 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
 
     # Save more frequently to not lose progress if training crashes
-    save_steps=1000,
+    save_steps=1100,
     save_total_limit=3,
 
     # Eval more frequently to catch early issues
-    eval_steps=2000,
-    logging_steps=50,
+    # eval_steps=550,
+    eval_steps=1100,
+    logging_steps=100,
 
     report_to="wandb",
     greater_is_better=False,
-    weight_decay=0.01,
+    weight_decay=0.05,
 
     dataloader_num_workers=8,
     dataloader_pin_memory=True,
     # dataloader_prefetch_factor=2,
     remove_unused_columns=False,
-    max_grad_norm=2.0,
-    # torch_compile=True,
+    max_grad_norm=1.0,
+    torch_compile=True,
 )
 
 
@@ -201,63 +223,6 @@ class CompressionRatioCallback(TrainerCallback):
             metrics["eval/boundary_adjacent_pct"] = boundary_adjacent_pct
 
 
-# COMMENTED OUT - CompressionRatioCallback only needed for MagnetWhisper experiments
-
-
-class CompressionScheduler(TrainerCallback):
-    """
-    Schedule the compression rate during training.
-
-    The schedule_fn takes training progress (0.0 to 1.0) and returns
-    compression_schedule value (0.0 to 1.0) where:
-    - 0.0 = no compression (every token is a boundary)
-    - 1.0 = max compression (only target_boundary_counts boundaries)
-    """
-
-    def __init__(self, schedule_fn=None, start_value=0.0, end_value=1.0):
-        """
-        Args:
-            schedule_fn: Optional function that takes progress (0-1) and returns compression (0-1).
-                        If None, uses linear schedule from start_value to end_value.
-            start_value: Starting compression value (used if schedule_fn is None)
-            end_value: Ending compression value (used if schedule_fn is None)
-        """
-        self.schedule_fn = schedule_fn
-        self.start_value = start_value
-        self.end_value = end_value
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        total_steps = state.max_steps if state and state.max_steps else None
-        if not total_steps or total_steps <= 0:
-            return
-
-        progress = min(1.0, state.global_step / total_steps)
-
-        if self.schedule_fn is not None:
-            compression_value = self.schedule_fn(progress)
-        else:
-            compression_value = self.start_value + \
-                (self.end_value - self.start_value) * progress
-
-        if hasattr(model.model.encoder, "boundary_predictor"):
-            predictor = model.model.encoder.boundary_predictor
-            if hasattr(predictor, "set_compression_schedule"):
-                predictor.set_compression_schedule(compression_value)
-
-
-def compression_schedule(progress):
-    """Advance compression in discrete steps during warmup, then hold at 1.0"""
-    return 1
-
-
-# COMMENTED OUT - These callbacks are only needed for boundary predictor experiments
-# trainer.add_callback(CompressionScheduler(
-#     schedule_fn=compression_schedule))
-
-
 class TemperatureScheduler(TrainerCallback):
     """
     Linearly schedule the temperature from a start to an end value over training.
@@ -282,17 +247,11 @@ class TemperatureScheduler(TrainerCallback):
         _set_boundary_temperature(model, temperature)
 
 
-trainer.add_callback(CompressionRatioCallback())
-trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
+# trainer.add_callback(CompressionRatioCallback())
+# trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
 
-
-class EvaluateFirstStepCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step == 1:
-            control.should_evaluate = True
-        return control
-
-
-trainer.add_callback(EvaluateFirstStepCallback())
-
-trainer.train()
+# Resume training from checkpoint if it exists
+if resume_from_checkpoint:
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
+else:
+    trainer.train()
