@@ -14,11 +14,25 @@ from librispeech import (
     create_librispeech_data_module,
 )
 
-print("Starting baseline Whisper training with random initialization (no boundary predictor)...")
+# =============================================================================
+# Configuration: Set to True to use BoundaryPredictor2, False for baseline
+# =============================================================================
+USE_BOUNDARY_PREDICTOR = True
+# =============================================================================
+
+if USE_BOUNDARY_PREDICTOR:
+    print("Starting Whisper training WITH BoundaryPredictor2...")
+else:
+    print("Starting baseline Whisper training (no boundary predictor)...")
 
 
 # Check if we should resume from a checkpoint
-resume_checkpoint = "models/whisper-pretrain/checkpoint-8800"
+# if USE_BOUNDARY_PREDICTOR:
+#     resume_checkpoint = "models/whisper-pretrain-bp2/checkpoint-8800"
+# else:
+#     resume_checkpoint = "models/whisper-pretrain/checkpoint-8800"
+resume_checkpoint = None
+
 resume_from_checkpoint = Path(
     resume_checkpoint).exists() if resume_checkpoint else False
 
@@ -29,22 +43,27 @@ if resume_from_checkpoint:
     generation_config = GenerationConfig.from_pretrained(resume_checkpoint)
     model.generation_config = generation_config
 
-    # Convert to the custom MagnetWhisper stack without boundary predictor
+    # Convert to the custom MagnetWhisper stack
     model.__class__ = MagnetWhisper
-    model.load_magnet(predictor_type="none")
+    if USE_BOUNDARY_PREDICTOR:
+        model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
+    else:
+        model.load_magnet(predictor_type="none")
 else:
     print("Starting training with random initialization...")
     # Load only the config (architecture) from checkpoint, then create model with random weights
-    checkpoint_path = "whisper-pretrain/checkpoint-8800"
+    checkpoint_path = "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789"
     config = WhisperConfig.from_pretrained(checkpoint_path)
     model = WhisperForConditionalGeneration(config)
     generation_config = GenerationConfig.from_pretrained(checkpoint_path)
     model.generation_config = generation_config
 
-    # Convert to the custom MagnetWhisper stack without boundary predictor
+    # Convert to the custom MagnetWhisper stack
     model.__class__ = MagnetWhisper
-    model.load_magnet(predictor_type="none")
-    # model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
+    if USE_BOUNDARY_PREDICTOR:
+        model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
+    else:
+        model.load_magnet(predictor_type="none")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -78,15 +97,33 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "glimpse-pretraining"
 
-MODEL_NAME = "whisper-pretrain"
+# A. Set model name based on whether we use boundary predictor
+if USE_BOUNDARY_PREDICTOR:
+    MODEL_NAME = "whisper-pretrain-bp2"
+else:
+    MODEL_NAME = "whisper-pretrain-256"
+
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# B. Configure batch size: keep effective batch size of 256
+# Without BP: 32 * 8 = 256 (use gradient accumulation)
+# With BP: 256 * 1 = 256 (no gradient accumulation)
+if USE_BOUNDARY_PREDICTOR:
+    per_device_train_batch_size = 256
+    gradient_accumulation_steps = 1
+else:
+    per_device_train_batch_size = 32
+    gradient_accumulation_steps = 8
+
+# C. Disable torch_compile when using boundary predictor
+use_torch_compile = not USE_BOUNDARY_PREDICTOR
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=32,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=per_device_train_batch_size,
+    gradient_accumulation_steps=gradient_accumulation_steps,
     per_device_eval_batch_size=32,
 
     # Temporarily disabled to debug backward graph error
@@ -116,13 +153,13 @@ training_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
 
     # Save more frequently to not lose progress if training crashes
-    save_steps=1100,
+    save_steps=550,
     save_total_limit=3,
 
     # Eval more frequently to catch early issues
     # eval_steps=550,
-    eval_steps=1100,
-    logging_steps=100,
+    eval_steps=550,
+    logging_steps=50,
 
     report_to="wandb",
     greater_is_better=False,
@@ -133,7 +170,7 @@ training_args = Seq2SeqTrainingArguments(
     # dataloader_prefetch_factor=2,
     remove_unused_columns=False,
     max_grad_norm=1.0,
-    torch_compile=True,
+    torch_compile=use_torch_compile,
 )
 
 
@@ -247,8 +284,10 @@ class TemperatureScheduler(TrainerCallback):
         _set_boundary_temperature(model, temperature)
 
 
-# trainer.add_callback(CompressionRatioCallback())
-# trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
+# D. Enable callbacks when using boundary predictor
+if USE_BOUNDARY_PREDICTOR:
+    trainer.add_callback(CompressionRatioCallback())
+    trainer.add_callback(TemperatureScheduler(start_temp=1, end_temp=0.0))
 
 # Resume training from checkpoint if it exists
 if resume_from_checkpoint:
