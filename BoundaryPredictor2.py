@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from loss import binomial_loss, binomial_loss_from_target_counts, binomial_loss_from_target_counts_flexible, local_rate_uniformity_loss
-from utils import downsample, get_sinusoidal_positional_embeddings, common, precompute_freqs_cis
+from utils import downsample, get_sinusoidal_positional_embeddings, common, precompute_freqs_cis, final
 
 
 class BoundaryPredictor2(nn.Module):
-    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, max_positions=1500, use_attention_pooling=True):
+    def __init__(self, input_dim, hidden_dim, prior, temp=1, threshold=0.5, max_positions=1500, use_attention_pooling=False):
         super().__init__()
         self.temp = temp
         self.prior = prior
@@ -270,6 +270,7 @@ class BoundaryPredictor2(nn.Module):
         return_entropy=False,
         rl=False,
     ):
+        # print(target_boundary_counts)
         batch_size = hidden.size(0)
 
         # Apply fusion MLP to combine all 4 conv features (3072 -> 768)

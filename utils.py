@@ -99,6 +99,14 @@ def max_pool_attention_mask(attention_mask, stride=2):
     # Reshape to (batch_size, -1, stride) and apply max pooling
     batch_size, seq_length = attention_mask.shape
 
+    # Pad sequence length to be divisible by stride
+    remainder = seq_length % stride
+    if remainder != 0:
+        pad_length = stride - remainder
+        # Pad with zeros (masked positions) on the right
+        attention_mask = torch.nn.functional.pad(
+            attention_mask, (0, pad_length), value=0)
+
     # Reshape and apply max pooling
     pooled_mask = attention_mask.view(
         batch_size, -1, stride).any(dim=-1).float()
@@ -106,24 +114,52 @@ def max_pool_attention_mask(attention_mask, stride=2):
     return pooled_mask
 
 
-def final(foo, attention_mask=None):
-    """
-        Input:
-            B x L x S
-    """
-    # what the heck
-    autoregressive = foo != 0
-    lel = 1 - foo
+# def final(foo, attention_mask=None):
+#     """
+#         Input:
+#             B x L x S
+#     """
+#     # what the heck
+#     autoregressive = foo != 0
+#     lel = 1 - foo
 
-    lel[autoregressive] = 0
+#     lel[autoregressive] = 0
 
+#     if attention_mask is not None:
+#         # attention_mask is B x L. lel is B x L x S.
+#         lel = lel * attention_mask.unsqueeze(-1)
+
+#     lel = lel / (lel.sum(dim=1, keepdim=True) + 1e-9)
+
+#     return lel
+
+def final(foo, attention_mask, alpha=10.0):
+    # ----- hard assignment (exactly your current behavior) -----
+    bar_hard = (foo == 0).float()
+
+    # Apply attention mask if provided
     if attention_mask is not None:
-        # attention_mask is B x L. lel is B x L x S.
-        lel = lel * attention_mask.unsqueeze(-1)
+        # attention_mask is B x L. bar_hard is B x L x S.
+        bar_hard = bar_hard * attention_mask.unsqueeze(-1)
 
-    lel = lel / (lel.sum(dim=1, keepdim=True) + 1e-9)
+    bar_hard = bar_hard / (bar_hard.sum(dim=1, keepdim=True) + 1e-9)
 
-    return lel
+    # ----- soft assignment (for gradients) -----
+    # weights highest when foo is near 0
+    logits = -alpha * foo.abs()
+
+    # Apply attention mask to logits before softmax
+    if attention_mask is not None:
+        # Set masked positions to very negative value so they get zero weight
+        logits = logits.masked_fill(
+            attention_mask.unsqueeze(-1) == 0, float('-inf'))
+
+    bar_soft = torch.softmax(logits, dim=1)
+
+    # ----- straight-through combine: hard forward, soft backward -----
+    bar = bar_hard + (bar_soft - bar_soft.detach())
+    # print(f"{bar=}")
+    return bar
 
 
 def common(boundaries):
@@ -367,7 +403,9 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device=None
     Returns:
         torch.Tensor: Complex tensor of shape (end, dim//2) containing rotation frequencies
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim))
+    freqs = 1.0 / \
+        (theta ** (torch.arange(0, dim, 2, device=device)
+         [: (dim // 2)].float() / dim))
     t = torch.arange(end, device=device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64

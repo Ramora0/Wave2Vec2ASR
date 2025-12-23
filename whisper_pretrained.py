@@ -17,7 +17,7 @@ from librispeech import (
 # =============================================================================
 # Configuration: Set to True to use BoundaryPredictor2, False for baseline
 # =============================================================================
-USE_BOUNDARY_PREDICTOR = True
+USE_BOUNDARY_PREDICTOR = False
 # =============================================================================
 
 if USE_BOUNDARY_PREDICTOR:
@@ -59,11 +59,11 @@ else:
     model.generation_config = generation_config
 
     # Convert to the custom MagnetWhisper stack
-    model.__class__ = MagnetWhisper
-    if USE_BOUNDARY_PREDICTOR:
-        model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
-    else:
-        model.load_magnet(predictor_type="none")
+    # model.__class__ = MagnetWhisper
+    # if USE_BOUNDARY_PREDICTOR:
+    #     model.load_magnet(0.075, predictor_type="BoundaryPredictor2")
+    # else:
+    #     model.load_magnet(predictor_type="none")
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -101,7 +101,7 @@ os.environ["WANDB_PROJECT"] = "glimpse-pretraining"
 if USE_BOUNDARY_PREDICTOR:
     MODEL_NAME = "whisper-pretrain-bp2"
 else:
-    MODEL_NAME = "whisper-pretrain-256"
+    MODEL_NAME = "raw-whisper-pretrain"
 
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,11 +110,11 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 # Without BP: 32 * 8 = 256 (use gradient accumulation)
 # With BP: 256 * 1 = 256 (no gradient accumulation)
 if USE_BOUNDARY_PREDICTOR:
-    per_device_train_batch_size = 256
-    gradient_accumulation_steps = 1
+    per_device_train_batch_size = 128
+    gradient_accumulation_steps = 2
 else:
-    per_device_train_batch_size = 32
-    gradient_accumulation_steps = 8
+    per_device_train_batch_size = 16
+    gradient_accumulation_steps = 16
 
 # C. Disable torch_compile when using boundary predictor
 use_torch_compile = not USE_BOUNDARY_PREDICTOR
