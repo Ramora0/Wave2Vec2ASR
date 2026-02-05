@@ -228,7 +228,7 @@ def main():
     # Load a brand-new model
     model = WhisperForConditionalGeneration.from_pretrained(
         "openai/whisper-small",
-        token="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"
+        token=os.environ.get("HF_TOKEN")
     )
     # model = WhisperForConditionalGeneration.from_pretrained(
     #     "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")

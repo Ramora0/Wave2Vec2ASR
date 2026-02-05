@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import string
@@ -14,7 +15,7 @@ from utils import recover_text_from_feature, tokenize_batch_texts
 
 SCRATCH_PATH = "/fs/scratch/PAS2836/lees_stuff"
 DEFAULT_MODEL_NAME = "openai/whisper-small"
-HF_AUTH_TOKEN = "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"
+HF_AUTH_TOKEN = os.environ.get("HF_TOKEN")
 
 
 G2P_CONVERTER = G2p()

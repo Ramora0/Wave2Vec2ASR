@@ -27,7 +27,7 @@ print("hi")
 # model = WhisperForConditionalGeneration.from_pretrained(
 #     "openai/whisper-small",
 #     # torch_dtype=torch.float16,
-#     token="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"
+#     token=os.environ.get("HF_TOKEN")
 #     # attn_implementation="flash_attention_2"
 # )
 model = WhisperForConditionalGeneration.from_pretrained(

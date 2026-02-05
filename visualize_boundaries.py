@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Visualize boundary predictions from a MagnetWhisper checkpoint."""
 
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -166,7 +167,7 @@ def visualize_boundaries() -> None:
 
     processor = WhisperProcessor.from_pretrained(
         "openai/whisper-small",
-        token="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",
+        token=os.environ.get("HF_TOKEN"),
         language="English",
         task="transcribe",
     )

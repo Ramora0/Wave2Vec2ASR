@@ -5,6 +5,7 @@ This script loads a model (either MagnetWhisper or vanilla Whisper),
 evaluates it on LibriSpeech validation set, and reports WER.
 """
 
+import os
 import torch
 import sys
 from torch.utils.data import DataLoader
@@ -211,7 +212,7 @@ def load_magnet_whisper(checkpoint_path=None, boundary_config=None):
     else:
         model = WhisperForConditionalGeneration.from_pretrained(
             "openai/whisper-small",
-            token="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"
+            token=os.environ.get("HF_TOKEN")
         )
 
     # Convert to MagnetWhisper
@@ -242,7 +243,7 @@ def load_vanilla_whisper(checkpoint_path=None):
     else:
         model = WhisperForConditionalGeneration.from_pretrained(
             "openai/whisper-small",
-            token="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"
+            token=os.environ.get("HF_TOKEN")
         )
 
     return model
