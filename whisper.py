@@ -166,7 +166,7 @@ trainer = MagnetSeq2SeqTrainer(
     eval_dataset=dataset["validation.clean"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    tokenizer=processor.feature_extractor,
+    processing_class=processor.feature_extractor,
 )
 
 
