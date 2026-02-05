@@ -410,8 +410,11 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             if not hasattr(self, "_boundary_loss_total"):
                 self._reset_boundary_loss_tracker()
             # Handle both scalar and per-sample boundary losses
-            if boundary_loss.dim() == 0:
-                # Scalar loss
+            if isinstance(boundary_loss, (int, float)):
+                # Python scalar (e.g., 0.0 when no boundary predictors active)
+                self._boundary_loss_total += float(boundary_loss)
+            elif boundary_loss.dim() == 0:
+                # Scalar tensor
                 self._boundary_loss_total += boundary_loss.detach().float().item()
             else:
                 # Per-sample loss (B,) - take mean for tracking

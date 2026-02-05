@@ -237,6 +237,13 @@ class CompressionRatioCallback(TrainerCallback):
         if metrics is None:
             return
 
+        # Log compression ratio from evaluation
+        compression_ratio = model.get_and_reset_compression_ratio()
+        if compression_ratio is not None:
+            eval_log = {"eval/compression_ratio": compression_ratio}
+            wandb.log(eval_log, step=state.global_step)
+            metrics["compression_ratio"] = compression_ratio
+
         # Log boundary CV from evaluation
         boundary_cv = getattr(model, "_boundary_cv", None)
         if boundary_cv is not None:
@@ -421,6 +428,8 @@ wer = client.compute(
 print(
     f"WER: {100 * wer:.2f}%")
 
+compression_ratio = model.get_and_reset_compression_ratio()
 wandb.log({
-    "evaluation/wer": 100 * wer
+    "evaluation/wer": 100 * wer,
+    "evaluation/compression_ratio": compression_ratio,
 })
