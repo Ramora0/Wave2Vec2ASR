@@ -13,7 +13,7 @@ from BoundaryPredictor2 import BoundaryPredictor2
 from BoundaryPredictor3 import BoundaryPredictor3
 from BoundaryPredictor4 import BoundaryPredictor4
 from MagnetWhisperDecoder import MagnetWhisperDecoder
-from MagnetWhisperEncoder import MagnetWhisperEncoder
+from MagnetWhisperEncoder import MagnetWhisperEncoder, ConvConfig
 from MagnetEncoderLayer import MagnetEncoderLayer
 from MagnetDecoderLayer import MagnetDecoderLayer
 from MagnetAttention import MagnetAttention
@@ -50,9 +50,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         if hasattr(self.model, "encoder"):
             setattr(self.model.encoder, "boundary_target_progress", progress)
 
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1", conv_config: Optional[ConvConfig] = None):
         self.model.__class__ = MagnetWhisperModel
-        self.model.load_magnet(lp, predictor_type)
+        self.model.load_magnet(lp, predictor_type, conv_config)
         self.set_boundary_target_progress(1.0)
         self._reset_boundary_loss_tracker()
 
@@ -72,6 +72,7 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         layer_temps = params.get("layer_temps", [])
         layer_thresholds = params.get("layer_thresholds", [])
         layer_types = params.get("layer_types", [])
+        conv_config_dict = params.get("conv_config", None)
 
         # Initialize the magnet component
         model.__class__ = cls
@@ -106,6 +107,17 @@ class MagnetWhisper(WhisperForConditionalGeneration):
         model.model.encoder.total_boundaries = 0
         model.model.encoder.total_positions = 0
         model.model.encoder.boundary_target_progress = 1.0
+
+        # Setup additional convs if config was saved
+        conv_config = ConvConfig.from_dict(conv_config_dict) if conv_config_dict else None
+        model.model.encoder._setup_additional_convs(conv_config)
+
+        # Load additional conv weights if present
+        additional_convs_path = os.path.join(
+            pretrained_model_name_or_path, "additional_convs.bin")
+        if os.path.exists(additional_convs_path) and model.model.encoder.additional_convs is not None:
+            additional_convs_state = torch.load(additional_convs_path, map_location="cpu")
+            model.model.encoder.additional_convs.load_state_dict(additional_convs_state)
 
         # If we have layer_types information, reconstruct boundary_predictors based on saved types
         if layer_types:
@@ -226,13 +238,24 @@ class MagnetWhisper(WhisperForConditionalGeneration):
             else:
                 layer_types.append((idx, "Identity"))
 
+        # Include conv_config if present
+        conv_config = getattr(self.model.encoder, 'conv_config', None)
+        conv_config_dict = conv_config.to_dict() if conv_config else None
+
         params = {
             "layer_priors": layer_priors,
             "layer_temps": layer_temps,
             "layer_thresholds": layer_thresholds,
             "layer_types": layer_types,
+            "conv_config": conv_config_dict,
         }
         torch.save(params, boundary_params_path)
+
+        # Save additional conv weights if present
+        additional_convs = getattr(self.model.encoder, 'additional_convs', None)
+        if additional_convs is not None:
+            additional_convs_path = os.path.join(save_directory, "additional_convs.bin")
+            torch.save(additional_convs.state_dict(), additional_convs_path)
 
     def forward(
         self,
@@ -444,9 +467,9 @@ class MagnetWhisper(WhisperForConditionalGeneration):
 
 
 class MagnetWhisperModel(WhisperModel):
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1", conv_config: Optional[ConvConfig] = None):
         self.encoder.__class__ = MagnetWhisperEncoder
-        self.encoder.load_magnet(lp, predictor_type)
+        self.encoder.load_magnet(lp, predictor_type, conv_config)
 
         self.decoder.__class__ = MagnetWhisperDecoder
         self.decoder.load_magnet()

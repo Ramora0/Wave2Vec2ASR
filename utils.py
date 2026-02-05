@@ -91,17 +91,21 @@ def max_pool_attention_mask(attention_mask, stride=2):
         stride (int): Pooling stride, default 2
 
     Returns:
-        torch.Tensor: Max-pooled attention mask of shape (batch_size, seq_length // stride)
+        torch.Tensor: Max-pooled attention mask of shape (batch_size, ceil(seq_length / stride))
     """
     if attention_mask is None:
         return None
 
-    # Reshape to (batch_size, -1, stride) and apply max pooling
     batch_size, seq_length = attention_mask.shape
 
-    # Reshape and apply max pooling
-    pooled_mask = attention_mask.view(
-        batch_size, -1, stride).any(dim=-1).float()
+    # Pad if sequence length is not divisible by stride
+    if seq_length % stride != 0:
+        pad_len = stride - (seq_length % stride)
+        attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+        seq_length = attention_mask.shape[1]
+
+    # Reshape to (batch_size, -1, stride) and apply max pooling
+    pooled_mask = attention_mask.view(batch_size, -1, stride).any(dim=-1).float()
 
     return pooled_mask
 

@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 import torch
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from transformers.models.whisper.modeling_whisper import WhisperEncoder
 from transformers.modeling_outputs import BaseModelOutput
 from torch import nn
@@ -12,6 +13,54 @@ from BoundaryPredictor4 import BoundaryPredictor4
 from MagnetAttention import MagnetAttention
 from MagnetEncoderLayer import MagnetEncoderLayer
 from utils import max_pool_attention_mask, remove_positional_embeddings
+
+
+@dataclass
+class ConvConfig:
+    """Configuration for ADDITIONAL conv layers after Whisper's conv1/conv2.
+
+    Whisper's pretrained convolutions are always preserved:
+    - conv1: stride 2
+    - conv2: stride 1
+    - Base downsampling: 2x
+
+    Additional convs are appended after these to achieve further downsampling.
+
+    Examples:
+        - None (default): uses only Whisper's conv1/conv2 (2x downsampling)
+        - ConvConfig.from_strides([2]): 2 × 1 × 2 = 4x downsampling
+        - ConvConfig.from_strides([3]): 2 × 1 × 3 = 6x downsampling
+        - ConvConfig.from_strides([2, 2]): 2 × 1 × 2 × 2 = 8x downsampling
+    """
+    layers: List[Tuple[int, int, int]] = field(default_factory=list)  # (out_channels, kernel_size, stride)
+
+    @property
+    def total_stride(self) -> int:
+        """Total stride from additional convs only."""
+        return math.prod(s for _, _, s in self.layers) if self.layers else 1
+
+    @classmethod
+    def from_strides(cls, strides: List[int], hidden_dim: int = 768, kernel_size: int = 3) -> "ConvConfig":
+        """Create config from just stride values.
+
+        Args:
+            strides: List of stride values for additional conv layers
+            hidden_dim: Output channels for each conv layer (default: 768)
+            kernel_size: Kernel size for each conv layer (default: 3)
+
+        Returns:
+            ConvConfig with layers configured from the stride values
+        """
+        return cls(layers=[(hidden_dim, kernel_size, s) for s in strides])
+
+    def to_dict(self) -> Dict:
+        """Serialize config to dictionary for saving."""
+        return {"layers": self.layers}
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "ConvConfig":
+        """Deserialize config from dictionary."""
+        return cls(layers=[tuple(layer) for layer in d.get("layers", [])])
 
 
 @dataclass
@@ -33,7 +82,7 @@ class MagnetModelOutput(BaseModelOutput):
 
 
 class MagnetWhisperEncoder(WhisperEncoder):
-    def load_magnet(self, lp, predictor_type="BoundaryPredictor1"):
+    def load_magnet(self, lp, predictor_type="BoundaryPredictor1", conv_config: Optional[ConvConfig] = None):
         self.boundary_predictors = nn.ModuleList(
             [nn.Identity() for _ in range(12)]
         )
@@ -41,6 +90,9 @@ class MagnetWhisperEncoder(WhisperEncoder):
         self.total_boundaries = 0
         self.total_positions = 0
         self.boundary_target_progress = 1.0
+
+        # Setup additional conv layers if configured
+        self._setup_additional_convs(conv_config)
 
         for layer in self.layers:
             layer.__class__ = MagnetEncoderLayer
@@ -84,6 +136,25 @@ class MagnetWhisperEncoder(WhisperEncoder):
             else:
                 raise ValueError(
                     f"Unknown predictor_type: {predictor_type}. Supported types are: BoundaryPredictor1, BoundaryPredictor2, BoundaryPredictor3, BoundaryPredictor4")
+
+    def _setup_additional_convs(self, conv_config: Optional[ConvConfig]):
+        """Create additional conv layers that come AFTER Whisper's conv1/conv2.
+
+        Args:
+            conv_config: Configuration for additional conv layers, or None for default behavior
+        """
+        self.conv_config = conv_config
+        if conv_config is None or not conv_config.layers:
+            self.additional_convs = None
+            return
+
+        # Input is output of conv2, which has d_model channels (768 for whisper-base)
+        in_channels = self.config.d_model
+        self.additional_convs = nn.ModuleList()
+        for out_channels, kernel_size, stride in conv_config.layers:
+            conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding=kernel_size // 2)
+            self.additional_convs.append(conv)
+            in_channels = out_channels
 
     def _apply_boundary_predictor(
         self,
@@ -254,8 +325,13 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 Whether or not to return the hidden states of all layers.
         """
 
-        expected_seq_length = self.config.max_source_positions * \
-            self.conv1.stride[0] * self.conv2.stride[0]
+        # Calculate total stride from Whisper convs + additional convs
+        base_stride = self.conv1.stride[0] * self.conv2.stride[0]  # 2 × 1 = 2
+        additional_stride = getattr(self, 'conv_config', None)
+        additional_stride = additional_stride.total_stride if additional_stride else 1
+        total_stride = base_stride * additional_stride
+
+        expected_seq_length = self.config.max_source_positions * total_stride
         if input_features.shape[-1] != expected_seq_length:
             raise ValueError(
                 f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
@@ -265,8 +341,15 @@ class MagnetWhisperEncoder(WhisperEncoder):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+
+        # Always apply Whisper's pretrained convs first
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+
+        # Apply additional convs if configured
+        if hasattr(self, 'additional_convs') and self.additional_convs is not None:
+            for conv in self.additional_convs:
+                inputs_embeds = nn.functional.gelu(conv(inputs_embeds))
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
@@ -302,7 +385,8 @@ class MagnetWhisperEncoder(WhisperEncoder):
         target_pointer = 0
 
         if attention_mask is not None:
-            attention_mask = max_pool_attention_mask(attention_mask)
+            # Pool attention mask with total stride (Whisper convs + additional convs)
+            attention_mask = max_pool_attention_mask(attention_mask, stride=total_stride)
             attention_mask_1d = attention_mask
         else:
             attention_mask_1d = None
