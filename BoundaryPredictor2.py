@@ -33,7 +33,7 @@ class BoundaryPredictor2(nn.Module):
         self.q_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
         self.k_proj_layer = nn.Linear(input_dim, input_dim, bias=False)
 
-        self.similarity_bias = nn.Parameter(torch.tensor(-0.126))
+        self.similarity_bias = nn.Parameter(torch.tensor(-0.7))
 
         with torch.no_grad():
             # Initialize with scaled identity matrices to control sensitivity

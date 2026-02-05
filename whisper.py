@@ -1,3 +1,4 @@
+from MagnetWhisperEncoder import ConvConfig
 import torch
 from transformers import TrainerCallback
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
@@ -40,8 +41,10 @@ BOUNDARY_TEMP = 1  # Final temperature we keep fixed during this run
 BOUNDARY_TARGET_PROGRESS = 1.0
 # FREEZE_NON_BOUNDARY_STEPS = 250
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
-boundary_priors = [(0, 0.08)]
-model.load_magnet(boundary_priors, "BoundaryPredictor1")
+# boundary_priors = [(0, 0.08)]
+
+conv_config = ConvConfig.from_strides([2,2])
+model.load_magnet([], conv_config=conv_config)
 
 
 def _set_boundary_temperature(magnet_model, temperature):
