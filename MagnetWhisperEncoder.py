@@ -325,17 +325,18 @@ class MagnetWhisperEncoder(WhisperEncoder):
                 Whether or not to return the hidden states of all layers.
         """
 
-        # Calculate total stride from Whisper convs + additional convs
+        # Input validation uses only Whisper's base stride (input size doesn't change with additional convs)
         base_stride = self.conv1.stride[0] * self.conv2.stride[0]  # 2 × 1 = 2
-        additional_stride = getattr(self, 'conv_config', None)
-        additional_stride = additional_stride.total_stride if additional_stride else 1
-        total_stride = base_stride * additional_stride
-
-        expected_seq_length = self.config.max_source_positions * total_stride
+        expected_seq_length = self.config.max_source_positions * base_stride
         if input_features.shape[-1] != expected_seq_length:
             raise ValueError(
                 f"Whisper expects the mel input features to be of length {expected_seq_length}, but found {input_features.shape[-1]}. Make sure to pad the input mel features to {expected_seq_length}."
             )
+
+        # Calculate total stride for attention mask pooling (Whisper convs + additional convs)
+        conv_config = getattr(self, 'conv_config', None)
+        additional_stride = conv_config.total_stride if conv_config else 1
+        total_stride = base_stride * additional_stride
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
