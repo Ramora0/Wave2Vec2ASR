@@ -43,8 +43,8 @@ BOUNDARY_TARGET_PROGRESS = 1.0
 # DOWNSAMPLE_NO_GRAD_STEPS = 17600
 # boundary_priors = [(0, 0.08)]
 
-conv_config = ConvConfig.from_strides([2,2])
-model.load_magnet([], conv_config=conv_config)
+# conv_config = ConvConfig.from_strides([2,2])
+model.load_magnet([])
 
 
 def _set_boundary_temperature(magnet_model, temperature):
@@ -86,7 +86,7 @@ compute_metrics = data_module.compute_metrics
 
 os.environ["WANDB_PROJECT"] = "whisper-magnet-osc"
 
-MODEL_NAME = "testing"
+MODEL_NAME = "attention-masked"
 MODEL_DIR = Path("./models") / MODEL_NAME
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -108,7 +108,7 @@ training_args = Seq2SeqTrainingArguments(
     learning_rate=1e-4,
     warmup_ratio=0.1,
     # max_steps=16000,
-    num_train_epochs=5,
+    num_train_epochs=2,
     eval_strategy="steps",
     predict_with_generate=True,
     generation_max_length=225,
