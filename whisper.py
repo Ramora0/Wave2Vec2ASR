@@ -94,10 +94,10 @@ training_args = Seq2SeqTrainingArguments(
     # change to a repo name of your choice
     output_dir=str(MODEL_DIR),
 
-    per_device_train_batch_size=128,
-    per_device_eval_batch_size=128,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=32,
 
-    # gradient_accumulation_steps=2,
+    gradient_accumulation_steps=4,
     gradient_checkpointing=True,
 
     fp16=True,
