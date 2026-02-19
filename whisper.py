@@ -71,8 +71,8 @@ model.to("cuda")
 # Don't manually convert to fp16 - let the trainer's AMP handle it
 # model.half()  # Convert model to fp16
 
-model.generation_config.language = "english"
-model.generation_config.task = "transcribe"
+# model.generation_config.language = "english"  # not needed for .en models (no lang_to_id)
+# model.generation_config.task = "transcribe"
 
 model.generation_config.forced_decoder_ids = None
 
