@@ -32,7 +32,7 @@ print("hi")
 #     # attn_implementation="flash_attention_2"
 # )
 model = WhisperForConditionalGeneration.from_pretrained(
-    "/users/PAS2836/leedavis/research/whisper/models/attention-mask/checkpoint-8789")
+    "openai/whisper-small.en")
 
 # # Convert to the custom MagnetWhisper stack and enable BoundaryPredictor1.
 model.__class__ = MagnetWhisper
