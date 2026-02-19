@@ -132,6 +132,16 @@ def build_compute_metrics(tokenizer: WhisperTokenizer) -> Callable[[Any], Dict[s
         pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
+        # Print sample predictions vs references
+        num_samples = min(10, len(pred_str))
+        print(f"\n{'='*60}")
+        print(f"Sample predictions ({num_samples} of {len(pred_str)}):")
+        print(f"{'='*60}")
+        for i in range(num_samples):
+            print(f"REF: {label_str[i]}")
+            print(f"PRD: {pred_str[i]}")
+            print(f"{'-'*60}")
+
         wer = 100 * \
             wer_metric.compute(predictions=pred_str, references=label_str)
         return {"wer": wer}

@@ -137,8 +137,11 @@ class MagnetAttention(WhisperAttention):
             if is_cross_attention:
                 # Cross-attention: encoder positions (always 0 to src_len-1)
                 key_positions = torch.arange(src_len, device=key_states.device, dtype=torch.long)
+            elif cache_position is not None:
+                # Self-attention during generation: keys are at same positions as queries
+                key_positions = cache_position
             else:
-                # Self-attention: keys are at positions 0 to src_len-1 (accounting for cache)
+                # Self-attention during training: sequential positions
                 key_positions = torch.arange(src_len, device=key_states.device, dtype=torch.long)
 
             # Get frequency tensor for keys and apply RoPE

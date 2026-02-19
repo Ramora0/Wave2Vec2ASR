@@ -74,6 +74,7 @@ class MagnetDecoderLayer(WhisperDecoderLayer):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
+                cache_position=cache_position,
             )
             hidden_states = nn.functional.dropout(
                 hidden_states, p=self.dropout, training=self.training)
